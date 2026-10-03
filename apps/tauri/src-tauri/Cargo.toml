@@ -1,0 +1,12 @@
+[package]
+name = "vocal-fast-tauri"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vocal-engine = { path = "../../crates/vocal-engine" }
+vocal-model = { path = "../../crates/vocal-model" }
+
+# Add tauri and tauri-build here when the host UI is wired. This crate stays
+# outside the root workspace while the core baseline remains headless/buildable.

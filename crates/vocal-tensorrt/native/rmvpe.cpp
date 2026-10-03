@@ -18,6 +18,7 @@
 namespace vocal {
 using namespace nvinfer1;
 using T = ITensor*;
+constexpr int kRmvpeStftBins = 513;
 
 inline Dims rdims(std::initializer_list<int64_t> v) {
     Dims d{};
@@ -535,6 +536,24 @@ struct RmvpeGraph {
         return mel;
     }
 
+    T mel_from_external_magnitude(T magnitude) {
+        // The external CUDA frontend emits one contiguous [513, frame]
+        // magnitude matrix per center-aligned STFT. Keep the learned mel
+        // basis and log/clamp in TensorRT so the VFRM package remains the
+        // single source of model weights. The layout is chosen to feed this
+        // GEMM directly and avoid a standalone TensorRT transpose.
+        auto mel_basis = reshape(parameter("rmvpe.mel_basis", rdims({128, kRmvpeStftBins})),
+                                  rdims({1, 128, kRmvpeStftBins}));
+        auto mel = output(n.addMatrixMultiply(*mel_basis, MatrixOperation::kNONE,
+                                              *magnitude, MatrixOperation::kNONE),
+                          "rmvpe.frontend.mel_external");
+        auto* clip = n.addActivation(*mel, ActivationType::kCLIP);
+        require(clip, "RMVPE external mel clamp");
+        clip->setAlpha(1.0e-5f);
+        clip->setBeta(1.0e30f);
+        return unary(output(clip, "rmvpe.frontend.mel_external_clamp"), UnaryOperation::kLOG);
+    }
+
     T gru_direction(T sequence, bool reverse) {
         constexpr int H = 256;
         constexpr int I = 384;
@@ -591,14 +610,16 @@ struct RmvpeGraph {
         return reshape(output(out), rdims({1, -1, H}));
     }
 
-    T build(T waveform, T threshold) {
+    T build(T input, T threshold) {
         // Keep the numerically sensitive Fourier frontend in its requested
         // precision, then switch the U-Net regions independently.  Explicit
         // casts at region boundaries make the mixed-precision contract stable
         // across TensorRT tactic changes.
         T mel{};
         active_precision = 0; // STFT/mel is intentionally FP32.
-        mel = fourier_mel(waveform); // [1, 128, T]
+        mel = options.rmvpe_external_stft != 0
+            ? mel_from_external_magnitude(input)
+            : fourier_mel(input); // [1, 128, T]
         // Diagnostic outputs are enabled only for a debug build.  Keeping
         // these tensors as explicit engine outputs lets the parity harness
         // compare the handwritten frontend and recurrent tail without
@@ -860,13 +881,25 @@ extern "C" int vocal_trt_build_rmvpe(
         config->clearFlag(BuilderFlag::kTF32);
         config->setProfilingVerbosity(ProfilingVerbosity::kDETAILED);
         auto* profile = builder->createOptimizationProfile(); require(profile, "create RMVPE profile");
-        auto* waveform = network->addInput("waveform", DataType::kFLOAT, Dims{2, {1, -1}}); require(waveform, "RMVPE waveform input");
+        auto* input = options->rmvpe_external_stft != 0
+            ? network->addInput("stft_magnitude", DataType::kFLOAT, Dims{3, {1, 513, -1}})
+            : network->addInput("waveform", DataType::kFLOAT, Dims{2, {1, -1}});
+        require(input, "RMVPE input");
         auto* threshold = network->addInput("threshold", DataType::kFLOAT, Dims{1, {1}}); require(threshold, "RMVPE threshold input");
-        require(profile->setDimensions("waveform", OptProfileSelector::kMIN, rdims({1, options->min_frames * 160})), "RMVPE min profile");
-        require(profile->setDimensions("waveform", OptProfileSelector::kOPT, rdims({1, options->opt_frames * 160})), "RMVPE opt profile");
-        require(profile->setDimensions("waveform", OptProfileSelector::kMAX, rdims({1, options->max_frames * 160})), "RMVPE max profile");
+        if (options->rmvpe_external_stft != 0) {
+            require(profile->setDimensions("stft_magnitude", OptProfileSelector::kMIN,
+                                           rdims({1, 513, options->min_frames + 1})), "RMVPE min STFT profile");
+            require(profile->setDimensions("stft_magnitude", OptProfileSelector::kOPT,
+                                           rdims({1, 513, options->opt_frames + 1})), "RMVPE opt STFT profile");
+            require(profile->setDimensions("stft_magnitude", OptProfileSelector::kMAX,
+                                           rdims({1, 513, options->max_frames + 1})), "RMVPE max STFT profile");
+        } else {
+            require(profile->setDimensions("waveform", OptProfileSelector::kMIN, rdims({1, options->min_frames * 160})), "RMVPE min profile");
+            require(profile->setDimensions("waveform", OptProfileSelector::kOPT, rdims({1, options->opt_frames * 160})), "RMVPE opt profile");
+            require(profile->setDimensions("waveform", OptProfileSelector::kMAX, rdims({1, options->max_frames * 160})), "RMVPE max profile");
+        }
         RmvpeGraph graph(*network, *options, weights, count);
-        auto internal_waveform = graph.cast_real(waveform);
+        auto internal_waveform = graph.cast_real(input);
         auto internal_threshold = graph.cast_real(threshold);
         auto pitch = graph.build(internal_waveform, internal_threshold);
         if (options->precision != 0) pitch = graph.output(network->addCast(*pitch, DataType::kFLOAT), "pitchf");

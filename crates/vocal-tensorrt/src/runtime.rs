@@ -474,6 +474,10 @@ impl CudaStream {
     pub(crate) fn device_ptr(&self) -> *mut c_void {
         unsafe { ffi::vocal_cuda_stream_ptr(self.raw) }
     }
+
+    pub(crate) fn native_handle(&self) -> *mut ffi::Stream {
+        self.raw
+    }
 }
 
 /// RAII guard for an active CUDA stream capture.  Dropping an unfinished
@@ -686,6 +690,10 @@ impl CudaBuffer {
 
     pub fn device_ptr(&self) -> *mut c_void {
         unsafe { ffi::vocal_cuda_ptr(self.raw) }
+    }
+
+    pub(crate) fn native_handle(&self) -> *mut ffi::Memory {
+        self.raw
     }
 
     pub(crate) fn device_ptr_offset(&self, offset_bytes: usize) -> *mut c_void {

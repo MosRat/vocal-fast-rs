@@ -52,6 +52,9 @@ struct HostMemory { void* ptr{}; size_t bytes{}; };
 // graph itself is instantiated by the end-capture call and is intentionally
 // opaque across the C ABI.
 struct CudaGraphExec { cudaGraphExec_t exec{}; };
+// cuFFT-backed RMVPE STFT frontend. The plan and scratch buffers are owned by
+// the native handle and are created before CUDA graph capture starts.
+struct CufftFrontend;
 // Versioned C data contract, independent of TensorRT C++ layouts. Rust validates
 // the canonical package before passing these borrowed arrays for the build call.
 struct Weight { char const* name; float const* data; int64_t count; int32_t rank; int64_t dims[4]; };
@@ -105,6 +108,9 @@ struct Options {
     // HuBERT feature extractor precision is independent from the projection
     // and Transformer encoder precision.
     int32_t hubert_feature_precision;
+    // 1 = RMVPE receives [1,513,T] cuFFT magnitude from the external CUDA
+    // frontend. TensorRT still owns mel projection and all learned layers.
+    int32_t rmvpe_external_stft;
 };
 
 inline uint16_t float_to_half_bits(float value) noexcept {
@@ -153,6 +159,15 @@ extern "C" int vocal_trt_build_hubert(
 extern "C" int vocal_trt_build_rmvpe(
     Weight const* weights, size_t count, Options const* options,
     Build** out, char** error) noexcept;
+
+extern "C" int vocal_cufft_frontend_create(
+    int32_t samples, CufftFrontend** out, char** error) noexcept;
+extern "C" int vocal_cufft_frontend_set_stream(
+    CufftFrontend* frontend, Stream* stream, char** error) noexcept;
+extern "C" int vocal_cufft_frontend_enqueue(
+    CufftFrontend* frontend, void const* waveform, size_t waveform_bytes,
+    Memory* magnitude, Stream* stream, char** error) noexcept;
+extern "C" void vocal_cufft_frontend_destroy(CufftFrontend* frontend) noexcept;
 
 // Pinned host staging is used by the realtime waveform ring. The async copy
 // does not block the producer and is ordered on the pipeline CUDA stream.

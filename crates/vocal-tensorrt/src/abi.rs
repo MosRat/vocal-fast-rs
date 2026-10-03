@@ -73,6 +73,7 @@ pub(crate) struct NativeOptions {
     pub rmvpe_fft_mode: i32,
     pub fused_rvc_qkv: i32,
     pub hubert_feature_precision: i32,
+    pub rmvpe_external_stft: i32,
 }
 
 pub(crate) fn native_config(c: &RvcSynthConfig) -> Result<NativeConfig, NativeBuildError> {

@@ -12,6 +12,7 @@
 mod abi;
 pub mod acoustic;
 mod builder;
+mod cufft;
 mod error;
 mod options;
 mod runtime;

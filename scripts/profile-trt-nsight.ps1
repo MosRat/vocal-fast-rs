@@ -5,7 +5,9 @@ param(
     [string]$Output = "target/nsys-rvc",
     [int]$Warmup = 10,
     [int]$Iterations = 100,
-    [string]$Binary = "target/debug/vocal-fast.exe"
+    [string]$Binary = "target/debug/vocal-fast.exe",
+    [ValidateSet("default", "cufft", "radix2")]
+    [string]$RmvpeFft = "default"
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,6 +40,11 @@ $env:VOCAL_TRT_PIPELINE_ITERATIONS = "$Iterations"
 $env:VOCAL_TRT_DEBUG_INTERMEDIATES = "0"
 $env:VOCAL_TRT_LAYER_PROFILE = "0"
 $env:VOCAL_TRT_NATIVE_CUDA_GRAPH = "1"
+if ($RmvpeFft -eq "default") {
+    Remove-Item Env:VOCAL_TRT_RMVPE_FFT -ErrorAction SilentlyContinue
+} else {
+    $env:VOCAL_TRT_RMVPE_FFT = $RmvpeFft
+}
 
 # Node-level graph tracing keeps device kernels visible after TensorRT-RTX has
 # switched from capture to replay. Without it, Nsight often records only the

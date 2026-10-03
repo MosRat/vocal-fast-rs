@@ -17,6 +17,7 @@ use crate::timing::CudaEvent;
 use crate::{
     CudaBuffer, CudaGraphExec, CudaStream, OwnedContext, PinnedHostRing, Runtime,
     builder::NativeTensorRtBuilder,
+    cufft::{CufftFrontend, unique_shapes},
     error::NativeBuildError,
     options::{DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode},
 };
@@ -344,6 +345,9 @@ pub struct RvcTrtPipelineArtifacts {
     pub hubert_feature_precision: PrecisionMode,
     #[serde(default)]
     pub rmvpe_fft_mode: u8,
+    /// Whether RMVPE plans consume the external cuFFT magnitude tensor.
+    #[serde(default)]
+    pub rmvpe_external_stft: bool,
     /// Whether the RMVPE plan exposes parity-only mel/U-Net/GRU/logit
     /// outputs. Runtime binding uses the manifest so a debug plan cannot be
     /// accidentally executed as a production plan (or vice versa).
@@ -394,6 +398,7 @@ impl RvcTrtPipelineArtifacts {
     ) -> Result<Self, NativeBuildError> {
         profile.validate()?;
         fs::create_dir_all(output_dir.as_ref())?;
+        let external_stft = builder_options.rmvpe_fft_cufft;
         let compile = |name: &str,
                        options: NativeBuildOptions|
          -> Result<PathBuf, NativeBuildError> {
@@ -411,8 +416,17 @@ impl RvcTrtPipelineArtifacts {
                         .map_err(|e| NativeBuildError::Api(e.to_string()))?;
                     builder.compile_rmvpe_vfrm(&package)
                 }
-                "rmvpe" => builder
-                    .compile_onnx_file_with_profile(rmvpe_onnx.as_ref(), OnnxProfileKind::Samples),
+                "rmvpe" => {
+                    if external_stft {
+                        return Err(NativeBuildError::Argument(
+                            "cuFFT RMVPE frontend requires an RMVPE VFRM package".into(),
+                        ));
+                    }
+                    builder.compile_onnx_file_with_profile(
+                        rmvpe_onnx.as_ref(),
+                        OnnxProfileKind::Samples,
+                    )
+                }
                 "frontend" => builder.compile_frontend(),
                 "synth" => builder.compile_vfrm(package),
                 _ => Err(NativeBuildError::Argument(
@@ -425,9 +439,16 @@ impl RvcTrtPipelineArtifacts {
         let hubert_feature_precision = builder_options.hubert_feature_precision;
         let rmvpe_fft_mode = if builder_options.rmvpe_fft_radix2 {
             1
+        } else if builder_options.rmvpe_fft_cufft {
+            2
         } else {
             0
         };
+        if builder_options.rmvpe_fft_radix2 && builder_options.rmvpe_fft_cufft {
+            return Err(NativeBuildError::Argument(
+                "RMVPE FFT mode cannot select both radix2 and cuFFT".into(),
+            ));
+        }
         let rmvpe_debug_outputs = builder_options.rmvpe_debug_outputs;
         let rmvpe_precision = builder_options.rmvpe_precision;
         let rmvpe_encoder_precision = builder_options.rmvpe_encoder_precision;
@@ -503,7 +524,7 @@ impl RvcTrtPipelineArtifacts {
         options.precision = PrecisionMode::Fp32;
         options.dispatch_tune = dispatch_tune;
         let frontend_plan = compile("frontend", options)?;
-        let mut options = builder_options;
+        let mut options = builder_options.clone();
         options.output = output_dir.as_ref().join("synth.plan");
         options.min_frames = profile.min_rvc_frames;
         options.opt_frames = profile.opt_rvc_frames;
@@ -523,6 +544,7 @@ impl RvcTrtPipelineArtifacts {
             hubert_precision,
             hubert_feature_precision,
             rmvpe_fft_mode,
+            rmvpe_external_stft: external_stft,
             rmvpe_debug_outputs,
             rmvpe_precision,
             rmvpe_encoder_precision,
@@ -636,12 +658,15 @@ pub struct RvcTrtPipeline {
     frontend: OwnedContext,
     synth: OwnedContext,
     stream: CudaStream,
+    rmvpe_external_stft: bool,
+    cufft_frontends: Vec<(usize, CufftFrontend)>,
     stage_events: StageEvents,
     waveform: CudaBuffer,
     waveform_host_ring: PinnedHostRing,
     threshold: CudaBuffer,
     hubert_features: CudaBuffer,
     pitchf_raw: CudaBuffer,
+    rmvpe_magnitude: CudaBuffer,
     p_len: CudaBuffer,
     sid: CudaBuffer,
     feats: CudaBuffer,
@@ -725,6 +750,7 @@ impl RvcTrtPipeline {
         let rmvpe_full_runtime = Runtime::shared(rmvpe_full_path)?;
         let frontend_runtime = Runtime::shared(&artifacts.frontend_plan)?;
         let synth_runtime = Runtime::shared(&artifacts.synth_plan)?;
+        let p = &artifacts.profile;
         // TensorRT-RTX's whole-graph strategy performs capture after JIT
         // specialization and owns replay inside enqueueV3. It must be chosen
         // while creating each execution context; changing it after the first
@@ -744,6 +770,19 @@ impl RvcTrtPipeline {
         let frontend = OwnedContext::create_with_cuda_graphs(frontend_runtime, native_cuda_graphs)?;
         let synth = OwnedContext::create_with_cuda_graphs(synth_runtime, native_cuda_graphs)?;
         let stream = CudaStream::new()?;
+        let rmvpe_external_stft = artifacts.rmvpe_external_stft;
+        let mut cufft_frontends = Vec::new();
+        if rmvpe_external_stft {
+            let shapes = unique_shapes([
+                RMVPE_REALTIME_SAMPLES,
+                p.min_samples as usize,
+                p.opt_samples as usize,
+                p.max_samples as usize,
+            ]);
+            for samples in shapes {
+                cufft_frontends.push((samples, CufftFrontend::new(samples, &stream)?));
+            }
+        }
         // The external path remains requested until the first concrete shape
         // and all tensor bindings have been installed. `isStreamCapturable`
         // is shape-sensitive on dynamic engines, so it is queried lazily in
@@ -759,7 +798,6 @@ impl RvcTrtPipeline {
             synth_start: CudaEvent::new()?,
             synth_end: CudaEvent::new()?,
         };
-        let p = &artifacts.profile;
         let latent = config.latent_channels as usize;
         let up = config
             .upsample_rates
@@ -791,12 +829,15 @@ impl RvcTrtPipeline {
             frontend,
             synth,
             stream,
+            rmvpe_external_stft,
+            cufft_frontends,
             stage_events,
             waveform: alloc(p.max_samples as usize * 4)?,
             waveform_host_ring: PinnedHostRing::new(3, p.max_samples as usize * 4)?,
             threshold: alloc(4)?,
             hubert_features: alloc(p.max_hubert_frames as usize * 768 * 4)?,
             pitchf_raw: alloc(p.max_pitch_frames as usize * 4)?,
+            rmvpe_magnitude: alloc(p.max_pitch_frames as usize * 513 * 4)?,
             p_len: alloc(4)?,
             sid: alloc(4)?,
             feats: alloc(p.max_rvc_frames as usize * 768 * 4)?,
@@ -949,6 +990,8 @@ impl RvcTrtPipeline {
         streaming_f0: bool,
         pitch_frames: usize,
         advance_frames: usize,
+        rmvpe_samples: usize,
+        rmvpe_waveform: *const std::ffi::c_void,
     ) -> Result<(), NativeBuildError> {
         let trace = std::env::var("VOCAL_TRT_TRACE").ok().as_deref() == Some("1");
         self.stage_events.hubert_start.record(&self.stream)?;
@@ -959,6 +1002,24 @@ impl RvcTrtPipeline {
             .enqueue_named(&self.stream, Some("rvc.hubert"))?;
         self.stage_events.hubert_end.record(&self.stream)?;
         self.stage_events.rmvpe_start.record(&self.stream)?;
+        if self.rmvpe_external_stft {
+            let frontend = self
+                .cufft_frontends
+                .iter_mut()
+                .find(|(samples, _)| *samples == rmvpe_samples)
+                .map(|(_, frontend)| frontend)
+                .ok_or_else(|| {
+                    NativeBuildError::Argument(format!(
+                        "missing cuFFT frontend plan for {rmvpe_samples} samples"
+                    ))
+                })?;
+            frontend.enqueue(
+                rmvpe_waveform,
+                rmvpe_samples * std::mem::size_of::<f32>(),
+                &self.rmvpe_magnitude,
+                &self.stream,
+            )?;
+        }
         if trace {
             eprintln!("trt trace: enqueue rmvpe streaming={streaming_f0}");
         }
@@ -1060,6 +1121,9 @@ impl RvcTrtPipeline {
         } else {
             waveform.len()
         };
+        let rmvpe_waveform = self
+            .waveform
+            .device_ptr_offset((waveform.len() - rmvpe_samples) * std::mem::size_of::<f32>());
         let advance_frames = realtime_advance_frames.unwrap_or(0);
         let same_waveform = self
             .shape_key
@@ -1088,13 +1152,20 @@ impl RvcTrtPipeline {
             &mut self.rmvpe_full
         };
         if !same_rmvpe {
-            rmvpe.set_input_shape("waveform", &[1, rmvpe_samples as i64])?;
+            if self.rmvpe_external_stft {
+                rmvpe.set_input_shape(
+                    "stft_magnitude",
+                    &[1, 513, (rmvpe_samples / 160 + 1) as i64],
+                )?;
+            } else {
+                rmvpe.set_input_shape("waveform", &[1, rmvpe_samples as i64])?;
+            }
         }
-        rmvpe.set_tensor_address(
-            "waveform",
-            self.waveform
-                .device_ptr_offset((waveform.len() - rmvpe_samples) * std::mem::size_of::<f32>()),
-        )?;
+        if self.rmvpe_external_stft {
+            rmvpe.set_tensor_address("stft_magnitude", self.rmvpe_magnitude.device_ptr())?;
+        } else {
+            rmvpe.set_tensor_address("waveform", rmvpe_waveform)?;
+        }
         rmvpe.set_tensor_address("threshold", self.threshold.device_ptr())?;
         rmvpe.set_tensor_address("pitchf", self.pitchf_raw.device_ptr())?;
         if self.rmvpe_debug_outputs {
@@ -1329,7 +1400,13 @@ impl RvcTrtPipeline {
                 None
             };
             if let Some(capture) = capture {
-                match self.enqueue_stage_sequence(streaming_f0, pitch_frames, advance_frames) {
+                match self.enqueue_stage_sequence(
+                    streaming_f0,
+                    pitch_frames,
+                    advance_frames,
+                    rmvpe_samples,
+                    rmvpe_waveform,
+                ) {
                     Ok(()) => match capture.finish() {
                         Ok(exec) => {
                             self.graph_exec = Some(exec);
@@ -1343,6 +1420,8 @@ impl RvcTrtPipeline {
                                 streaming_f0,
                                 pitch_frames,
                                 advance_frames,
+                                rmvpe_samples,
+                                rmvpe_waveform,
                             )?;
                         }
                     },
@@ -1355,11 +1434,23 @@ impl RvcTrtPipeline {
                         drop(capture);
                         self.cuda_graphs = false;
                         self.graph_invalidations = self.graph_invalidations.saturating_add(1);
-                        self.enqueue_stage_sequence(streaming_f0, pitch_frames, advance_frames)?;
+                        self.enqueue_stage_sequence(
+                            streaming_f0,
+                            pitch_frames,
+                            advance_frames,
+                            rmvpe_samples,
+                            rmvpe_waveform,
+                        )?;
                     }
                 }
             } else {
-                self.enqueue_stage_sequence(streaming_f0, pitch_frames, advance_frames)?;
+                self.enqueue_stage_sequence(
+                    streaming_f0,
+                    pitch_frames,
+                    advance_frames,
+                    rmvpe_samples,
+                    rmvpe_waveform,
+                )?;
             }
         }
         self.stream.synchronize()?;

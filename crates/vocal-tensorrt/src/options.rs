@@ -127,6 +127,11 @@ pub struct NativeBuildOptions {
     /// build and replay cost is characterized on each GPU.
     #[serde(default)]
     pub rmvpe_fft_radix2: bool,
+    /// Use the external cuFFT STFT frontend. TensorRT receives an FP32
+    /// magnitude tensor, so this mode avoids plugins while keeping mel basis
+    /// and learned RMVPE layers in the native graph.
+    #[serde(default)]
+    pub rmvpe_fft_cufft: bool,
     /// Explicit INT8 per-output-channel weight quantization. This is an
     /// experiment: activations stay floating point and sensitive affine
     /// parameters are kept in their original precision.
@@ -239,6 +244,7 @@ impl Default for NativeBuildOptions {
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             rmvpe_fft_radix2: matches!(fft_mode.as_str(), "1" | "true" | "radix2"),
+            rmvpe_fft_cufft: matches!(fft_mode.as_str(), "cufft" | "cuda" | "cu_fft"),
             quantize_weights: env::var("VOCAL_TRT_WEIGHT_INT8")
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),

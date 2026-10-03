@@ -142,6 +142,7 @@ impl NativeTensorRtBuilder {
             rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
             fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
+            rmvpe_external_stft: 0,
         };
 
         let canonical = package
@@ -252,6 +253,7 @@ impl NativeTensorRtBuilder {
             rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
             fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
+            rmvpe_external_stft: 0,
         };
         options.min_frames = self.options.min_samples;
         options.opt_frames = self.options.opt_samples;
@@ -476,6 +478,7 @@ impl NativeTensorRtBuilder {
             rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
             fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
+            rmvpe_external_stft: self.options.rmvpe_fft_cufft as i32,
         };
         // RMVPE's waveform binding is profiled in complete 160-sample hops.
         // Keep the measured application sample points exact; the graph itself

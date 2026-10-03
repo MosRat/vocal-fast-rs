@@ -48,6 +48,10 @@ pub(crate) struct Stream {
 pub(crate) struct CudaGraphExec {
     _private: [u8; 0],
 }
+#[repr(C)]
+pub(crate) struct CufftFrontend {
+    _private: [u8; 0],
+}
 
 unsafe extern "C" {
     pub(crate) fn vocal_cuda_event_create(out: *mut *mut c_void, error: *mut *mut c_char) -> i32;
@@ -124,6 +128,25 @@ unsafe extern "C" {
         out: *mut *mut Build,
         error: *mut *mut c_char,
     ) -> i32;
+    pub(crate) fn vocal_cufft_frontend_create(
+        samples: i32,
+        out: *mut *mut CufftFrontend,
+        error: *mut *mut c_char,
+    ) -> i32;
+    pub(crate) fn vocal_cufft_frontend_set_stream(
+        frontend: *mut CufftFrontend,
+        stream: *mut Stream,
+        error: *mut *mut c_char,
+    ) -> i32;
+    pub(crate) fn vocal_cufft_frontend_enqueue(
+        frontend: *mut CufftFrontend,
+        waveform: *const c_void,
+        waveform_bytes: usize,
+        magnitude: *mut Memory,
+        stream: *mut Stream,
+        error: *mut *mut c_char,
+    ) -> i32;
+    pub(crate) fn vocal_cufft_frontend_destroy(frontend: *mut CufftFrontend);
     pub(crate) fn vocal_trt_build_bytes(
         handle: *mut Build,
         data: *mut *mut u8,

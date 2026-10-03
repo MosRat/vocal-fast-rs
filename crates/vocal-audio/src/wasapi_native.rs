@@ -25,7 +25,7 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
     CoUninitialize,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows::core::Interface;
 
 use crate::threading::MmcssGuard;
@@ -33,8 +33,6 @@ use crate::{
     AudioClock, AudioError, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp,
     BlockAssembler, BlockDrainer, StreamConfig, WorkerIo,
 };
-
-const MAX_WAIT_MS: u32 = 1_000;
 
 #[derive(Debug, Error)]
 pub enum NativeWasapiError {
@@ -49,6 +47,7 @@ pub enum NativeWasapiError {
 /// Shared-mode stream configured through `IAudioClient3::InitializeSharedAudioStream`.
 pub struct NativeWasapiStream {
     stop: Arc<AtomicBool>,
+    stop_event: EventHandle,
     errors: Arc<Mutex<Vec<String>>>,
     latency: Option<Arc<AudioLatencyStats>>,
     joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
@@ -74,6 +73,10 @@ impl NativeWasapiStream {
         let io = crate::StreamIo::new(config)?;
         let (device, worker) = io.split();
         let stop = Arc::new(AtomicBool::new(false));
+        let stop_event = EventHandle(
+            unsafe { CreateEventW(None, true, false, None) }
+                .map_err(|error| NativeWasapiError::Startup(error.to_string()))?,
+        );
         let errors = Arc::new(Mutex::new(Vec::new()));
         let latency = clock
             .as_ref()
@@ -90,6 +93,7 @@ impl NativeWasapiStream {
             config,
             input_producer,
             Arc::clone(&stop),
+            stop_event.0.0 as usize,
             Arc::clone(&errors),
             capture_ready_tx,
             clock.clone(),
@@ -99,6 +103,7 @@ impl NativeWasapiStream {
             config,
             output_consumer,
             Arc::clone(&stop),
+            stop_event.0.0 as usize,
             Arc::clone(&errors),
             render_ready_tx,
             clock,
@@ -106,7 +111,7 @@ impl NativeWasapiStream {
         ) {
             Ok(render) => render,
             Err(error) => {
-                stop.store(true, Ordering::Release);
+                signal_stop(&stop, stop_event.0);
                 let _ = capture.join();
                 return Err(error);
             }
@@ -119,13 +124,13 @@ impl NativeWasapiStream {
             .recv()
             .unwrap_or_else(|_| Err("render thread exited before startup".into()));
         if let Err(error) = capture_result {
-            stop.store(true, Ordering::Release);
+            signal_stop(&stop, stop_event.0);
             let _ = capture.join();
             let _ = render.join();
             return Err(NativeWasapiError::Startup(error));
         }
         if let Err(error) = render_result {
-            stop.store(true, Ordering::Release);
+            signal_stop(&stop, stop_event.0);
             let _ = capture.join();
             let _ = render.join();
             return Err(NativeWasapiError::Startup(error));
@@ -134,6 +139,7 @@ impl NativeWasapiStream {
         Ok((
             Self {
                 stop,
+                stop_event,
                 errors,
                 latency,
                 joins: Some((capture, render)),
@@ -158,7 +164,7 @@ impl NativeWasapiStream {
     }
 
     fn shutdown(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        signal_stop(&self.stop, self.stop_event.0);
         if let Some((capture, render)) = self.joins.take() {
             let _ = capture.join();
             let _ = render.join();
@@ -176,6 +182,7 @@ fn spawn_capture(
     config: StreamConfig,
     input: crate::AudioProducer,
     stop: Arc<AtomicBool>,
+    stop_event: usize,
     errors: Arc<Mutex<Vec<String>>>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
@@ -183,7 +190,18 @@ fn spawn_capture(
 ) -> Result<JoinHandle<()>, NativeWasapiError> {
     thread::Builder::new()
         .name("vocal-wasapi3-capture".into())
-        .spawn(move || run_capture(config, input, stop, errors, ready, clock, latency))
+        .spawn(move || {
+            run_capture(
+                config,
+                input,
+                stop,
+                handle_from_raw(stop_event),
+                errors,
+                ready,
+                clock,
+                latency,
+            )
+        })
         .map_err(NativeWasapiError::Spawn)
 }
 
@@ -191,6 +209,7 @@ fn spawn_render(
     config: StreamConfig,
     output: crate::AudioConsumer,
     stop: Arc<AtomicBool>,
+    stop_event: usize,
     errors: Arc<Mutex<Vec<String>>>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
@@ -198,11 +217,59 @@ fn spawn_render(
 ) -> Result<JoinHandle<()>, NativeWasapiError> {
     thread::Builder::new()
         .name("vocal-wasapi3-render".into())
-        .spawn(move || run_render(config, output, stop, errors, ready, clock, latency))
+        .spawn(move || {
+            run_render(
+                config,
+                output,
+                stop,
+                handle_from_raw(stop_event),
+                errors,
+                ready,
+                clock,
+                latency,
+            )
+        })
         .map_err(NativeWasapiError::Spawn)
 }
 
 struct EventHandle(HANDLE);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitResult {
+    Audio,
+    Stop,
+    Error,
+}
+
+// `windows::HANDLE` wraps a raw pointer and is intentionally not `Send` in
+// the bindings. A kernel event handle is process-global, so pass its integer
+// representation through the thread boundary and reconstruct the wrapper on
+// the target thread. The owning `EventHandle` remains in `NativeWasapiStream`
+// until both threads have joined.
+fn handle_from_raw(raw: usize) -> HANDLE {
+    HANDLE(raw as *mut _)
+}
+
+fn wait_for_audio(stop_event: HANDLE, audio_event: HANDLE) -> WaitResult {
+    let handles = [stop_event, audio_event];
+    let result = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+    if result == WAIT_OBJECT_0 {
+        WaitResult::Stop
+    } else if result.0 == WAIT_OBJECT_0.0.saturating_add(1) {
+        WaitResult::Audio
+    } else if result == WAIT_TIMEOUT {
+        // INFINITE cannot time out. Treat a spurious timeout as a normal
+        // wake so a future iteration can observe the stop flag or audio event.
+        WaitResult::Audio
+    } else {
+        WaitResult::Error
+    }
+}
+
+fn signal_stop(stop: &AtomicBool, stop_event: HANDLE) {
+    stop.store(true, Ordering::Release);
+    let _ = unsafe { SetEvent(stop_event) };
+}
 
 impl Drop for EventHandle {
     fn drop(&mut self) {
@@ -374,6 +441,7 @@ fn run_capture(
     config: StreamConfig,
     mut input: crate::AudioProducer,
     stop: Arc<AtomicBool>,
+    stop_event: HANDLE,
     errors: Arc<Mutex<Vec<String>>>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
@@ -419,11 +487,11 @@ fn run_capture(
     };
     let mut silence = vec![0.0; endpoint_frames * config.format.channels as usize];
     while !stop.load(Ordering::Acquire) {
-        let wait = unsafe { WaitForSingleObject(event.0, MAX_WAIT_MS) };
-        if wait == WAIT_TIMEOUT {
-            continue;
+        let wait = wait_for_audio(stop_event, event.0);
+        if wait == WaitResult::Stop {
+            break;
         }
-        if wait != WAIT_OBJECT_0 {
+        if wait == WaitResult::Error {
             record_error(&errors, "native WASAPI capture event wait failed".into());
             break;
         }
@@ -541,6 +609,7 @@ fn run_render(
     config: StreamConfig,
     mut output: crate::AudioConsumer,
     stop: Arc<AtomicBool>,
+    stop_event: HANDLE,
     errors: Arc<Mutex<Vec<String>>>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
@@ -587,11 +656,11 @@ fn run_render(
     };
     let mut samples = vec![0.0; endpoint_frames * config.format.channels as usize];
     while !stop.load(Ordering::Acquire) {
-        let wait = unsafe { WaitForSingleObject(event.0, MAX_WAIT_MS) };
-        if wait == WAIT_TIMEOUT {
-            continue;
+        let wait = wait_for_audio(stop_event, event.0);
+        if wait == WaitResult::Stop {
+            break;
         }
-        if wait != WAIT_OBJECT_0 {
+        if wait == WaitResult::Error {
             record_error(&errors, "native WASAPI render event wait failed".into());
             break;
         }

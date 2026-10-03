@@ -10,6 +10,7 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -506,6 +507,7 @@ fn run_capture(
         }
     };
     let mut silence = vec![0.0; endpoint_frames * config.format.channels as usize];
+    let mut last_callback = None;
     while !stop.load(Ordering::Acquire) {
         let wait = wait_for_audio(stop_event, event.0);
         if wait == WaitResult::Stop {
@@ -515,6 +517,11 @@ fn run_capture(
             record_error(&errors, "native WASAPI capture event wait failed".into());
             break;
         }
+        record_callback_tick(
+            latency.as_deref(),
+            &mut last_callback,
+            config.block_duration(),
+        );
         loop {
             let packet_frames = match unsafe { capture.GetNextPacketSize() } {
                 Ok(frames) => frames as usize,
@@ -675,6 +682,7 @@ fn run_render(
         }
     };
     let mut samples = vec![0.0; endpoint_frames * config.format.channels as usize];
+    let mut last_callback = None;
     while !stop.load(Ordering::Acquire) {
         let wait = wait_for_audio(stop_event, event.0);
         if wait == WaitResult::Stop {
@@ -684,6 +692,11 @@ fn run_render(
             record_error(&errors, "native WASAPI render event wait failed".into());
             break;
         }
+        record_callback_tick(
+            latency.as_deref(),
+            &mut last_callback,
+            config.block_duration(),
+        );
         let available = match unsafe { client.GetCurrentPadding() } {
             Ok(padding) => endpoint_frames.saturating_sub(padding as usize),
             Err(error) => {
@@ -826,6 +839,20 @@ fn packet_timestamp(
             mapped.unwrap_or_else(|| clock.now())
         }
         None => AudioTimestamp::ZERO,
+    }
+}
+
+fn record_callback_tick(
+    latency: Option<&AudioLatencyStats>,
+    last_callback: &mut Option<Instant>,
+    expected: Duration,
+) {
+    let Some(latency) = latency else {
+        return;
+    };
+    let now = Instant::now();
+    if let Some(previous) = last_callback.replace(now) {
+        latency.record_callback_period(now.saturating_duration_since(previous), expected);
     }
 }
 

@@ -10,6 +10,7 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use wasapi::{
@@ -393,6 +394,20 @@ fn record_error(errors: &Mutex<Vec<String>>, error: String) {
     }
 }
 
+fn record_callback_tick(
+    latency: Option<&AudioLatencyStats>,
+    last_callback: &mut Option<Instant>,
+    expected: Duration,
+) {
+    let Some(latency) = latency else {
+        return;
+    };
+    let now = Instant::now();
+    if let Some(previous) = last_callback.replace(now) {
+        latency.record_callback_period(now.saturating_duration_since(previous), expected);
+    }
+}
+
 fn capture_loop(
     config: StreamConfig,
     mode: WasapiMode,
@@ -431,6 +446,7 @@ fn capture_loop(
             config.format.sample_rate,
         );
     }
+    let mut last_callback = None;
     while !stop.load(Ordering::Acquire) {
         if let Err(error) = event.wait_for_event(1000) {
             if !matches!(error, wasapi::WasapiError::EventTimeout) {
@@ -439,6 +455,11 @@ fn capture_loop(
             }
             continue;
         }
+        record_callback_tick(
+            latency.as_deref(),
+            &mut last_callback,
+            config.block_duration(),
+        );
         loop {
             let packet_frames = match capture.get_next_packet_size() {
                 Ok(Some(frames)) => frames as usize,
@@ -597,6 +618,7 @@ fn render_loop(
         }
     };
     let channels = config.format.channels as usize;
+    let mut last_callback = None;
     while !stop.load(Ordering::Acquire) {
         if let Err(error) = event.wait_for_event(1000) {
             if !matches!(error, wasapi::WasapiError::EventTimeout) {
@@ -605,6 +627,11 @@ fn render_loop(
             }
             continue;
         }
+        record_callback_tick(
+            profile.stats.as_deref(),
+            &mut last_callback,
+            config.block_duration(),
+        );
         let frames = match client.get_available_space_in_frames() {
             Ok(frames) => frames as usize,
             Err(error) => {

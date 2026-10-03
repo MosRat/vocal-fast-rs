@@ -123,6 +123,10 @@ pub struct AudioLatencyStats {
     max_endpoint_frames: AtomicU64,
     max_endpoint_nanos: AtomicU64,
     latency_buckets: [AtomicU64; 64],
+    callback_periods: AtomicU64,
+    callback_period_total_nanos: AtomicU64,
+    callback_jitter_max_nanos: AtomicU64,
+    callback_jitter_buckets: [AtomicU64; 64],
 }
 
 impl Default for AudioLatencyStats {
@@ -142,6 +146,10 @@ impl Default for AudioLatencyStats {
             max_endpoint_frames: AtomicU64::new(0),
             max_endpoint_nanos: AtomicU64::new(0),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            callback_periods: AtomicU64::new(0),
+            callback_period_total_nanos: AtomicU64::new(0),
+            callback_jitter_max_nanos: AtomicU64::new(0),
+            callback_jitter_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -165,6 +173,13 @@ pub struct AudioLatencySnapshot {
     pub p95: Option<Duration>,
     pub p99: Option<Duration>,
     pub p999: Option<Duration>,
+    pub callback_periods: u64,
+    pub callback_period_mean: Option<Duration>,
+    pub callback_jitter_max: Option<Duration>,
+    pub callback_jitter_p50: Option<Duration>,
+    pub callback_jitter_p95: Option<Duration>,
+    pub callback_jitter_p99: Option<Duration>,
+    pub callback_jitter_p999: Option<Duration>,
 }
 
 impl AudioLatencyStats {
@@ -236,6 +251,20 @@ impl AudioLatencyStats {
         }
     }
 
+    /// Record one event-to-event interval from a device callback thread.
+    /// This is opt-in with the rest of the profile and uses a separate
+    /// histogram from capture-to-render age so scheduling jitter is not hidden
+    /// by queue residency.
+    pub fn record_callback_period(&self, actual: Duration, expected: Duration) {
+        let actual_nanos = actual.as_nanos().min(u64::MAX as u128) as u64;
+        let expected_nanos = expected.as_nanos().min(u64::MAX as u128) as u64;
+        let jitter_nanos = actual_nanos.abs_diff(expected_nanos);
+        saturating_add(&self.callback_periods, 1);
+        saturating_add(&self.callback_period_total_nanos, actual_nanos);
+        update_max(&self.callback_jitter_max_nanos, jitter_nanos);
+        self.callback_jitter_buckets[latency_bucket(jitter_nanos)].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> AudioLatencySnapshot {
         let samples = self.samples.load(Ordering::Relaxed);
         let to_duration = |nanos| (samples > 0).then(|| Duration::from_nanos(nanos));
@@ -266,6 +295,25 @@ impl AudioLatencyStats {
             p95: self.percentile(samples, 95, 100),
             p99: self.percentile(samples, 99, 100),
             p999: self.percentile(samples, 999, 1000),
+            callback_periods: self.callback_periods.load(Ordering::Relaxed),
+            callback_period_mean: {
+                let periods = self.callback_periods.load(Ordering::Relaxed);
+                (periods > 0).then(|| {
+                    Duration::from_nanos(
+                        self.callback_period_total_nanos
+                            .load(Ordering::Relaxed)
+                            .saturating_div(periods),
+                    )
+                })
+            },
+            callback_jitter_max: {
+                let nanos = self.callback_jitter_max_nanos.load(Ordering::Relaxed);
+                (nanos > 0).then(|| Duration::from_nanos(nanos))
+            },
+            callback_jitter_p50: self.callback_percentile(50, 100),
+            callback_jitter_p95: self.callback_percentile(95, 100),
+            callback_jitter_p99: self.callback_percentile(99, 100),
+            callback_jitter_p999: self.callback_percentile(999, 1000),
         }
     }
 
@@ -279,6 +327,25 @@ impl AudioLatencyStats {
             / denominator;
         let mut cumulative = 0_u64;
         for (index, bucket) in self.latency_buckets.iter().enumerate() {
+            cumulative = cumulative.saturating_add(bucket.load(Ordering::Relaxed));
+            if cumulative >= target {
+                return Some(Duration::from_nanos(bucket_upper_nanos(index)));
+            }
+        }
+        Some(Duration::from_nanos(u64::MAX))
+    }
+
+    fn callback_percentile(&self, numerator: u64, denominator: u64) -> Option<Duration> {
+        let samples = self.callback_periods.load(Ordering::Relaxed);
+        if samples == 0 {
+            return None;
+        }
+        let target = samples
+            .saturating_mul(numerator)
+            .saturating_add(denominator - 1)
+            / denominator;
+        let mut cumulative = 0_u64;
+        for (index, bucket) in self.callback_jitter_buckets.iter().enumerate() {
             cumulative = cumulative.saturating_add(bucket.load(Ordering::Relaxed));
             if cumulative >= target {
                 return Some(Duration::from_nanos(bucket_upper_nanos(index)));

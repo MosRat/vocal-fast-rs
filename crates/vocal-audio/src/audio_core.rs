@@ -78,6 +78,22 @@ mod tests {
     }
 
     #[test]
+    fn latency_profile_tracks_callback_jitter_separately() {
+        let stats = AudioLatencyStats::default();
+        stats.record_callback_period(Duration::from_millis(10), Duration::from_millis(10));
+        stats.record_callback_period(Duration::from_millis(12), Duration::from_millis(10));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.callback_periods, 2);
+        assert_eq!(
+            snapshot.callback_period_mean,
+            Some(Duration::from_millis(11))
+        );
+        assert!(snapshot.callback_jitter_max >= Some(Duration::from_millis(2)));
+        assert!(snapshot.callback_jitter_p95 >= Some(Duration::from_millis(2)));
+        assert_eq!(snapshot.samples, 0);
+    }
+
+    #[test]
     fn opt_in_timestamps_survive_the_ring_boundary() {
         let clock = AudioClock::new();
         let timestamp = clock.now();

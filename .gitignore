@@ -1,0 +1,21 @@
+/target
+**/*.vfr
+models/*/*.pth
+models/*/*.index
+!models/fixture-rvc-v2/model.pth
+!models/fixture-rvc-v2/model.index
+# Shared HuBERT/RMVPE weights are local runtime assets and are not committed.
+models/shared/**/*.bin
+models/shared/**/*.pt
+models/shared/**/*.onnx
+models/shared/**/*.onnx.data
+models/voices/**/*.pth
+models/voices/**/*.index
+models/voices/**/*.onnx
+.venv/
+.venv-cuda/
+**/__pycache__/
+testdata/generated/
+
+# External reference checkouts used only for local parity tests.
+ref_repos/

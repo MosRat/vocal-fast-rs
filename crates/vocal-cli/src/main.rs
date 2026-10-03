@@ -258,6 +258,10 @@ fn test_trt_pipeline(
                 "rvc_frames": result.rvc_frames, "hubert_features": result.hubert_features,
                 "rvc_features": result.rvc_features, "pitchf": result.pitchf,
                 "aligned_pitchf": result.aligned_pitchf, "pitch": result.pitch,
+                "rmvpe_mel": result.rmvpe_mel, "rmvpe_gru": result.rmvpe_gru,
+                "rmvpe_bottleneck": result.rmvpe_bottleneck,
+                "rmvpe_unet": result.rmvpe_unet,
+                "rmvpe_logits": result.rmvpe_logits,
                 "audio": result.audio,
             }))?,
         )?;

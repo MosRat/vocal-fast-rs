@@ -93,6 +93,18 @@ struct Options {
     int32_t rmvpe_stft_precision;
     int32_t rmvpe_gru_precision;
     int32_t rmvpe_logits_precision;
+    // Emit only RMVPE parity tensors (kept separate from Synth debug outputs).
+    int32_t rmvpe_debug_outputs;
+    // 0 = compact DFT convolution (production default), 1 = experimental
+    // radix-2 graph frontend with lower cancellation error.
+    int32_t rmvpe_fft_mode;
+    // Keep the RVC encoder Q/K/V projections separate by default. The fused
+    // HuBERT path is independent; RVC fusion changes long-sequence
+    // accumulation order and is enabled only for an explicit A/B experiment.
+    int32_t fused_rvc_qkv;
+    // HuBERT feature extractor precision is independent from the projection
+    // and Transformer encoder precision.
+    int32_t hubert_feature_precision;
 };
 
 inline uint16_t float_to_half_bits(float value) noexcept {

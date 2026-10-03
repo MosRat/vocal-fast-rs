@@ -221,6 +221,52 @@ def main() -> None:
             torch.tensor([frames], dtype=torch.long),
             torch.tensor([0], dtype=torch.long),
         ).numpy()
+        # Isolate HuBERT feature sensitivity from TensorRT Synth and RMVPE/F0
+        # differences: both PyTorch runs use the same reference pitch, rnd and
+        # NSF noise, while only the feature sequence is swapped.
+        native_feature_audio = synthesize(
+            net,
+            torch.from_numpy(
+                np.asarray(debug["rvc_features"], dtype=np.float32).reshape(
+                    1, frames, 768
+                )
+            ),
+            torch.from_numpy(reference_pitch[None]),
+            torch.from_numpy(reference_pitchf[None]),
+            torch.from_numpy(rnd),
+            torch.tensor([frames], dtype=torch.long),
+            torch.tensor([0], dtype=torch.long),
+        ).numpy()
+        native_pitch_audio = synthesize(
+            net,
+            torch.from_numpy(reference_features[None]),
+            torch.from_numpy(pitch_native[None]),
+            torch.from_numpy(pitchf_native[None]),
+            torch.from_numpy(rnd),
+            torch.tensor([frames], dtype=torch.long),
+            torch.tensor([0], dtype=torch.long),
+        ).numpy()
+        pitch_component_audio = {}
+        for name, coarse, continuous in (
+            ("coarse_only", pitch_native, reference_pitchf),
+            ("continuous_only", reference_pitch, pitchf_native),
+        ):
+            pitch_component_audio[name] = synthesize(
+                net,
+                torch.from_numpy(reference_features[None]),
+                torch.from_numpy(coarse[None]),
+                torch.from_numpy(continuous[None]),
+                torch.from_numpy(rnd),
+                torch.tensor([frames], dtype=torch.long),
+                torch.tensor([0], dtype=torch.long),
+            ).numpy()
+
+    # NSF integrates frequency for upsample/sample_rate seconds per RVC frame.
+    # Report unwrapped phase drift, without claiming it measures perceptual loss.
+    pitch_delta = pitchf_native.astype(np.float64) - reference_pitchf.astype(np.float64)
+    phase_cycles = np.cumsum(pitch_delta) * upsample / int(
+        config["metadata"]["rvc_config"]["sample_rate"]
+    )
 
     result = {
         "scope": "complete waveform HuBERT/RMVPE/frontend/Synth parity",
@@ -247,6 +293,20 @@ def main() -> None:
             ),
         },
         "final_audio": stats(reference_audio, native_audio),
+        "hubert_feature_sensitivity": stats(reference_audio, native_feature_audio),
+        "pitch_sensitivity": stats(reference_audio, native_pitch_audio),
+        "pitch_component_sensitivity": {
+            name: stats(reference_audio, value)
+            for name, value in pitch_component_audio.items()
+        },
+        "pitch_phase_drift": {
+            "mean_signed_hz": float(pitch_delta.mean()),
+            "final_cycles": float(phase_cycles[-1]),
+            "max_abs_cycles": float(np.abs(phase_cycles).max()),
+            "coarse_mismatch_frames": np.flatnonzero(
+                reference_pitch != pitch_native
+            ).tolist(),
+        },
         "synth_only_with_native_inputs": stats(stage_reference, native_audio),
     }
     report = args.report or args.debug.with_name("end-to-end-parity.json")

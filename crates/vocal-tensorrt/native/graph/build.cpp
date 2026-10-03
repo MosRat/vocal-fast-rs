@@ -56,8 +56,9 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         g.mark(audio,"audio");
         require(g.used.size()==count,"not every canonical weight was consumed");
         require(bc->addOptimizationProfile(profile)>=0,"addOptimizationProfile");
-        std::fprintf(stderr,"[RVC] %d native layers, %zu weights, F0=%d, fused_qkv=%d, dispatch=%d\n",
-                     n->getNbLayers(),g.used.size(),c->uses_f0,options->fused_qkv,options->dispatch_tune);
+        std::fprintf(stderr,"[RVC] %d native layers, %zu weights, F0=%d, fused_hubert_qkv=%d, fused_rvc_qkv=%d, dispatch=%d\n",
+                     n->getNbLayers(),g.used.size(),c->uses_f0,options->fused_qkv,
+                     options->fused_rvc_qkv,options->dispatch_tune);
         auto result=new Build();
         result->mem=b->buildSerializedNetwork(*n,*bc);
         require(result->mem,"buildSerializedNetwork RVC failed");

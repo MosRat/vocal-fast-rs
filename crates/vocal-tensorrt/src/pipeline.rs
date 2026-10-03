@@ -341,6 +341,15 @@ pub struct RvcTrtPipelineArtifacts {
     #[serde(default)]
     pub hubert_precision: PrecisionMode,
     #[serde(default)]
+    pub hubert_feature_precision: PrecisionMode,
+    #[serde(default)]
+    pub rmvpe_fft_mode: u8,
+    /// Whether the RMVPE plan exposes parity-only mel/U-Net/GRU/logit
+    /// outputs. Runtime binding uses the manifest so a debug plan cannot be
+    /// accidentally executed as a production plan (or vice versa).
+    #[serde(default)]
+    pub rmvpe_debug_outputs: bool,
+    #[serde(default)]
     pub rmvpe_precision: PrecisionMode,
     #[serde(default)]
     pub rmvpe_encoder_precision: PrecisionMode,
@@ -368,6 +377,10 @@ pub struct RvcTrtPipelineArtifacts {
     /// Whether native acoustic and Synth plans used the fused Q/K/V path.
     #[serde(default)]
     pub fused_qkv: bool,
+    /// Whether the RVC encoder used the optional fused Q/K/V Conv1d path.
+    /// HuBERT fusion is recorded separately in `fused_qkv`.
+    #[serde(default)]
+    pub fused_rvc_qkv: bool,
 }
 
 impl RvcTrtPipelineArtifacts {
@@ -409,6 +422,13 @@ impl RvcTrtPipelineArtifacts {
         };
         let precision = builder_options.precision;
         let hubert_precision = builder_options.hubert_precision;
+        let hubert_feature_precision = builder_options.hubert_feature_precision;
+        let rmvpe_fft_mode = if builder_options.rmvpe_fft_radix2 {
+            1
+        } else {
+            0
+        };
+        let rmvpe_debug_outputs = builder_options.rmvpe_debug_outputs;
         let rmvpe_precision = builder_options.rmvpe_precision;
         let rmvpe_encoder_precision = builder_options.rmvpe_encoder_precision;
         let rmvpe_decoder_precision = builder_options.rmvpe_decoder_precision;
@@ -431,12 +451,14 @@ impl RvcTrtPipelineArtifacts {
         };
         let weight_int8 = builder_options.quantize_weights;
         let fused_qkv = builder_options.fused_qkv;
+        let fused_rvc_qkv = builder_options.fused_rvc_qkv;
         let mut options = builder_options.clone();
         options.output = output_dir.as_ref().join("hubert.plan");
         options.min_samples = profile.min_samples;
         options.opt_samples = profile.opt_samples;
         options.max_samples = profile.max_samples;
         options.precision = hubert_precision;
+        options.hubert_feature_precision = hubert_feature_precision;
         options.dispatch_tune = dispatch_tune;
         let hubert_plan = compile("hubert", options)?;
         // RMVPE has two application shapes. Build each as a fixed profile so
@@ -499,6 +521,9 @@ impl RvcTrtPipelineArtifacts {
             profile,
             precision,
             hubert_precision,
+            hubert_feature_precision,
+            rmvpe_fft_mode,
+            rmvpe_debug_outputs,
             rmvpe_precision,
             rmvpe_encoder_precision,
             rmvpe_decoder_precision,
@@ -511,6 +536,7 @@ impl RvcTrtPipelineArtifacts {
             dispatch_tune,
             weight_int8,
             fused_qkv,
+            fused_rvc_qkv,
         })
     }
 }
@@ -538,6 +564,14 @@ pub struct RvcTrtOutput {
     /// F0 after the native frontend crop, also only for parity diagnostics.
     pub aligned_pitchf: Option<Vec<f32>>,
     pub pitch: Option<Vec<i32>>,
+    /// RMVPE diagnostic tensors emitted by a debug build. These remain on
+    /// device in the production graph and are absent unless the plan was
+    /// compiled with `VOCAL_TRT_RMVPE_DEBUG_OUTPUTS=1`.
+    pub rmvpe_mel: Option<Vec<f32>>,
+    pub rmvpe_bottleneck: Option<Vec<f32>>,
+    pub rmvpe_unet: Option<Vec<f32>>,
+    pub rmvpe_gru: Option<Vec<f32>>,
+    pub rmvpe_logits: Option<Vec<f32>>,
     pub hubert_frames: usize,
     pub pitch_frames: usize,
     pub rvc_frames: usize,
@@ -613,6 +647,11 @@ pub struct RvcTrtPipeline {
     feats: CudaBuffer,
     pitch: CudaBuffer,
     pitchf: CudaBuffer,
+    rmvpe_debug_mel: CudaBuffer,
+    rmvpe_debug_bottleneck: CudaBuffer,
+    rmvpe_debug_unet: CudaBuffer,
+    rmvpe_debug_gru: CudaBuffer,
+    rmvpe_debug_logits: CudaBuffer,
     pitch_cache: CudaBuffer,
     pitch_cache_scratch: CudaBuffer,
     rnd: CudaBuffer,
@@ -626,6 +665,7 @@ pub struct RvcTrtPipeline {
     last_sid: Option<i32>,
     last_p_len: Option<i32>,
     debug_intermediates: bool,
+    rmvpe_debug_outputs: bool,
     shape_key: Option<PipelineShapeKey>,
     native_cuda_graphs: bool,
     native_graph_shape: Option<PipelineShapeKey>,
@@ -727,6 +767,17 @@ impl RvcTrtPipeline {
             .try_fold(1usize, |v, r| v.checked_mul(*r as usize))
             .ok_or_else(|| NativeBuildError::Argument("upsample product overflow".into()))?;
         let alloc = |bytes: usize| CudaBuffer::new(bytes.max(4));
+        // These capacities cover the largest shipped realtime profile. The
+        // RMVPE U-Net reflects mel time to a multiple of 32 (44960 -> 288),
+        // so its debug bottleneck/GRU/logit outputs use the padded length even
+        // though public pitch is cropped to 282 frames. Buffers are allocated
+        // once so parity diagnostics never introduce an undersized output
+        // binding or a per-call device allocation.
+        let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs
+            || std::env::var("VOCAL_TRT_RMVPE_DEBUG_OUTPUTS")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let rmvpe_max_padded_frames = ((p.max_pitch_frames as usize + 31) / 32) * 32;
         let pitch_cache = alloc(RVC_F0_CACHE_FRAMES * 4)?;
         let pitch_cache_scratch = alloc(RVC_F0_CACHE_FRAMES * 4)?;
         pitch_cache.zero()?;
@@ -751,6 +802,11 @@ impl RvcTrtPipeline {
             feats: alloc(p.max_rvc_frames as usize * 768 * 4)?,
             pitch: alloc(p.max_rvc_frames as usize * 4)?,
             pitchf: alloc(p.max_rvc_frames as usize * 4)?,
+            rmvpe_debug_mel: alloc(p.max_pitch_frames as usize * 128 * 4)?,
+            rmvpe_debug_bottleneck: alloc(512 * (rmvpe_max_padded_frames / 32) * 4 * 4)?,
+            rmvpe_debug_unet: alloc(rmvpe_max_padded_frames * 16 * 128 * 4)?,
+            rmvpe_debug_gru: alloc(rmvpe_max_padded_frames * 512 * 4)?,
+            rmvpe_debug_logits: alloc(rmvpe_max_padded_frames * 360 * 4)?,
             pitch_cache,
             pitch_cache_scratch,
             rnd: alloc(latent * p.max_rvc_frames as usize * 4)?,
@@ -761,6 +817,7 @@ impl RvcTrtPipeline {
             last_sid: None,
             last_p_len: None,
             debug_intermediates: false,
+            rmvpe_debug_outputs,
             shape_key: None,
             native_cuda_graphs,
             native_graph_shape: None,
@@ -1040,6 +1097,26 @@ impl RvcTrtPipeline {
         )?;
         rmvpe.set_tensor_address("threshold", self.threshold.device_ptr())?;
         rmvpe.set_tensor_address("pitchf", self.pitchf_raw.device_ptr())?;
+        if self.rmvpe_debug_outputs {
+            rmvpe.set_tensor_address("rmvpe_debug_mel", self.rmvpe_debug_mel.device_ptr())?;
+            rmvpe.set_tensor_address(
+                "rmvpe_debug_bottleneck",
+                self.rmvpe_debug_bottleneck.device_ptr(),
+            )?;
+            rmvpe.set_tensor_address("rmvpe_debug_unet", self.rmvpe_debug_unet.device_ptr())?;
+            rmvpe.set_tensor_address("rmvpe_debug_gru", self.rmvpe_debug_gru.device_ptr())?;
+            rmvpe.set_tensor_address("rmvpe_debug_logits", self.rmvpe_debug_logits.device_ptr())?;
+            if trace {
+                eprintln!(
+                    "trt trace: rmvpe debug shapes mel={:?} bottleneck={:?} unet={:?} gru={:?} logits={:?}",
+                    rmvpe.tensor_shape("rmvpe_debug_mel")?,
+                    rmvpe.tensor_shape("rmvpe_debug_bottleneck")?,
+                    rmvpe.tensor_shape("rmvpe_debug_unet")?,
+                    rmvpe.tensor_shape("rmvpe_debug_gru")?,
+                    rmvpe.tensor_shape("rmvpe_debug_logits")?,
+                );
+            }
+        }
         let pitch_shape = rmvpe.tensor_shape("pitchf")?;
         let pitch_frames = concrete_dim(&pitch_shape, 1, rmvpe_samples / 160 + 1)?;
         if trace {
@@ -1309,49 +1386,114 @@ impl RvcTrtPipeline {
             .chunks_exact(4)
             .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let (hubert_features, rvc_features, pitchf, aligned_pitchf, pitch) =
-            if self.debug_intermediates {
-                let mut feature_bytes = vec![0_u8; hubert_frames * 768 * 4];
-                self.hubert_features.download_bytes(&mut feature_bytes)?;
-                let features = feature_bytes
-                    .chunks_exact(4)
-                    .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                let mut rvc_feature_bytes = vec![0_u8; rvc_frames * 768 * 4];
-                self.feats.download_bytes(&mut rvc_feature_bytes)?;
-                let rvc_features = rvc_feature_bytes
-                    .chunks_exact(4)
-                    .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                let mut raw_pitch_bytes = vec![0_u8; pitch_frames * 4];
-                self.pitchf_raw.download_bytes(&mut raw_pitch_bytes)?;
-                let raw_pitch = raw_pitch_bytes
-                    .chunks_exact(4)
-                    .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
-                    .take(rvc_frames)
-                    .collect::<Vec<_>>();
-                let mut aligned_pitch_bytes = vec![0_u8; rvc_frames * 4];
-                self.pitchf.download_bytes(&mut aligned_pitch_bytes)?;
-                let aligned_pitchf = aligned_pitch_bytes
-                    .chunks_exact(4)
-                    .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                let mut pitch_bytes = vec![0_u8; rvc_frames * 4];
-                self.pitch.download_bytes(&mut pitch_bytes)?;
-                let coarse = pitch_bytes
-                    .chunks_exact(4)
-                    .map(|x| i32::from_le_bytes(x.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                (
-                    Some(features),
-                    Some(rvc_features),
-                    Some(raw_pitch),
-                    Some(aligned_pitchf),
-                    Some(coarse),
-                )
-            } else {
-                (None, None, None, None, None)
-            };
+        let (
+            hubert_features,
+            rvc_features,
+            pitchf,
+            aligned_pitchf,
+            pitch,
+            rmvpe_mel,
+            rmvpe_bottleneck,
+            rmvpe_unet,
+            rmvpe_gru,
+            rmvpe_logits,
+        ) = if self.debug_intermediates {
+            let mut feature_bytes = vec![0_u8; hubert_frames * 768 * 4];
+            self.hubert_features.download_bytes(&mut feature_bytes)?;
+            let features = feature_bytes
+                .chunks_exact(4)
+                .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let mut rvc_feature_bytes = vec![0_u8; rvc_frames * 768 * 4];
+            self.feats.download_bytes(&mut rvc_feature_bytes)?;
+            let rvc_features = rvc_feature_bytes
+                .chunks_exact(4)
+                .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let mut raw_pitch_bytes = vec![0_u8; pitch_frames * 4];
+            self.pitchf_raw.download_bytes(&mut raw_pitch_bytes)?;
+            let raw_pitch = raw_pitch_bytes
+                .chunks_exact(4)
+                .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                .take(rvc_frames)
+                .collect::<Vec<_>>();
+            let mut aligned_pitch_bytes = vec![0_u8; rvc_frames * 4];
+            self.pitchf.download_bytes(&mut aligned_pitch_bytes)?;
+            let aligned_pitchf = aligned_pitch_bytes
+                .chunks_exact(4)
+                .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let mut pitch_bytes = vec![0_u8; rvc_frames * 4];
+            self.pitch.download_bytes(&mut pitch_bytes)?;
+            let coarse = pitch_bytes
+                .chunks_exact(4)
+                .map(|x| i32::from_le_bytes(x.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let (rmvpe_mel, rmvpe_bottleneck, rmvpe_unet, rmvpe_gru, rmvpe_logits) =
+                if self.rmvpe_debug_outputs {
+                    let mut mel_bytes = vec![0_u8; pitch_frames * 128 * 4];
+                    self.rmvpe_debug_mel.download_bytes(&mut mel_bytes)?;
+                    let mel = mel_bytes
+                        .chunks_exact(4)
+                        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                        .take(128 * pitch_frames)
+                        .collect::<Vec<_>>();
+                    let padded_pitch_frames = ((pitch_frames + 31) / 32) * 32;
+                    let bottleneck_frames = padded_pitch_frames / 32;
+                    let mut bottleneck_bytes = vec![0_u8; 512 * bottleneck_frames * 4 * 4];
+                    self.rmvpe_debug_bottleneck
+                        .download_bytes(&mut bottleneck_bytes)?;
+                    let bottleneck = bottleneck_bytes
+                        .chunks_exact(4)
+                        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                        .take(512 * bottleneck_frames * 4)
+                        .collect::<Vec<_>>();
+                    let mut unet_bytes = vec![0_u8; padded_pitch_frames * 16 * 128 * 4];
+                    self.rmvpe_debug_unet.download_bytes(&mut unet_bytes)?;
+                    let unet = unet_bytes
+                        .chunks_exact(4)
+                        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                        .take(padded_pitch_frames * 16 * 128)
+                        .collect::<Vec<_>>();
+                    let mut gru_bytes = vec![0_u8; padded_pitch_frames * 512 * 4];
+                    self.rmvpe_debug_gru.download_bytes(&mut gru_bytes)?;
+                    let gru = gru_bytes
+                        .chunks_exact(4)
+                        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                        .take(512 * padded_pitch_frames)
+                        .collect::<Vec<_>>();
+                    let mut logits_bytes = vec![0_u8; padded_pitch_frames * 360 * 4];
+                    self.rmvpe_debug_logits.download_bytes(&mut logits_bytes)?;
+                    let logits = logits_bytes
+                        .chunks_exact(4)
+                        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                        .take(360 * padded_pitch_frames)
+                        .collect::<Vec<_>>();
+                    (
+                        Some(mel),
+                        Some(bottleneck),
+                        Some(unet),
+                        Some(gru),
+                        Some(logits),
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
+            (
+                Some(features),
+                Some(rvc_features),
+                Some(raw_pitch),
+                Some(aligned_pitchf),
+                Some(coarse),
+                rmvpe_mel,
+                rmvpe_bottleneck,
+                rmvpe_unet,
+                rmvpe_gru,
+                rmvpe_logits,
+            )
+        } else {
+            (None, None, None, None, None, None, None, None, None, None)
+        };
         let non_finite = audio.iter().any(|v| !v.is_finite())
             || hubert_features
                 .as_ref()
@@ -1371,6 +1513,11 @@ impl RvcTrtPipeline {
             pitchf,
             aligned_pitchf,
             pitch,
+            rmvpe_mel,
+            rmvpe_bottleneck,
+            rmvpe_unet,
+            rmvpe_gru,
+            rmvpe_logits,
             hubert_frames,
             pitch_frames,
             rvc_frames,

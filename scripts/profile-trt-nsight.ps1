@@ -37,8 +37,14 @@ $env:VOCAL_TRT_WARMUP = "$Warmup"
 $env:VOCAL_TRT_PIPELINE_ITERATIONS = "$Iterations"
 $env:VOCAL_TRT_DEBUG_INTERMEDIATES = "0"
 $env:VOCAL_TRT_LAYER_PROFILE = "0"
+$env:VOCAL_TRT_NATIVE_CUDA_GRAPH = "1"
 
+# Node-level graph tracing keeps device kernels visible after TensorRT-RTX has
+# switched from capture to replay. Without it, Nsight often records only the
+# first two graph launches while the host NVTX ranges continue for all 100
+# iterations, making the kernel summary look like a JIT hotspot.
 & $nsys profile --trace=cuda,nvtx --cuda-trace-scope=process-tree --cuda-event-trace=true `
+    --cuda-graph-trace=node `
     --sample=none --stats=true --force-overwrite=true `
     --output=$Output $binaryPath model profile-trt-pipeline $pipelinePath $modelPath $inputPath
 if ($LASTEXITCODE -ne 0) {

@@ -26,9 +26,10 @@ struct HubertGraph {
     std::deque<std::vector<uint16_t>> low_constants;
     std::deque<std::vector<int32_t>> integers;
     int elementwise_id = 0;
+    int active_precision = 0;
 
     HubertGraph(INetworkDefinition& net, Options const& options, Weight const* ws, size_t count)
-        : n(net), o(options) {
+        : n(net), o(options), active_precision(options.hubert_feature_precision) {
         for (size_t i = 0; i < count; ++i) {
             require(weights.emplace(ws[i].name, ws + i).second, "duplicate HuBERT weight");
         }
@@ -41,18 +42,18 @@ struct HubertGraph {
     Weights w(std::string const& name) const {
         auto const& p = weight(name);
         require(p.rank <= 4, "HuBERT weight rank exceeds ABI");
-        if (o.precision == 0) return {DataType::kFLOAT, p.data, p.count};
+        if (active_precision == 0) return {DataType::kFLOAT, p.data, p.count};
         auto* self = const_cast<HubertGraph*>(this);
         self->low_constants.emplace_back(static_cast<size_t>(p.count));
         auto& dst = self->low_constants.back();
         for (int64_t i = 0; i < p.count; ++i)
-            dst[static_cast<size_t>(i)] = o.precision == 1
+            dst[static_cast<size_t>(i)] = active_precision == 1
                 ? float_to_half_bits(p.data[i]) : float_to_bf16_bits(p.data[i]);
-        return {o.precision == 1 ? DataType::kHALF : DataType::kBF16, dst.data(), p.count};
+        return {active_precision == 1 ? DataType::kHALF : DataType::kBF16, dst.data(), p.count};
     }
     DataType real_type() const {
-        return o.precision == 1 ? DataType::kHALF
-             : o.precision == 2 ? DataType::kBF16 : DataType::kFLOAT;
+        return active_precision == 1 ? DataType::kHALF
+             : active_precision == 2 ? DataType::kBF16 : DataType::kFLOAT;
     }
     T output(ILayer* layer, char const* name = nullptr) {
         require(layer != nullptr, name ? std::string("HuBERT layer failed: ") + name : "HuBERT layer failed");
@@ -62,11 +63,11 @@ struct HubertGraph {
         return tensor;
     }
     T constant(std::vector<float> values, Dims dims) {
-        if (o.precision != 0) {
+        if (active_precision != 0) {
             low_constants.emplace_back(values.size());
             auto& dst = low_constants.back();
             for (size_t i = 0; i < values.size(); ++i)
-                dst[i] = o.precision == 1 ? float_to_half_bits(values[i]) : float_to_bf16_bits(values[i]);
+                dst[i] = active_precision == 1 ? float_to_half_bits(values[i]) : float_to_bf16_bits(values[i]);
             return output(n.addConstant(dims, {real_type(), dst.data(), static_cast<int64_t>(dst.size())}));
         }
         constants.push_back(std::move(values));
@@ -112,6 +113,7 @@ struct HubertGraph {
         if (real_type() == DataType::kFLOAT) return x;
         return output(n.addCast(*x, real_type()));
     }
+    void set_precision(int value) { active_precision = value; }
     T matmul(T a, T b, bool transpose_b = false) {
         return output(n.addMatrixMultiply(*a, MatrixOperation::kNONE, *b,
                                           transpose_b ? MatrixOperation::kTRANSPOSE : MatrixOperation::kNONE));
@@ -147,14 +149,14 @@ struct HubertGraph {
         // ordinary parameters. This keeps FP32/FP16/BF16 A/B comparisons
         // numerically identical apart from the GEMM accumulation order.
         T matrix;
-        if (o.precision == 0) {
+        if (active_precision == 0) {
             matrix = output(n.addConstant(hdims({1, in, 3 * out}),
                 {DataType::kFLOAT, fused.data(), static_cast<int64_t>(fused.size())}));
         } else {
             low_constants.emplace_back(fused.size());
             auto& low = low_constants.back();
             for (size_t i = 0; i < fused.size(); ++i)
-                low[i] = o.precision == 1 ? float_to_half_bits(fused[i]) : float_to_bf16_bits(fused[i]);
+                low[i] = active_precision == 1 ? float_to_half_bits(fused[i]) : float_to_bf16_bits(fused[i]);
             matrix = output(n.addConstant(hdims({1, in, 3 * out}),
                 {real_type(), low.data(), static_cast<int64_t>(low.size())}));
         }
@@ -252,7 +254,12 @@ struct HubertGraph {
         return linear(context, p + "out_proj", 768, 768);
     }
     T build(T waveform) {
-        auto x = reshape(waveform, hdims({1, 1, 1, -1}));
+        // The convolutional feature extractor is the most FP16-sensitive
+        // HuBERT region. Keep its input, GroupNorm and weights at the
+        // dedicated frontend precision, then switch to the main precision
+        // before feature projection and the Transformer encoder.
+        set_precision(o.hubert_feature_precision);
+        auto x = reshape(cast_real(waveform), hdims({1, 1, 1, -1}));
         static int const kernels[] = {10, 3, 3, 3, 3, 2, 2};
         static int const strides[] = {5, 2, 2, 2, 2, 2, 2};
         for (int i = 0; i < 7; ++i) {
@@ -274,15 +281,31 @@ struct HubertGraph {
             }
             x = activation(x, ActivationType::kGELU_ERF);
         }
-        x = reshape(x, hdims({1, -1, 512}));
+        // The feature extractor is laid out as [B, C, T].  HuBERT's feature
+        // projection consumes [B, T, C]; a reshape here would only reinterpret
+        // the contiguous buffer and would mix neighbouring channels with time
+        // steps.  Keep the explicit transpose from the exported graph.
+        // Convolution uses a 2-D TensorRT representation [B,C,1,T].  Drop
+        // the singleton spatial axis before changing the semantic order.
+        x = reshape(x, hdims({1, 512, -1}));
+        x = transpose(x, {0, 2, 1});
+        set_precision(o.precision);
+        x = cast_real(x);
         x = layer_norm(x, "hubert.model.feature_projection.layer_norm", 512);
         x = linear(x, "hubert.model.feature_projection.projection", 512, 768);
         // Positional convolution uses the normalized weight exported by the
         // converter.  Keep the sequence length dynamic and crop the extra
         // right padding with a shape-driven slice in a later refinement.
-        auto pos = reshape(x, hdims({1, 768, 1, -1}));
+        // Positional convolution operates on [B, C, T].  The projection above
+        // is [B, T, C], so transpose before adding the singleton 2-D spatial
+        // dimension used by TensorRT's grouped convolution.
+        auto pos = transpose(x, {0, 2, 1});
+        pos = reshape(pos, hdims({1, 768, 1, -1}));
         auto* pos_layer = n.addConvolutionNd(
             *pos, 768, hdims({1, 128}),
+            // The acoustic converter folds Hubert's weight_norm(dim=2) into
+            // the canonical `conv.weight`; the runtime consumes that stable
+            // effective tensor directly.
             w("hubert.model.encoder.pos_conv_embed.conv.weight"),
             w("hubert.model.encoder.pos_conv_embed.conv.bias"));
         require(pos_layer, "HuBERT positional convolution");
@@ -295,16 +318,21 @@ struct HubertGraph {
         auto target = concat({integer({1, 768, 1}, hdims({3})), sequence}, 0);
         auto* crop = n.addSlice(*pos4, hdims({0, 0, 0, 0}), hdims({1, 1, 1, 1}), hdims({1, 1, 1, 1}));
         require(crop, "HuBERT positional crop"); crop->setInput(2, *target);
-        pos = reshape(output(crop), hdims({1, -1, 768}));
+        pos = transpose(reshape(output(crop), hdims({1, 768, 1, -1})), {0, 3, 1, 2});
+        pos = reshape(pos, hdims({1, -1, 768}));
         pos = activation(pos, ActivationType::kGELU_ERF);
         x = layer_norm(add(x, pos), "hubert.model.encoder.layer_norm", 768);
         for (int i = 0; i < 12; ++i) {
             auto prefix = std::string("hubert.model.encoder.layers.") + std::to_string(i);
-            auto y = add(x, attention(x, i));
-            y = layer_norm(y, prefix + ".layer_norm", 768);
+            // HubertEncoderLayer keeps the post-attention residual for the
+            // feed-forward block.  The second residual is added after the
+            // first LayerNorm (the normalized tensor is the FFN residual).
+            auto residual = add(x, attention(x, i));
+            auto ffn_residual = layer_norm(residual, prefix + ".layer_norm", 768);
+            auto y = ffn_residual;
             y = activation(linear(y, prefix + ".feed_forward.intermediate_dense", 768, 3072), ActivationType::kGELU_ERF);
             y = linear(y, prefix + ".feed_forward.output_dense", 3072, 768);
-            x = layer_norm(add(x, y), prefix + ".final_layer_norm", 768);
+            x = layer_norm(add(ffn_residual, y), prefix + ".final_layer_norm", 768);
         }
         return x;
     }

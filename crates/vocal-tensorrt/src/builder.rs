@@ -96,7 +96,7 @@ impl NativeTensorRtBuilder {
     pub fn compile_vfrm(&self, package: &ModelPackage) -> Result<PathBuf, NativeBuildError> {
         if std::env::var("VOCAL_TRT_LOG_BUILD_OPTIONS").ok().as_deref() == Some("1") {
             eprintln!(
-                "[RVC-RUST] synth output={} frames={}/{}/{} precision={:?} fp16={} debug={} fused_qkv={} dispatch={} resblock={:?} mask=0x{:x} workspace={}",
+                "[RVC-RUST] synth output={} frames={}/{}/{} precision={:?} fp16={} debug={} fused_hubert_qkv={} fused_rvc_qkv={} dispatch={} resblock={:?} mask=0x{:x} workspace={}",
                 self.options.output.display(),
                 self.options.min_frames,
                 self.options.opt_frames,
@@ -105,6 +105,7 @@ impl NativeTensorRtBuilder {
                 self.options.fp16,
                 self.options.debug_outputs,
                 self.options.fused_qkv,
+                self.options.fused_rvc_qkv,
                 self.options.dispatch_tune.code(),
                 self.options.synth_resblock_precision,
                 self.options.synth_resblock_stage_mask,
@@ -137,6 +138,10 @@ impl NativeTensorRtBuilder {
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
             rmvpe_gru_precision: self.options.rmvpe_gru_precision.code(),
             rmvpe_logits_precision: self.options.rmvpe_logits_precision.code(),
+            rmvpe_debug_outputs: self.options.rmvpe_debug_outputs as i32,
+            rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
+            fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
+            hubert_feature_precision: self.options.hubert_feature_precision.code(),
         };
 
         let canonical = package
@@ -243,6 +248,10 @@ impl NativeTensorRtBuilder {
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
             rmvpe_gru_precision: self.options.rmvpe_gru_precision.code(),
             rmvpe_logits_precision: self.options.rmvpe_logits_precision.code(),
+            rmvpe_debug_outputs: self.options.rmvpe_debug_outputs as i32,
+            rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
+            fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
+            hubert_feature_precision: self.options.hubert_feature_precision.code(),
         };
         options.min_frames = self.options.min_samples;
         options.opt_frames = self.options.opt_samples;
@@ -463,6 +472,10 @@ impl NativeTensorRtBuilder {
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
             rmvpe_gru_precision: self.options.rmvpe_gru_precision.code(),
             rmvpe_logits_precision: self.options.rmvpe_logits_precision.code(),
+            rmvpe_debug_outputs: self.options.rmvpe_debug_outputs as i32,
+            rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
+            fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
+            hubert_feature_precision: self.options.hubert_feature_precision.code(),
         };
         // RMVPE's waveform binding is profiled in complete 160-sample hops.
         // Keep the measured application sample points exact; the graph itself

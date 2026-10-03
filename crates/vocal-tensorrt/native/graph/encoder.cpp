@@ -34,7 +34,7 @@ T Layers::attention(T x,T mask,int layer) {
     }
 
     T q,k,v;
-    if (o.fused_qkv && !o.quantize_weights) {
+    if (o.fused_rvc_qkv && !o.quantize_weights) {
         auto qkv=fused_qkv_conv(x,p+".conv_",c.hidden);
         q=fused_heads(qkv,0);
         k=fused_heads(qkv,c.hidden);

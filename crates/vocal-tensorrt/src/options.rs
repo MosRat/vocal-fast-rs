@@ -118,6 +118,15 @@ pub struct NativeBuildOptions {
     /// This is a diagnostic-only build mode; production plans keep a single
     /// public `audio` output.
     pub debug_outputs: bool,
+    /// Emit RMVPE mel/U-Net/GRU/logit tensors for stage parity diagnostics.
+    /// This is independent of the Synth debug outputs above.
+    #[serde(default)]
+    pub rmvpe_debug_outputs: bool,
+    /// Use the experimental radix-2 FFT frontend. The compact DFT
+    /// convolution remains the production default until the larger graph's
+    /// build and replay cost is characterized on each GPU.
+    #[serde(default)]
+    pub rmvpe_fft_radix2: bool,
     /// Explicit INT8 per-output-channel weight quantization. This is an
     /// experiment: activations stay floating point and sensitive affine
     /// parameters are kept in their original precision.
@@ -127,16 +136,26 @@ pub struct NativeBuildOptions {
     /// available through `VOCAL_TRT_FUSED_QKV=0` for A/B measurements.
     #[serde(default = "default_fused_qkv")]
     pub fused_qkv: bool,
+    /// Fuse only the RVC encoder Q/K/V Conv1d projections. This is separate
+    /// from HuBERT fusion because long Synth sequences accumulate a larger
+    /// numerical difference when the three convolutions share one tactic.
+    #[serde(default)]
+    pub fused_rvc_qkv: bool,
     /// Per-engine precision overrides. `precision` remains the compatibility
     /// fallback; RMVPE additionally exposes region-level precision fields,
     /// while a non-FP32 Synth build uses mixed precision: FP32 encoder/flow
     /// and a low-precision NSF/HiFi-GAN decoder.
     #[serde(default)]
     pub hubert_precision: PrecisionMode,
+    /// HuBERT convolutional feature extractor precision. The default follows
+    /// `hubert_precision`; override it to keep the sensitive frontend in
+    /// FP32 while the projection and Transformer tail use FP16/BF16.
+    #[serde(default)]
+    pub hubert_feature_precision: PrecisionMode,
     #[serde(default)]
     pub rmvpe_precision: PrecisionMode,
-    /// RMVPE U-Net encoder/decoder precision. The default is FP16 for Tensor
-    /// Core throughput; STFT, GRU, and logits remain FP32 by default.
+    /// RMVPE U-Net encoder/decoder precision. The default is FP32 for F0
+    /// parity; FP16 is an explicit Tensor Core throughput experiment.
     #[serde(default)]
     pub rmvpe_encoder_precision: PrecisionMode,
     #[serde(default)]
@@ -172,6 +191,26 @@ fn default_fused_qkv() -> bool {
 impl Default for NativeBuildOptions {
     fn default() -> Self {
         let precision = PrecisionMode::from_env();
+        // Keep RMVPE conservative by default.  Its U-Net can be lowered to
+        // FP16 independently, but the native full-chain F0 gate must pass
+        // before that is selected for a deployment.  An explicit RMVPE
+        // precision request remains unambiguous and selects both U-Net
+        // regions unless a region override is provided.
+        let rmvpe_precision_env = env::var("VOCAL_TRT_RMVPE_PRECISION").ok();
+        let rmvpe_precision = rmvpe_precision_env
+            .as_deref()
+            .map(PrecisionMode::from_name)
+            .unwrap_or(PrecisionMode::Fp32);
+        let rmvpe_unet_default = rmvpe_precision_env
+            .as_deref()
+            .map(PrecisionMode::from_name)
+            .unwrap_or(PrecisionMode::Fp32);
+        let hubert_precision = PrecisionMode::from_env_or("VOCAL_TRT_HUBERT_PRECISION", precision);
+        let hubert_feature_precision =
+            PrecisionMode::from_env_or("VOCAL_TRT_HUBERT_FEATURE_PRECISION", hubert_precision);
+        let fft_mode = env::var("VOCAL_TRT_RMVPE_FFT")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         Self {
             sdk_root: env::var_os("TENSORRT_RTX_ROOT")
                 .or_else(|| env::var_os("TRT_RTX_ROOT"))
@@ -196,6 +235,10 @@ impl Default for NativeBuildOptions {
             debug_outputs: env::var("VOCAL_TRT_DEBUG_GRAPH_OUTPUTS")
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            rmvpe_debug_outputs: env::var("VOCAL_TRT_RMVPE_DEBUG_OUTPUTS")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            rmvpe_fft_radix2: matches!(fft_mode.as_str(), "1" | "true" | "radix2"),
             quantize_weights: env::var("VOCAL_TRT_WEIGHT_INT8")
                 .ok()
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
@@ -203,15 +246,19 @@ impl Default for NativeBuildOptions {
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
-            hubert_precision: PrecisionMode::from_env_or("VOCAL_TRT_HUBERT_PRECISION", precision),
-            rmvpe_precision: PrecisionMode::from_env_or("VOCAL_TRT_RMVPE_PRECISION", precision),
+            fused_rvc_qkv: env::var("VOCAL_TRT_FUSED_RVC_QKV")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            hubert_precision,
+            hubert_feature_precision,
+            rmvpe_precision,
             rmvpe_encoder_precision: PrecisionMode::from_env_or(
                 "VOCAL_TRT_RMVPE_ENCODER_PRECISION",
-                PrecisionMode::Fp16,
+                rmvpe_unet_default,
             ),
             rmvpe_decoder_precision: PrecisionMode::from_env_or(
                 "VOCAL_TRT_RMVPE_DECODER_PRECISION",
-                PrecisionMode::Fp16,
+                rmvpe_unet_default,
             ),
             // These regions are intentionally fixed at FP32. Their fields are
             // serialized for an explicit ABI contract, but are not user

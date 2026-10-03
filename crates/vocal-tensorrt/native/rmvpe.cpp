@@ -130,6 +130,32 @@ struct RmvpeGraph {
         return output(n.addCast(*x, real_type()));
     }
 
+    T gather(T data, T indices, int axis) {
+        auto* layer = n.addGather(*data, *indices, axis);
+        require(layer, "RMVPE gather");
+        return output(layer);
+    }
+
+    T integer_vector(std::vector<int32_t> values) {
+        integers.push_back(std::move(values));
+        auto const& v = integers.back();
+        return output(n.addConstant(rdims({static_cast<int64_t>(v.size())}),
+                                    {DataType::kINT32, v.data(), static_cast<int64_t>(v.size())}));
+    }
+
+    T range(T length, int maximum) {
+        require(maximum > 0, "RMVPE range maximum");
+        integers.emplace_back(static_cast<size_t>(maximum));
+        auto& values = integers.back();
+        for (int i = 0; i < maximum; ++i) values[static_cast<size_t>(i)] = i;
+        auto* slice = n.addSlice(*n.addConstant(rdims({maximum}),
+                                                {DataType::kINT32, values.data(), maximum})->getOutput(0),
+                                 rdims({0}), rdims({maximum}), rdims({1}));
+        require(slice, "RMVPE range slice");
+        slice->setInput(2, *length);
+        return output(slice);
+    }
+
     T conv(T x, int node, int out_channels, bool bias = true) {
         auto prefix = std::string("rmvpe.node.") + std::to_string(node);
         auto* l = n.addConvolutionNd(*x, out_channels, rdims({3, 3}),
@@ -165,6 +191,12 @@ struct RmvpeGraph {
 
     T deconv(T x, int node, int out_channels, int input_width) {
         auto prefix = std::string("rmvpe.node.") + std::to_string(node);
+        // Encoder and decoder may use different precisions.  The first
+        // decoder block consumes the FP32 bottleneck when only the decoder is
+        // lowered; cast before zero insertion so all decoder-side elementwise
+        // constants have one type and TensorRT's shape/type validator sees a
+        // valid graph.
+        x = cast_real(x);
         // TensorRT-RTX 1.6 may select cuDNN ConvBwdData kernels for native
         // deconvolution that are unavailable on pre-Blackwell GPUs. Express
         // the exact operator with a zero-insertion stage followed by a
@@ -238,6 +270,11 @@ struct RmvpeGraph {
 
     // Two Conv-BN-ReLU paths with a residual shortcut, matching ConvBlockRes.
     T residual_block(T x, int conv1, int conv2, int shortcut, int in_channels, int out_channels) {
+        // The shipped ONNX export folds the BatchNorm parameters inside every
+        // residual ConvBlockRes into the convolution weights.  Only the
+        // encoder input and decoder transposed-convolution BatchNorm nodes
+        // remain explicit in the graph, and those are handled at their call
+        // sites below.
         auto y = act(conv(x, conv1, out_channels), ActivationType::kRELU);
         y = conv(y, conv2, out_channels);
         y = act(y, ActivationType::kRELU);
@@ -313,6 +350,7 @@ struct RmvpeGraph {
     }
 
     T fourier_mel(T waveform) {
+        if (options.rmvpe_fft_mode != 0) return fourier_mel_radix2(waveform);
         auto samples = shape_dim(waveform, 1);
         auto input = reshape(waveform, rdims({1, 1, 1, -1}));
         // torch.stft(center=True, pad_mode="reflect") pads 512 samples on
@@ -366,6 +404,125 @@ struct RmvpeGraph {
         require(reduce, "RMVPE Fourier magnitude");
         auto magnitude = reshape(output(reduce), rdims({1, kBins, -1}));
         magnitude = unary(magnitude, UnaryOperation::kSQRT);
+        auto mel_basis = reshape(parameter("rmvpe.mel_basis", rdims({128, kBins})), rdims({1, 128, kBins}));
+        auto mel = output(n.addMatrixMultiply(*mel_basis, MatrixOperation::kNONE,
+                                              *magnitude, MatrixOperation::kNONE),
+                          "rmvpe.frontend.mel");
+        auto* clip = n.addActivation(*mel, ActivationType::kCLIP);
+        require(clip, "RMVPE mel clamp");
+        clip->setAlpha(1.0e-5f);
+        clip->setBeta(1.0e30f);
+        mel = unary(output(clip, "rmvpe.frontend.mel_clamp"), UnaryOperation::kLOG);
+        return mel;
+    }
+
+    T fourier_mel_radix2(T waveform) {
+        auto samples = shape_dim(waveform, 1);
+        auto input = reshape(waveform, rdims({1, 1, 1, -1}));
+        // torch.stft(center=True, pad_mode="reflect") pads 512 samples on
+        // each side before the 1024-point analysis window.  Express the
+        // reflection with dynamic reverse slices so the waveform profile can
+        // remain shape-polymorphic.
+        auto pad = reshape(integer(512), rdims({1}));
+        auto left_start = pad;
+        auto two = reshape(integer(2), rdims({1}));
+        auto right_start = sub(samples, two);
+        auto left = slice_dynamic(input, left_start, pad, 3, 4, -1);
+        auto right = slice_dynamic(input, right_start, pad, 3, 4, -1);
+        std::array<T,3> padded_parts{left, input, right};
+        auto* padded_cat = n.addConcatenation(padded_parts.data(), 3);
+        require(padded_cat, "RMVPE waveform reflect pad");
+        padded_cat->setAxis(3);
+        input = output(padded_cat, "rmvpe.frontend.waveform_padded");
+
+        // Expand the overlapping STFT frames with a gather and evaluate a
+        // radix-2 FFT in graph layers.  The old 1024-wide DFT convolution is
+        // fast, but its single long FP32 reduction leaves a sizeable residual
+        // on bins whose true magnitude is near zero.  The residual survives
+        // the 1e-5 mel clamp and moves RMVPE's continuous F0 by roughly
+        // 0.1 Hz on the 440 Hz fixture.  Pairwise radix-2 butterflies keep
+        // the same FP32 contract while reducing the cancellation error to the
+        // level of the PyTorch/cuFFT reference; no host intermediate or ONNX
+        // graph is introduced.
+        constexpr int kNfft = 1024;
+        constexpr int kBins = 513;
+        auto one = reshape(integer_vector({1}), rdims({1}));
+        auto hop = reshape(integer_vector({160}), rdims({1}));
+        auto frame_count = add(div(samples, hop), one);
+        auto frame_offsets = reshape(range(frame_count, options.max_frames + 1), rdims({-1, 1}));
+        frame_offsets = mul(frame_offsets, reshape(hop, rdims({1, 1})));
+        std::vector<int32_t> sample_offsets(kNfft);
+        for (int i = 0; i < kNfft; ++i) sample_offsets[static_cast<size_t>(i)] = i;
+        auto offsets = reshape(integer_vector(std::move(sample_offsets)), rdims({1, kNfft}));
+        auto indices = add(frame_offsets, offsets);
+        auto waveform_flat = reshape(input, rdims({1, -1}));
+        auto frames = gather(waveform_flat, indices, 1);
+
+        constexpr float kPi = 3.14159265358979323846f;
+        std::vector<float> hann(kNfft);
+        for (int i = 0; i < kNfft; ++i)
+            hann[static_cast<size_t>(i)] = 0.5f - 0.5f * std::cos(2.0f * kPi * i / kNfft);
+        auto window = constant_fp32(std::move(hann), rdims({1, 1, kNfft}));
+        auto real = mul(frames, window);
+        auto imag = mul(real, constant_fp32({0.0f}, rdims({1, 1, 1})));
+
+        std::vector<int32_t> bit_reverse(kNfft);
+        for (int i = 0; i < kNfft; ++i) {
+            int value = i;
+            int reversed = 0;
+            for (int bit = 0; bit < 10; ++bit) {
+                reversed = (reversed << 1) | (value & 1);
+                value >>= 1;
+            }
+            bit_reverse[static_cast<size_t>(i)] = reversed;
+        }
+        real = gather(real, integer_vector(std::move(bit_reverse)), 2);
+        // The imaginary input is zero; it needs no separate bit-reversal.
+        imag = mul(real, constant_fp32({0.0f}, rdims({1, 1, 1})));
+
+        for (int stage = 1; stage <= 10; ++stage) {
+            int width = 1 << stage;
+            int half = width >> 1;
+            int groups = kNfft / width;
+            auto shaped_real = reshape(real, rdims({1, -1, groups, width}));
+            auto shaped_imag = reshape(imag, rdims({1, -1, groups, width}));
+            std::vector<int32_t> first_indices(static_cast<size_t>(half));
+            std::vector<int32_t> second_indices(static_cast<size_t>(half));
+            for (int i = 0; i < half; ++i) {
+                first_indices[static_cast<size_t>(i)] = i;
+                second_indices[static_cast<size_t>(i)] = i + half;
+            }
+            auto first = integer_vector(std::move(first_indices));
+            auto second = integer_vector(std::move(second_indices));
+            auto ar = gather(shaped_real, first, 3);
+            auto br = gather(shaped_real, second, 3);
+            auto ai = gather(shaped_imag, first, 3);
+            auto bi = gather(shaped_imag, second, 3);
+            std::vector<float> twiddle_real(static_cast<size_t>(half));
+            std::vector<float> twiddle_imag(static_cast<size_t>(half));
+            for (int i = 0; i < half; ++i) {
+                float phase = 2.0f * kPi * static_cast<float>(i) / static_cast<float>(width);
+                twiddle_real[static_cast<size_t>(i)] = std::cos(phase);
+                twiddle_imag[static_cast<size_t>(i)] = -std::sin(phase);
+            }
+            auto wr = constant_fp32(std::move(twiddle_real), rdims({1, 1, 1, half}));
+            auto wi = constant_fp32(std::move(twiddle_imag), rdims({1, 1, 1, half}));
+            auto tr = sub(mul(br, wr), mul(bi, wi));
+            auto ti = add(mul(br, wi), mul(bi, wr));
+            auto out_real = n.addConcatenation(std::array<T, 2>{add(ar, tr), sub(ar, tr)}.data(), 2);
+            auto out_imag = n.addConcatenation(std::array<T, 2>{add(ai, ti), sub(ai, ti)}.data(), 2);
+            require(out_real && out_imag, "RMVPE FFT butterfly concat");
+            real = reshape(output(out_real), rdims({1, -1, kNfft}));
+            imag = reshape(output(out_imag), rdims({1, -1, kNfft}));
+        }
+
+        std::vector<int32_t> bin_indices(kBins);
+        for (int i = 0; i < kBins; ++i) bin_indices[static_cast<size_t>(i)] = i;
+        auto bins = integer_vector(std::move(bin_indices));
+        real = gather(real, bins, 2);
+        imag = gather(imag, bins, 2);
+        auto magnitude = unary(add(mul(real, real), mul(imag, imag)), UnaryOperation::kSQRT);
+        magnitude = transpose(magnitude, {0, 2, 1});
         auto mel_basis = reshape(parameter("rmvpe.mel_basis", rdims({128, kBins})), rdims({1, 128, kBins}));
         auto mel = output(n.addMatrixMultiply(*mel_basis, MatrixOperation::kNONE,
                                               *magnitude, MatrixOperation::kNONE),
@@ -442,6 +599,18 @@ struct RmvpeGraph {
         T mel{};
         active_precision = 0; // STFT/mel is intentionally FP32.
         mel = fourier_mel(waveform); // [1, 128, T]
+        // Diagnostic outputs are enabled only for a debug build.  Keeping
+        // these tensors as explicit engine outputs lets the parity harness
+        // compare the handwritten frontend and recurrent tail without
+        // downloading every internal activation or changing the production
+        // graph topology.
+        if (options.rmvpe_debug_outputs) {
+            auto* debug_mel = n.addIdentity(*mel);
+            require(debug_mel, "RMVPE debug mel");
+            debug_mel->setName("rmvpe.debug.mel");
+            debug_mel->getOutput(0)->setName("rmvpe_debug_mel");
+            n.markOutput(*debug_mel->getOutput(0));
+        }
         active_precision = options.rmvpe_encoder_precision;
         auto original_frames = shape_dim(mel, 2);
         mel = pad_mel_to_multiple(mel, original_frames);
@@ -470,8 +639,34 @@ struct RmvpeGraph {
             x = pool(x);
             in_channels = out_channels;
         }
-        static int const mid[4][3] = {{138,140,142},{144,146,-1},{149,151,-1},{154,156,-1}};
-        for (auto const& b : mid) x = residual_block(x, b[0], b[1], b[2], in_channels, 512);
+        // The intermediate module has four layers, each containing four
+        // residual blocks.  The previous graph expanded only the first
+        // layer (the first four calls), leaving twelve trained blocks out of
+        // the inference path and shifting the F0 logits while preserving
+        // plausible tensor ranges.
+        x = residual_block(x, 138, 140, 142, in_channels, 512);
+        x = residual_block(x, 144, 146, -1, 512, 512);
+        x = residual_block(x, 149, 151, -1, 512, 512);
+        x = residual_block(x, 154, 156, -1, 512, 512);
+        x = residual_block(x, 159, 161, -1, 512, 512);
+        x = residual_block(x, 164, 166, -1, 512, 512);
+        x = residual_block(x, 169, 171, -1, 512, 512);
+        x = residual_block(x, 174, 176, -1, 512, 512);
+        x = residual_block(x, 179, 181, -1, 512, 512);
+        x = residual_block(x, 184, 186, -1, 512, 512);
+        x = residual_block(x, 189, 191, -1, 512, 512);
+        x = residual_block(x, 194, 196, -1, 512, 512);
+        x = residual_block(x, 199, 201, -1, 512, 512);
+        x = residual_block(x, 204, 206, -1, 512, 512);
+        x = residual_block(x, 209, 211, -1, 512, 512);
+        x = residual_block(x, 214, 216, -1, 512, 512);
+        if (options.rmvpe_debug_outputs) {
+            auto* debug_bottleneck = n.addIdentity(*x);
+            require(debug_bottleneck, "RMVPE debug bottleneck");
+            debug_bottleneck->setName("rmvpe.debug.bottleneck");
+            debug_bottleneck->getOutput(0)->setName("rmvpe_debug_bottleneck");
+            n.markOutput(*debug_bottleneck->getOutput(0));
+        }
         static int const dec[5][1 + 4 * 2 + 4] = {
             {219,223,225,227,229,231,234,236,239,241},
             {244,248,250,252,254,256,259,261,264,266},
@@ -509,6 +704,13 @@ struct RmvpeGraph {
         // same type. Keep the GRU boundary explicitly FP32 even if a caller
         // experiments with a low-precision field in the ABI.
         active_precision = 0;
+        if (options.rmvpe_debug_outputs) {
+            auto* debug_unet = n.addIdentity(*x);
+            require(debug_unet, "RMVPE debug U-Net");
+            debug_unet->setName("rmvpe.debug.unet");
+            debug_unet->getOutput(0)->setName("rmvpe_debug_unet");
+            n.markOutput(*debug_unet->getOutput(0));
+        }
         x = output(n.addCast(*x, DataType::kFLOAT), "rmvpe.gru.input_fp32");
         auto* head = n.addConvolutionNd(*x, 3, rdims({3,3}), w("rmvpe.node.344.weight"), w("rmvpe.node.344.bias"));
         require(head, "RMVPE salience head"); head->setPaddingNd(rdims({1,1}));
@@ -521,11 +723,25 @@ struct RmvpeGraph {
         auto* direction_cat = n.addConcatenation(std::array<T,2>{fwd,rev}.data(), 2);
         require(direction_cat, "RMVPE bidirectional concat"); direction_cat->setAxis(2);
         auto both = output(direction_cat);
+        if (options.rmvpe_debug_outputs) {
+            auto* debug_gru = n.addIdentity(*both);
+            require(debug_gru, "RMVPE debug GRU");
+            debug_gru->setName("rmvpe.debug.gru");
+            debug_gru->getOutput(0)->setName("rmvpe_debug_gru");
+            n.markOutput(*debug_gru->getOutput(0));
+        }
         active_precision = 0;
         both = output(n.addCast(*both, DataType::kFLOAT), "rmvpe.logits.input_fp32");
         auto logits_full = add(output(n.addMatrixMultiply(*both, MatrixOperation::kNONE,
                                                      *parameter("rmvpe.node.360.weight", rdims({1,512,360})), MatrixOperation::kNONE)),
                           reshape(parameter("rmvpe.node.361.bias", rdims({360})), rdims({1,1,360})));
+        if (options.rmvpe_debug_outputs) {
+            auto* debug_logits = n.addIdentity(*logits_full);
+            require(debug_logits, "RMVPE debug logits");
+            debug_logits->setName("rmvpe.debug.logits");
+            debug_logits->getOutput(0)->setName("rmvpe_debug_logits");
+            n.markOutput(*debug_logits->getOutput(0));
+        }
         // Salience argmax and the nine-bin weighted average are extremely
         // sensitive to half-precision ties. The decode tail is always FP32;
         // the U-Net is the only region intentionally lowered by default.

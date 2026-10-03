@@ -166,7 +166,11 @@ def convert(kind: str, source: Path, output: Path) -> None:
             base = initializer.name.removesuffix(".parametrizations.weight.original1")
             gain = raw_values.get(base + ".parametrizations.weight.original0")
             if gain is not None:
-                norm = np.linalg.vector_norm(value.astype(np.float32), axis=(1, 2), keepdims=True)
+                # Hubert applies weight_norm(dim=2): the norm is over the
+                # output and input channel axes for each kernel position.
+                # Folding over (1,2) would produce a per-output-channel norm
+                # and silently change the positional embedding scale.
+                norm = np.linalg.vector_norm(value.astype(np.float32), axis=(0, 1), keepdims=True)
                 value = value.astype(np.float32) * gain / np.maximum(norm, np.finfo(np.float32).tiny)
                 semantic_by_initializer[initializer.name] = base
         value = np.ascontiguousarray(value)

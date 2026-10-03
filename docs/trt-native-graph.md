@@ -43,15 +43,18 @@ faster.
 
 The native builders fuse the three HuBERT `q_proj`/`k_proj`/`v_proj` linear
 layers into one `[768,2304]` GEMM and split the result at the attention input
-boundary. The RVC encoder applies the same transformation to its three
-`Conv1d(hidden,hidden,1)` projections, producing one `[3*hidden,...]`
-convolution before relative attention. Fused constants are assembled from the
-canonical HuBERT `[in,out]` and RVC `[out,in,k]` layouts, so the runtime does
-not need to know whether a model came from PTH or ONNX. Set
-`VOCAL_TRT_FUSED_QKV=0` for an unfused A/B build. HuBERT is bit-identical to
-the unfused FP32 plan on the 6400-sample fixture; Synth differences remain at
-approximately `1e-3` relative L2 and come from the larger convolution's CUDA
-accumulation order.
+boundary. Fused constants are assembled from the canonical HuBERT `[in,out]`
+layout, so the runtime does not need to know whether a model came from PTH or
+ONNX. HuBERT fusion is enabled by `VOCAL_TRT_FUSED_QKV` and is bit-identical
+to the separate FP32 fixture in the current A/B test.
+
+The RVC encoder has a separate optional fusion switch,
+`VOCAL_TRT_FUSED_RVC_QKV`. It combines the three `Conv1d(hidden,hidden,1)`
+projections into one `[3*hidden,...]` convolution before relative attention,
+using the canonical `[out,in,k]` layout. Long Synth sequences amplify the
+different CUDA accumulation order: the 44960 no-fusion Synth-only error was
+`1.27e-4` RMSE, versus `1.36e-3` with both QKV paths fused. RVC fusion is
+therefore disabled by default; enable it only after a voice/model parity gate.
 
 ## Module boundaries
 
@@ -178,15 +181,33 @@ fields describe the TensorRT-managed path.
 ## Mixed precision and dispatch tuning
 
 The builder carries independent precision fields for HuBERT, RMVPE, and
-Synth. The recommended mixed candidate is
-`VOCAL_TRT_HUBERT_PRECISION=fp16`,
-`VOCAL_TRT_RMVPE_PRECISION=fp16`, and
-`VOCAL_TRT_SYNTH_PRECISION=fp32`. BF16 is exposed for hardware comparison;
-on the test RTX 3060 it is slower than FP16 and its coarser RMVPE arithmetic
-has unacceptable F0 error. Synth FP16 is an opt-in decoder experiment only.
+Synth. There are two supported operating points:
+
+* The parity profile uses FP32 HuBERT, FP32 RMVPE, and FP32 Synth. This is the
+  reference when a waveform or F0 track is being debugged.
+* The throughput profile uses HuBERT FP16, FP32 RMVPE, and the Synth decoder
+  FP16 path with residual stages left FP32 (`synth_resblock_stage_mask=0`).
+  This avoids the large HuBERT feature drift from being mistaken for an RVC
+  frontend bug while keeping the measured decoder speedup.
+
+RMVPE U-Net/head FP16, Synth residual stage masks, and BF16 are diagnostic
+options. The Python RMVPE matrix is encouraging for U-Net FP16, but the native
+full-chain F0 gate on real speech is required before selecting it by default.
+BF16 is slower on the test RTX 3060 and has substantially coarser F0
+arithmetic. The component results and QKV A/B are recorded in
+`docs/precision-profile-44960.md`.
+
+The native RMVPE encoder and decoder fields are independent. The decoder entry
+casts the FP32 bottleneck before zero-insertion/deconvolution, so an encoder
+FP32/decoder FP16 diagnostic plan remains type-correct. The current native
+measurement still rejects that combination for production: it saves about
+`1.3 ms` at 44960 but changes three coarse F0 frames. Keep both U-Net regions
+FP32 until a multi-voice gate passes; STFT, GRU, salience/logits, and decode
+remain FP32 in all supported profiles.
+
 `VOCAL_TRT_DISPATCH_TUNE=11200` or `44960` records the measured realtime
-shape policy in the native ABI; the actual TensorRT tactic remains SDK-
-selected, leaving a stable hook for timing-cache or dispatch additions.
+shape policy in the native ABI; the actual TensorRT tactic remains
+SDK-selected, leaving a stable hook for timing-cache or dispatch additions.
 
 ```powershell
 rtk cargo run -p vocal-fast --features tensorrt-rtx -- model compile-trt-pipeline \
@@ -396,12 +417,13 @@ reported end-to-end number includes host-side enqueue overhead; the stage
 columns are CUDA event timings. The layer report and Nsight kernel aggregation
 identify RMVPE GRU unroll and U-Net convolutions, HuBERT MatMul/attention
 groups, and Synth `dec.conv_pre` plus residual convolutions as the main
-arithmetic hotspots. QKV projection fusion is now part of the default graph.
-The next optimization order is CUDA Graph capture, testing dedicated
+arithmetic hotspots. HuBERT QKV projection fusion is part of the default graph;
+RVC encoder QKV fusion remains opt-in because of long-sequence accumulation
+error. The next optimization order is CUDA Graph capture, testing dedicated
 `IAttentionV2` tactics at fixed profiles, GRU unroll reduction, then selective
 INT8 calibration.
 
-With the old synthetic fused-QKV profile, the same pipeline was measured at
+With the old synthetic profile, the same pipeline was measured at
 three power-of-two points (three warmups, ten measured iterations, RTX 3060,
 FP32):
 

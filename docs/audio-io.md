@@ -80,7 +80,7 @@ When using `BlockDrainer`, the same source timestamp is returned in
 and approximate p50/p95/p99/p99.9 ages in their `latency()` snapshots. The
 snapshot also reports underflow samples, packet timestamp validity,
 discontinuities, queue high-water, overflow/stale-drop counts, and maximum
-endpoint padding. Profiled WASAPI event loops also expose callback period
+endpoint padding. Profiled device callbacks also expose callback period
 count/mean and callback jitter percentiles, so scheduling jitter can be
 distinguished from queue residency. A zero sample count means the inference worker did not
 propagate timestamps, rather than that the device measured zero latency.

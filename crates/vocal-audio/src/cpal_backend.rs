@@ -5,6 +5,7 @@
 //! [`BlockDrainer`], while the worker communicates through [`WorkerIo`].
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use thiserror::Error;
@@ -146,6 +147,7 @@ fn build_duplex_inner(
     let latency = clock
         .as_ref()
         .map(|_| Arc::new(AudioLatencyStats::default()));
+    let expected_period = config.block_duration();
 
     let DeviceIo {
         input: mut input_producer,
@@ -155,10 +157,16 @@ fn build_duplex_inner(
     let input_clock = clock.clone();
     let input_latency = latency.clone();
     let input_error = Arc::clone(&callback_error);
+    let mut input_last_callback = None;
     let input = input_device
         .build_input_stream(
             native_config,
             move |data: &[f32], _| {
+                record_callback_tick(
+                    input_latency.as_deref(),
+                    &mut input_last_callback,
+                    expected_period,
+                );
                 // A full queue is a real-time overflow. Dropping the newest
                 // block bounds latency; the ring and assembler expose counters
                 // for diagnostics.
@@ -186,10 +194,16 @@ fn build_duplex_inner(
     let output_clock = clock;
     let output_latency = latency.clone();
     let output_error = Arc::clone(&callback_error);
+    let mut output_last_callback = None;
     let output = output_device
         .build_output_stream(
             native_config,
             move |data: &mut [f32], _| {
+                record_callback_tick(
+                    output_latency.as_deref(),
+                    &mut output_last_callback,
+                    expected_period,
+                );
                 // Silence is written on underflow so the native callback never
                 // blocks behind inference.
                 if let Ok(report) = drainer.drain(data, &mut output_consumer) {
@@ -231,6 +245,20 @@ fn build_duplex_inner(
         },
         worker_io,
     ))
+}
+
+fn record_callback_tick(
+    latency: Option<&AudioLatencyStats>,
+    last_callback: &mut Option<Instant>,
+    expected: Duration,
+) {
+    let Some(latency) = latency else {
+        return;
+    };
+    let now = Instant::now();
+    if let Some(previous) = last_callback.replace(now) {
+        latency.record_callback_period(now.saturating_duration_since(previous), expected);
+    }
 }
 
 /// Prefer the native Windows host. On other platforms this returns cpal's

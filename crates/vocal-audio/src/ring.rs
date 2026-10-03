@@ -49,6 +49,7 @@ struct RingInner {
     pushed: CachePadded<AtomicU64>,
     popped: CachePadded<AtomicU64>,
     dropped_full: CachePadded<AtomicU64>,
+    dropped_stale: CachePadded<AtomicU64>,
     high_water: CachePadded<AtomicUsize>,
 }
 
@@ -80,6 +81,7 @@ impl RingInner {
             pushed: CachePadded(AtomicU64::new(0)),
             popped: CachePadded(AtomicU64::new(0)),
             dropped_full: CachePadded(AtomicU64::new(0)),
+            dropped_stale: CachePadded(AtomicU64::new(0)),
             high_water: CachePadded(AtomicUsize::new(0)),
         }))
     }
@@ -160,6 +162,7 @@ impl RingInner {
             pushed: self.pushed.0.load(Ordering::Relaxed),
             popped: self.popped.0.load(Ordering::Relaxed),
             dropped_full: self.dropped_full.0.load(Ordering::Relaxed),
+            dropped_stale: self.dropped_stale.0.load(Ordering::Relaxed),
             high_water_blocks: self.high_water.0.load(Ordering::Relaxed),
         }
     }
@@ -173,6 +176,7 @@ pub struct AudioRingStats {
     pub pushed: u64,
     pub popped: u64,
     pub dropped_full: u64,
+    pub dropped_stale: u64,
     pub high_water_blocks: usize,
 }
 
@@ -417,6 +421,14 @@ impl AudioWriteLease<'_> {
         unsafe { &mut *slot.samples.get() }
     }
 
+    pub fn samples(&self) -> &[f32] {
+        let slot = &self.producer.inner.slots[self.index % self.producer.inner.slots.len()];
+        // SAFETY: the producer owns this unpublished slot for the lifetime of
+        // the lease. This read-only view is used only to recover an unusual
+        // short packet before the lease is dropped.
+        unsafe { &*slot.samples.get() }
+    }
+
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -549,10 +561,24 @@ impl AudioConsumer {
                 actual: destination.len(),
             });
         }
-        while self.inner.stats().queued_blocks > 1 {
-            drop(self.try_acquire()?);
-        }
+        self.discard_stale();
         self.try_copy_into(destination)
+    }
+
+    /// Drop all but the newest published block. This is a consumer-side
+    /// policy: it never lets the producer overwrite a slot that a worker may
+    /// still be reading, while allowing a real-time worker to recover from a
+    /// temporary scheduling stall without replaying stale audio.
+    pub fn discard_stale(&mut self) -> usize {
+        let mut discarded = 0;
+        while self.inner.stats().queued_blocks > 1 {
+            if self.try_acquire().is_err() {
+                break;
+            }
+            self.inner.dropped_stale.0.fetch_add(1, Ordering::Relaxed);
+            discarded += 1;
+        }
+        discarded
     }
 
     pub fn try_read<R>(&mut self, read: impl FnOnce(&[f32], u64) -> R) -> Result<R, AudioError> {

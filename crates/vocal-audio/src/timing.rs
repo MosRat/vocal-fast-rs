@@ -118,6 +118,8 @@ pub struct AudioLatencyStats {
     timestamp_errors: AtomicU64,
     discontinuities: AtomicU64,
     max_queue_blocks: AtomicU64,
+    queue_overflows: AtomicU64,
+    stale_drops: AtomicU64,
     max_endpoint_frames: AtomicU64,
     max_endpoint_nanos: AtomicU64,
     latency_buckets: [AtomicU64; 64],
@@ -135,6 +137,8 @@ impl Default for AudioLatencyStats {
             timestamp_errors: AtomicU64::new(0),
             discontinuities: AtomicU64::new(0),
             max_queue_blocks: AtomicU64::new(0),
+            queue_overflows: AtomicU64::new(0),
+            stale_drops: AtomicU64::new(0),
             max_endpoint_frames: AtomicU64::new(0),
             max_endpoint_nanos: AtomicU64::new(0),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -153,6 +157,8 @@ pub struct AudioLatencySnapshot {
     pub timestamp_errors: u64,
     pub discontinuities: u64,
     pub max_queue_blocks: usize,
+    pub queue_overflows: u64,
+    pub stale_drops: u64,
     pub max_endpoint_frames: usize,
     pub max_endpoint_latency: Option<Duration>,
     pub p50: Option<Duration>,
@@ -164,8 +170,8 @@ pub struct AudioLatencySnapshot {
 impl AudioLatencyStats {
     pub fn record(&self, latency: Duration) {
         let nanos = latency.as_nanos().min(u64::MAX as u128) as u64;
-        self.samples.fetch_add(1, Ordering::Relaxed);
-        self.total_nanos.fetch_add(nanos, Ordering::Relaxed);
+        saturating_add(&self.samples, 1);
+        saturating_add(&self.total_nanos, nanos);
         self.last_nanos.store(nanos, Ordering::Relaxed);
         self.latency_buckets[latency_bucket(nanos)].fetch_add(1, Ordering::Relaxed);
         let mut max = self.max_nanos.load(Ordering::Relaxed);
@@ -183,24 +189,38 @@ impl AudioLatencyStats {
     }
 
     pub fn record_underflow(&self, samples: usize) {
-        self.underflow_samples
-            .fetch_add(samples.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+        saturating_add(
+            &self.underflow_samples,
+            samples.min(u64::MAX as usize) as u64,
+        );
     }
 
     pub fn record_device_timestamp(&self, valid: bool) {
         if valid {
-            self.timestamped_packets.fetch_add(1, Ordering::Relaxed);
+            saturating_add(&self.timestamped_packets, 1);
         } else {
-            self.timestamp_errors.fetch_add(1, Ordering::Relaxed);
+            saturating_add(&self.timestamp_errors, 1);
         }
     }
 
     pub fn record_discontinuity(&self) {
-        self.discontinuities.fetch_add(1, Ordering::Relaxed);
+        saturating_add(&self.discontinuities, 1);
     }
 
     pub fn record_queue_depth(&self, blocks: usize) {
         update_max(&self.max_queue_blocks, blocks.min(u64::MAX as usize) as u64);
+    }
+
+    pub fn record_queue_state(
+        &self,
+        queued_blocks: usize,
+        high_water_blocks: usize,
+        dropped_full: u64,
+        dropped_stale: u64,
+    ) {
+        self.record_queue_depth(queued_blocks.max(high_water_blocks));
+        update_max(&self.queue_overflows, dropped_full);
+        update_max(&self.stale_drops, dropped_stale);
     }
 
     pub fn record_endpoint(&self, queued_frames: usize, sample_rate: u32) {
@@ -235,6 +255,8 @@ impl AudioLatencyStats {
             timestamp_errors: self.timestamp_errors.load(Ordering::Relaxed),
             discontinuities: self.discontinuities.load(Ordering::Relaxed),
             max_queue_blocks: self.max_queue_blocks.load(Ordering::Relaxed) as usize,
+            queue_overflows: self.queue_overflows.load(Ordering::Relaxed),
+            stale_drops: self.stale_drops.load(Ordering::Relaxed),
             max_endpoint_frames: self.max_endpoint_frames.load(Ordering::Relaxed) as usize,
             max_endpoint_latency: {
                 let nanos = self.max_endpoint_nanos.load(Ordering::Relaxed);
@@ -288,6 +310,17 @@ fn update_max(target: &AtomicU64, value: u64) {
         match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(next) => current = next,
+        }
+    }
+}
+
+fn saturating_add(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(value);
+        match target.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
         }
     }
 }

@@ -95,13 +95,16 @@ mod tests {
         stats.record_discontinuity();
         stats.record_queue_depth(3);
         stats.record_queue_depth(2);
+        stats.record_queue_state(2, 4, 5, 1);
         stats.record_endpoint(480, 48_000);
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.underflow_samples, 4);
         assert_eq!(snapshot.timestamped_packets, 1);
         assert_eq!(snapshot.timestamp_errors, 1);
         assert_eq!(snapshot.discontinuities, 1);
-        assert_eq!(snapshot.max_queue_blocks, 3);
+        assert_eq!(snapshot.max_queue_blocks, 4);
+        assert_eq!(snapshot.queue_overflows, 5);
+        assert_eq!(snapshot.stale_drops, 1);
         assert_eq!(snapshot.max_endpoint_frames, 480);
         assert_eq!(
             snapshot.max_endpoint_latency,
@@ -244,5 +247,18 @@ mod tests {
         consumer.try_copy_latest_into(&mut latest).unwrap();
         assert_eq!(latest, [2.0, 2.0]);
         assert!(consumer.is_empty());
+        assert_eq!(consumer.stats().dropped_stale, 1);
+    }
+
+    #[test]
+    fn worker_latest_input_discards_old_blocks_before_borrowing() {
+        let io = StreamIo::new(config()).unwrap();
+        let (mut device, mut worker) = io.split();
+        device.input.try_push(&[1.0, 1.0]).unwrap();
+        device.input.try_push(&[2.0, 2.0]).unwrap();
+        let input = worker.wait_latest_input(Some(Duration::ZERO)).unwrap();
+        assert_eq!(input.samples(), &[2.0, 2.0]);
+        drop(input);
+        assert_eq!(worker.stats().input.dropped_stale, 1);
     }
 }

@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = []
 cpal-backend = ["dep:cpal"]
-wasapi-backend = ["dep:wasapi"]
+wasapi-backend = ["dep:wasapi", "dep:windows"]
 
 [dependencies]
 thiserror.workspace = true
@@ -17,3 +17,13 @@ cpal = { version = "0.18", optional = true }
 [target.'cfg(windows)'.dependencies]
 wasapi = { version = "0.25", optional = true }
 windows-sys = { version = "0.61.2", features = ["Win32_System_Performance", "Win32_System_Threading"] }
+windows = { version = "0.62.2", optional = true, features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+] }

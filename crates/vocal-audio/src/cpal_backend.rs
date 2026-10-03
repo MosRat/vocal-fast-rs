@@ -168,7 +168,13 @@ fn build_duplex_inner(
                     .unwrap_or(AudioTimestamp::ZERO);
                 let _ = assembler.push_at(data, &mut input_producer, timestamp);
                 if let Some(latency) = input_latency.as_ref() {
-                    latency.record_queue_depth(input_producer.stats().high_water_blocks);
+                    let stats = input_producer.stats();
+                    latency.record_queue_state(
+                        stats.queued_blocks,
+                        stats.high_water_blocks,
+                        stats.dropped_full,
+                        stats.dropped_stale,
+                    );
                 }
             },
             move |error| input_error(error),
@@ -189,7 +195,13 @@ fn build_duplex_inner(
                 if let Ok(report) = drainer.drain(data, &mut output_consumer) {
                     if let Some(latency) = output_latency.as_ref() {
                         latency.record_underflow(report.underflow_samples);
-                        latency.record_queue_depth(output_consumer.stats().high_water_blocks);
+                        let stats = output_consumer.stats();
+                        latency.record_queue_state(
+                            stats.queued_blocks,
+                            stats.high_water_blocks,
+                            stats.dropped_full,
+                            stats.dropped_stale,
+                        );
                         if let Some(clock) = output_clock.as_ref() {
                             let age = report
                                 .source_timestamp

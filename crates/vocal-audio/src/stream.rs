@@ -89,6 +89,24 @@ impl WorkerIo {
         self.input.try_acquire()
     }
 
+    /// Wait for input and discard already queued blocks before acquiring the
+    /// newest one. This bounds age when the model worker falls behind for a
+    /// short interval and makes the drop direction visible in ring stats.
+    pub fn wait_latest_input(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<AudioReadLease<'_>, AudioError> {
+        if !self.input.wait_for_data(timeout) {
+            return Err(AudioError::QueueEmpty);
+        }
+        self.input.discard_stale();
+        self.input.try_acquire()
+    }
+
+    pub fn discard_stale_input(&mut self) -> usize {
+        self.input.discard_stale()
+    }
+
     /// Reserve the next output block for the inference backend to fill.
     pub fn try_output(&mut self) -> Result<AudioWriteLease<'_>, AudioError> {
         self.output.try_acquire()
@@ -323,6 +341,18 @@ impl BlockDrainer {
 
     pub fn stats(&self) -> DrainStats {
         self.stats
+    }
+
+    /// Whether the next device block can be read directly from the ring.
+    /// This is the zero-copy fast path used by the native WASAPI adapter when
+    /// its engine period equals the model block size.
+    pub fn can_drain_direct(&self, output_samples: usize) -> bool {
+        self.offset == self.current.len() && output_samples == self.current.len()
+    }
+
+    #[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
+    pub(crate) fn record_direct_block(&mut self) {
+        self.stats.blocks_consumed = self.stats.blocks_consumed.saturating_add(1);
     }
 
     pub fn reset(&mut self) {

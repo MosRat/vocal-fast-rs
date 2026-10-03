@@ -21,6 +21,7 @@ use crate::{AudioClock, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp}
 use crate::{AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo};
 
 pub use crate::threading::MmcssGuard;
+pub use crate::wasapi_native::{NativeWasapiError, NativeWasapiStream};
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("the WASAPI f32 path requires a little-endian Windows target");
@@ -333,6 +334,30 @@ fn f32_bytes_mut(samples: &mut [f32]) -> &mut [u8] {
     }
 }
 
+fn packet_timestamp(
+    clock: Option<&AudioClock>,
+    latency: Option<&AudioLatencyStats>,
+    info: &wasapi::BufferInfo,
+) -> AudioTimestamp {
+    if info.flags.data_discontinuity {
+        if let Some(latency) = latency {
+            latency.record_discontinuity();
+        }
+    }
+    match clock {
+        Some(clock) => {
+            let mapped = (!info.flags.timestamp_error && info.timestamp != 0)
+                .then(|| clock.from_wasapi_qpc(info.timestamp))
+                .flatten();
+            if let Some(latency) = latency {
+                latency.record_device_timestamp(mapped.is_some());
+            }
+            mapped.unwrap_or_else(|| clock.now())
+        }
+        None => AudioTimestamp::ZERO,
+    }
+}
+
 fn record_error(errors: &Mutex<Vec<String>>, error: String) {
     if let Ok(mut errors) = errors.lock() {
         errors.push(error);
@@ -398,13 +423,91 @@ fn capture_loop(
                 break;
             }
             let byte_count = packet_frames.saturating_mul(bytes_per_frame);
-            if byte_count > samples.len() * std::mem::size_of::<f32>() {
+            if byte_count > samples.len() * std::mem::size_of::<f32>()
+                && !(packet_frames == config.block_frames && input.available_capacity() > 0)
+            {
                 record_error(
                     &errors,
                     "WASAPI capture packet exceeds endpoint buffer".into(),
                 );
                 break;
             }
+
+            // With a fixed engine period the endpoint packet is already one
+            // model block. Read it straight into the ring lease and avoid the
+            // endpoint staging buffer plus the assembler copy. If the packet
+            // shape changes, or the ring is full, fall back to the general
+            // assembler path below so the capture packet is still released.
+            let direct_result =
+                if packet_frames == config.block_frames && input.available_capacity() > 0 {
+                    match input.try_acquire() {
+                        Ok(mut lease) => {
+                            match capture.read_from_device(f32_bytes_mut(lease.samples_mut())) {
+                                Ok((frames, info)) => {
+                                    let sample_count = (frames as usize)
+                                        .saturating_mul(config.format.channels as usize);
+                                    let timestamp =
+                                        packet_timestamp(clock.as_ref(), latency.as_deref(), &info);
+                                    if frames as usize == config.block_frames {
+                                        if info.flags.silent {
+                                            lease.samples_mut().fill(0.0);
+                                        }
+                                        lease.set_timestamp(timestamp);
+                                        lease.commit();
+                                        Ok(Some((true, sample_count, timestamp)))
+                                    } else if sample_count > samples.len() {
+                                        Err("WASAPI capture packet exceeds endpoint buffer".into())
+                                    } else {
+                                        samples[..sample_count]
+                                            .copy_from_slice(&lease.samples()[..sample_count]);
+                                        if info.flags.silent {
+                                            samples[..sample_count].fill(0.0);
+                                        }
+                                        Ok(Some((false, sample_count, timestamp)))
+                                    }
+                                }
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        Err(AudioError::QueueFull) => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                    }
+                } else {
+                    Ok(None)
+                };
+            match direct_result {
+                Ok(Some((true, _, _))) => {
+                    if let Some(latency) = latency.as_ref() {
+                        let stats = input.stats();
+                        latency.record_queue_state(
+                            stats.queued_blocks,
+                            stats.high_water_blocks,
+                            stats.dropped_full,
+                            stats.dropped_stale,
+                        );
+                    }
+                    continue;
+                }
+                Ok(Some((false, sample_count, timestamp))) => {
+                    let _ = assembler.push_at(&samples[..sample_count], &mut input, timestamp);
+                    if let Some(latency) = latency.as_ref() {
+                        let stats = input.stats();
+                        latency.record_queue_state(
+                            stats.queued_blocks,
+                            stats.high_water_blocks,
+                            stats.dropped_full,
+                            stats.dropped_stale,
+                        );
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    record_error(&errors, error);
+                    break;
+                }
+            }
+
             let (frames, info) =
                 match capture.read_from_device(&mut f32_bytes_mut(&mut samples)[..byte_count]) {
                     Ok(value) => value,
@@ -417,26 +520,16 @@ fn capture_loop(
             if info.flags.silent {
                 samples[..sample_count].fill(0.0);
             }
-            if let Some(latency) = latency.as_ref() {
-                if info.flags.data_discontinuity {
-                    latency.record_discontinuity();
-                }
-            }
-            let timestamp = match clock.as_ref() {
-                Some(clock) => {
-                    let mapped = (!info.flags.timestamp_error && info.timestamp != 0)
-                        .then(|| clock.from_wasapi_qpc(info.timestamp))
-                        .flatten();
-                    if let Some(latency) = latency.as_ref() {
-                        latency.record_device_timestamp(mapped.is_some());
-                    }
-                    mapped.unwrap_or_else(|| clock.now())
-                }
-                None => AudioTimestamp::ZERO,
-            };
+            let timestamp = packet_timestamp(clock.as_ref(), latency.as_deref(), &info);
             let _ = assembler.push_at(&samples[..sample_count], &mut input, timestamp);
             if let Some(latency) = latency.as_ref() {
-                latency.record_queue_depth(input.stats().high_water_blocks);
+                let stats = input.stats();
+                latency.record_queue_state(
+                    stats.queued_blocks,
+                    stats.high_water_blocks,
+                    stats.dropped_full,
+                    stats.dropped_stale,
+                );
             }
         }
     }
@@ -495,6 +588,52 @@ fn render_loop(
         }
         let frames = frames.min(samples.len() / channels);
         let sample_count = frames * channels;
+        if drainer.can_drain_direct(sample_count) {
+            let direct_result = match output.try_acquire() {
+                Ok(lease) => {
+                    let timestamp = lease.timestamp();
+                    let write_result =
+                        render.write_to_device(frames, f32_bytes(lease.samples()), None);
+                    drop(lease);
+                    write_result
+                        .map(|()| Some(timestamp))
+                        .map_err(|error| error.to_string())
+                }
+                Err(AudioError::QueueEmpty) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            };
+            match direct_result {
+                Ok(Some(timestamp)) => {
+                    drainer.record_direct_block();
+                    if let Some(latency) = profile.stats.as_ref() {
+                        let stats = output.stats();
+                        latency.record_queue_state(
+                            stats.queued_blocks,
+                            stats.high_water_blocks,
+                            stats.dropped_full,
+                            stats.dropped_stale,
+                        );
+                        if let Ok(padding) = client.get_current_padding() {
+                            latency.record_endpoint(padding as usize, config.format.sample_rate);
+                        }
+                        if let Some(clock) = profile.clock.as_ref()
+                            && let Some(age) = timestamp
+                                .is_set()
+                                .then(|| clock.elapsed(timestamp))
+                                .flatten()
+                        {
+                            latency.record(age);
+                        }
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    record_error(&errors, error);
+                    break;
+                }
+            }
+        }
         let report = match drainer.drain(&mut samples[..sample_count], &mut output) {
             Ok(report) => report,
             Err(error) => {
@@ -504,7 +643,13 @@ fn render_loop(
         };
         if let Some(latency) = profile.stats.as_ref() {
             latency.record_underflow(report.underflow_samples);
-            latency.record_queue_depth(output.stats().high_water_blocks);
+            let stats = output.stats();
+            latency.record_queue_state(
+                stats.queued_blocks,
+                stats.high_water_blocks,
+                stats.dropped_full,
+                stats.dropped_stale,
+            );
         }
         if let Err(error) =
             render.write_to_device(frames, f32_bytes(&samples[..sample_count]), None)

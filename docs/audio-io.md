@@ -29,11 +29,20 @@ producers/consumers against one queue. A monitor path can call
 the main render path should use FIFO draining to preserve every block.
 
 `DeviceIo::stats()` and `WorkerIo::stats()` expose queue depth, pushes, pops,
-and overflow counters. `AudioIoStats::estimated_queue_latency()` converts the
+overflow counters, stale-block drops, and the high-water mark. The worker can
+choose `wait_input()` for FIFO processing or `wait_latest_input()` when bounded
+age is more important than preserving every block. `wait_latest_input()` only
+drops blocks from the consumer side, so a producer never overwrites a slot that
+the worker is reading. `AudioIoStats::estimated_queue_latency()` converts the
 current ring depth to a lower-bound queue budget. For example, a 480-frame
-block at 48 kHz is 10 ms, so four queued input blocks plus two queued output
+block at 48 kHz is 10 ms, so three queued input blocks plus three queued output
 blocks represent 60 ms of ring residency before device safety buffers and
 model execution are included.
+
+The producer publishes a generation after every commit. On Windows the worker
+waits with `WaitOnAddress` and the callback wakes it with
+`WakeByAddressSingle`; the callback never takes a mutex or sleeps. Portable
+builds retain a bounded polling fallback.
 
 The zero-copy worker loop is shaped like this:
 
@@ -56,10 +65,12 @@ render thread can then report `clock.elapsed(timestamp)` as the measured age.
 When using `BlockDrainer`, the same source timestamp is returned in
 `DrainReport::source_timestamp`.
 `cpal_backend::build_duplex_profiled` and
-`wasapi_backend::WasapiStream::open_profiled` collect the latest and maximum
-ages in their `latency()` snapshots. A zero sample count means the inference
-worker did not propagate timestamps, rather than that the device measured zero
-latency.
+`wasapi_backend::WasapiStream::open_profiled` collect latest, mean, maximum,
+and approximate p50/p95/p99/p99.9 ages in their `latency()` snapshots. The
+snapshot also reports underflow samples, packet timestamp validity,
+discontinuities, queue high-water, overflow/stale-drop counts, and maximum
+endpoint padding. A zero sample count means the inference worker did not
+propagate timestamps, rather than that the device measured zero latency.
 The default methods write `AudioTimestamp::ZERO`, so production streams do not
 pay for a clock read on every callback.
 
@@ -79,6 +90,15 @@ format and period support; it can reduce conversion latency but prevents other
 clients from using that endpoint in the selected format. The worker/ring layer
 is independent of this choice.
 
+`wasapi_backend::NativeWasapiStream` is the Windows 10+ path that performs
+this setup directly. It validates the endpoint's native f32 mix format,
+chooses a period aligned to `GetSharedModeEnginePeriod`, and initializes the
+stream with `InitializeSharedAudioStream` and event callbacks. It intentionally
+does not enable format conversion; callers should use the device's native
+sample rate and channel count or handle conversion outside the callback. The
+existing `WasapiStream` remains the wrapper based path for devices where the
+native shared client cannot be opened.
+
 The optional `cpal-backend` adapter is a portable first integration. It requests
 f32 and a fixed callback size, then still uses the assembler/drainer because a
 driver may provide another size. On Windows this uses cpal's WASAPI host, but
@@ -86,7 +106,16 @@ the adapter does not promise WASAPI exclusive mode. A native `wasapi` adapter
 can replace only the device layer while keeping `StreamIo` unchanged.
 The native adapter keeps one pre-allocated `f32` endpoint buffer per event
 thread and views it as bytes only at the WASAPI FFI boundary, so capture and
-render avoid per-sample format conversion.
+render avoid per-sample format conversion. When the endpoint packet is exactly
+one model block, capture writes directly into a ring lease and render writes a
+ring lease directly through `GetBuffer`/`ReleaseBuffer`'s high-level wrapper;
+the assembler/drainer staging copy is then skipped. Variable packet sizes and
+underflow still use the bounded staging buffers.
+
+Capture and render event threads register with Windows MMCSS under the
+`Pro Audio` task category. Registration is scoped to each thread and is
+reverted on exit. A model worker can use the exported `MmcssGuard` when its
+inference loop must share the same scheduling policy.
 
 ## Initial tuning
 

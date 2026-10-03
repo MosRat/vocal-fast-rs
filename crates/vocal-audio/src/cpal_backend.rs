@@ -14,9 +14,9 @@ use crate::{AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, Wo
 #[derive(Debug, Error)]
 pub enum CpalError {
     #[error("cpal input device has no default stream configuration: {0}")]
-    InputConfig(#[source] cpal::DefaultStreamConfigError),
+    InputConfig(#[source] cpal::Error),
     #[error("cpal output device has no default stream configuration: {0}")]
-    OutputConfig(#[source] cpal::DefaultStreamConfigError),
+    OutputConfig(#[source] cpal::Error),
     #[error("cpal callback format must be f32 (input={input:?}, output={output:?})")]
     UnsupportedSampleFormat {
         input: cpal::SampleFormat,
@@ -25,13 +25,13 @@ pub enum CpalError {
     #[error("invalid cpal stream configuration: {0}")]
     InvalidConfig(#[from] AudioError),
     #[error("failed to build input stream: {0}")]
-    BuildInput(#[source] cpal::BuildStreamError),
+    BuildInput(#[source] cpal::Error),
     #[error("failed to build output stream: {0}")]
-    BuildOutput(#[source] cpal::BuildStreamError),
+    BuildOutput(#[source] cpal::Error),
     #[error("failed to start input stream: {0}")]
-    PlayInput(#[source] cpal::PlayStreamError),
+    PlayInput(#[source] cpal::Error),
     #[error("failed to start output stream: {0}")]
-    PlayOutput(#[source] cpal::PlayStreamError),
+    PlayOutput(#[source] cpal::Error),
 }
 
 /// The two native streams. The callback closures own all mutable state, so no
@@ -63,9 +63,14 @@ pub fn build_duplex(
     config: StreamConfig,
     device_io: DeviceIo,
     worker_io: WorkerIo,
-    error_handler: impl Fn(cpal::StreamError) + Send + Sync + 'static,
+    error_handler: impl Fn(cpal::Error) + Send + Sync + 'static,
 ) -> Result<(CpalDuplexStream, WorkerIo), CpalError> {
     let config = config.validate()?;
+    if config.block_frames > u32::MAX as usize {
+        return Err(CpalError::InvalidConfig(AudioError::InvalidConfig(
+            "cpal buffer size exceeds u32::MAX frames".into(),
+        )));
+    }
     let input_default = input_device
         .default_input_config()
         .map_err(CpalError::InputConfig)?;
@@ -83,25 +88,25 @@ pub fn build_duplex(
 
     let native_config = cpal::StreamConfig {
         channels: config.format.channels,
-        sample_rate: cpal::SampleRate(config.format.sample_rate),
+        sample_rate: config.format.sample_rate,
         buffer_size: cpal::BufferSize::Fixed(config.block_frames as u32),
     };
     let callback_error = Arc::new(error_handler);
 
     let DeviceIo {
-        input: input_producer,
-        output: output_consumer,
+        input: mut input_producer,
+        output: mut output_consumer,
     } = device_io;
     let mut assembler = BlockAssembler::new(config)?;
     let input_error = Arc::clone(&callback_error);
     let input = input_device
         .build_input_stream(
-            &native_config,
+            native_config,
             move |data: &[f32], _| {
                 // A full queue is a real-time overflow. Dropping the newest
                 // block bounds latency; the ring and assembler expose counters
                 // for diagnostics.
-                let _ = assembler.push(data, &input_producer);
+                let _ = assembler.push(data, &mut input_producer);
             },
             move |error| input_error(error),
             None,
@@ -112,11 +117,11 @@ pub fn build_duplex(
     let output_error = Arc::clone(&callback_error);
     let output = output_device
         .build_output_stream(
-            &native_config,
+            native_config,
             move |data: &mut [f32], _| {
                 // Silence is written on underflow so the native callback never
                 // blocks behind inference.
-                let _ = drainer.drain(data, &output_consumer);
+                let _ = drainer.drain(data, &mut output_consumer);
             },
             move |error| output_error(error),
             None,

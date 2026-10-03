@@ -7,8 +7,12 @@ license.workspace = true
 [features]
 default = []
 cpal-backend = ["dep:cpal"]
+wasapi-backend = ["dep:wasapi"]
 
 [dependencies]
 thiserror.workspace = true
 vocal-types.workspace = true
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+wasapi = { version = "0.25", optional = true }

@@ -2,18 +2,35 @@
 //!
 //! The device callback and the inference worker have different timing
 //! requirements. A callback must not allocate or wait for a lock, while the
-//! worker needs an owned block that it can keep for the duration of inference.
-//! This crate therefore uses a pre-allocated single-producer/single-consumer
-//! ring. The producer writes directly into a slot and the consumer can either
-//! borrow a slot for the duration of a callback or copy it into a worker-owned
-//! buffer.
+//! worker needs a block that it can keep for the duration of inference. This
+//! crate therefore uses a pre-allocated single-producer/single-consumer ring.
+//! The producer and consumer expose leases so the hot path can borrow a slot
+//! directly; copy-based helpers are available only at format boundaries.
 
 use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use thiserror::Error;
 use vocal_types::{AudioChunk, AudioFormat};
+
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> Deref for CachePadded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for CachePadded<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Fixed-size block configuration shared by the device and worker sides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,12 +115,12 @@ unsafe impl Sync for RingSlot {}
 struct RingInner {
     config: StreamConfig,
     slots: Box<[RingSlot]>,
-    write: AtomicUsize,
-    read: AtomicUsize,
+    write: CachePadded<AtomicUsize>,
+    read: CachePadded<AtomicUsize>,
     next_sequence: AtomicU64,
-    pushed: AtomicU64,
-    popped: AtomicU64,
-    dropped_full: AtomicU64,
+    pushed: CachePadded<AtomicU64>,
+    popped: CachePadded<AtomicU64>,
+    dropped_full: CachePadded<AtomicU64>,
 }
 
 unsafe impl Send for RingInner {}
@@ -122,12 +139,12 @@ impl RingInner {
         Ok(Arc::new(Self {
             config,
             slots,
-            write: AtomicUsize::new(0),
-            read: AtomicUsize::new(0),
+            write: CachePadded(AtomicUsize::new(0)),
+            read: CachePadded(AtomicUsize::new(0)),
             next_sequence: AtomicU64::new(0),
-            pushed: AtomicU64::new(0),
-            popped: AtomicU64::new(0),
-            dropped_full: AtomicU64::new(0),
+            pushed: CachePadded(AtomicU64::new(0)),
+            popped: CachePadded(AtomicU64::new(0)),
+            dropped_full: CachePadded(AtomicU64::new(0)),
         }))
     }
 
@@ -139,10 +156,10 @@ impl RingInner {
             });
         }
 
-        let write = self.write.load(Ordering::Relaxed);
-        let read = self.read.load(Ordering::Acquire);
+        let write = self.write.0.load(Ordering::Relaxed);
+        let read = self.read.0.load(Ordering::Acquire);
         if write.wrapping_sub(read) >= self.slots.len() {
-            self.dropped_full.fetch_add(1, Ordering::Relaxed);
+            self.dropped_full.0.fetch_add(1, Ordering::Relaxed);
             return Err(AudioError::QueueFull);
         }
 
@@ -154,14 +171,14 @@ impl RingInner {
             (*slot.samples.get()).copy_from_slice(samples);
             *slot.sequence.get() = sequence;
         }
-        self.pushed.fetch_add(1, Ordering::Relaxed);
-        self.write.store(write.wrapping_add(1), Ordering::Release);
+        self.pushed.0.fetch_add(1, Ordering::Relaxed);
+        self.write.0.store(write.wrapping_add(1), Ordering::Release);
         Ok(sequence)
     }
 
     fn try_read<R>(&self, read_fn: impl FnOnce(&[f32], u64) -> R) -> Result<R, AudioError> {
-        let read = self.read.load(Ordering::Relaxed);
-        let write = self.write.load(Ordering::Acquire);
+        let read = self.read.0.load(Ordering::Relaxed);
+        let write = self.write.0.load(Ordering::Acquire);
         if read == write {
             return Err(AudioError::QueueEmpty);
         }
@@ -174,23 +191,19 @@ impl RingInner {
             let samples = &*slot.samples.get();
             read_fn(samples, *slot.sequence.get())
         };
-        self.popped.fetch_add(1, Ordering::Relaxed);
-        self.read.store(read.wrapping_add(1), Ordering::Release);
+        self.popped.0.fetch_add(1, Ordering::Relaxed);
+        self.read.0.store(read.wrapping_add(1), Ordering::Release);
         Ok(result)
     }
 
-    fn discard_one(&self) -> Result<(), AudioError> {
-        self.try_read(|_, _| ())
-    }
-
     fn stats(&self) -> AudioRingStats {
-        let write = self.write.load(Ordering::Acquire);
-        let read = self.read.load(Ordering::Acquire);
+        let write = self.write.0.load(Ordering::Acquire);
+        let read = self.read.0.load(Ordering::Acquire);
         AudioRingStats {
             queued_blocks: write.wrapping_sub(read).min(self.slots.len()),
-            pushed: self.pushed.load(Ordering::Relaxed),
-            popped: self.popped.load(Ordering::Relaxed),
-            dropped_full: self.dropped_full.load(Ordering::Relaxed),
+            pushed: self.pushed.0.load(Ordering::Relaxed),
+            popped: self.popped.0.load(Ordering::Relaxed),
+            dropped_full: self.dropped_full.0.load(Ordering::Relaxed),
         }
     }
 }
@@ -264,14 +277,22 @@ impl AudioRing {
     /// Split ownership for a device callback and a worker thread.
     pub fn split(self) -> (AudioProducer, AudioConsumer) {
         let config = self.inner.config;
+        let write = self.inner.write.0.load(Ordering::Relaxed);
+        let read = self.inner.read.0.load(Ordering::Relaxed);
+        let next_sequence = self.inner.next_sequence.load(Ordering::Relaxed);
         (
             AudioProducer {
                 inner: Arc::clone(&self.inner),
                 config,
+                write,
+                cached_read: read,
+                next_sequence,
             },
             AudioConsumer {
                 inner: self.inner,
                 config,
+                read,
+                cached_write: write,
             },
         )
     }
@@ -281,6 +302,9 @@ impl AudioRing {
 pub struct AudioProducer {
     inner: Arc<RingInner>,
     config: StreamConfig,
+    write: usize,
+    cached_read: usize,
+    next_sequence: u64,
 }
 
 impl AudioProducer {
@@ -288,31 +312,47 @@ impl AudioProducer {
         self.config
     }
 
-    pub fn try_push(&self, samples: &[f32]) -> Result<u64, AudioError> {
-        self.inner.try_write(samples)
+    fn reserve(&mut self) -> Result<(usize, u64), AudioError> {
+        let write = self.write;
+        if write.wrapping_sub(self.cached_read) >= self.inner.slots.len() {
+            self.cached_read = self.inner.read.0.load(Ordering::Acquire);
+            if write.wrapping_sub(self.cached_read) >= self.inner.slots.len() {
+                self.inner.dropped_full.0.fetch_add(1, Ordering::Relaxed);
+                return Err(AudioError::QueueFull);
+            }
+        }
+        Ok((write, self.next_sequence))
+    }
+
+    /// Reserve one slot. The returned lease exposes the pre-allocated sample
+    /// storage and publishes it only when [`AudioWriteLease::commit`] is called.
+    pub fn try_acquire(&mut self) -> Result<AudioWriteLease<'_>, AudioError> {
+        let (index, sequence) = self.reserve()?;
+        Ok(AudioWriteLease {
+            producer: self,
+            index,
+            sequence,
+        })
+    }
+
+    pub fn try_push(&mut self, samples: &[f32]) -> Result<u64, AudioError> {
+        if samples.len() != self.config.block_samples() {
+            return Err(AudioError::BlockSizeMismatch {
+                expected: self.config.block_samples(),
+                actual: samples.len(),
+            });
+        }
+        let mut lease = self.try_acquire()?;
+        lease.samples_mut().copy_from_slice(samples);
+        Ok(lease.commit())
     }
 
     /// Fill a queue slot in place. The callback is only invoked when a slot is
     /// available, so a device callback can avoid a temporary audio buffer.
-    pub fn try_write_with(&self, fill: impl FnOnce(&mut [f32])) -> Result<u64, AudioError> {
-        let write = self.inner.write.load(Ordering::Relaxed);
-        let read = self.inner.read.load(Ordering::Acquire);
-        if write.wrapping_sub(read) >= self.inner.slots.len() {
-            self.inner.dropped_full.fetch_add(1, Ordering::Relaxed);
-            return Err(AudioError::QueueFull);
-        }
-        let sequence = self.inner.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let slot = &self.inner.slots[write % self.inner.slots.len()];
-        // SAFETY: this producer owns the unpublished slot.
-        unsafe {
-            fill(&mut *slot.samples.get());
-            *slot.sequence.get() = sequence;
-        }
-        self.inner.pushed.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .write
-            .store(write.wrapping_add(1), Ordering::Release);
-        Ok(sequence)
+    pub fn try_write_with(&mut self, fill: impl FnOnce(&mut [f32])) -> Result<u64, AudioError> {
+        let mut lease = self.try_acquire()?;
+        fill(lease.samples_mut());
+        Ok(lease.commit())
     }
 
     pub fn available_capacity(&self) -> usize {
@@ -327,10 +367,58 @@ impl AudioProducer {
     }
 }
 
+/// A producer-side zero-copy reservation. Dropping an uncommitted lease
+/// aborts the reservation and leaves the queue index unchanged.
+#[must_use = "fill the slot and call commit(), or drop it to abort"]
+pub struct AudioWriteLease<'a> {
+    producer: &'a mut AudioProducer,
+    index: usize,
+    sequence: u64,
+}
+
+impl AudioWriteLease<'_> {
+    pub fn samples_mut(&mut self) -> &mut [f32] {
+        let slot = &self.producer.inner.slots[self.index % self.producer.inner.slots.len()];
+        // SAFETY: the producer owns this unpublished slot for the lifetime of
+        // the lease; no consumer can observe it until commit.
+        unsafe { &mut *slot.samples.get() }
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn commit(self) -> u64 {
+        let next = self.index.wrapping_add(1);
+        let sequence = self.sequence;
+        let inner = &self.producer.inner;
+        let slot = &inner.slots[self.index % inner.slots.len()];
+        // SAFETY: the lease owns the unpublished slot and the sequence is
+        // written before the release publication of the write cursor.
+        unsafe {
+            *slot.sequence.get() = sequence;
+        }
+        inner.pushed.0.fetch_add(1, Ordering::Relaxed);
+        inner.write.0.store(next, Ordering::Release);
+        self.producer.write = next;
+        self.producer.next_sequence = sequence.wrapping_add(1);
+        sequence
+    }
+}
+
+impl Drop for AudioWriteLease<'_> {
+    fn drop(&mut self) {
+        // An aborted reservation is intentionally not published. The next
+        // producer reservation reuses and fully overwrites this slot.
+    }
+}
+
 /// The only reader handle a ring should have. All methods are non-blocking.
 pub struct AudioConsumer {
     inner: Arc<RingInner>,
     config: StreamConfig,
+    read: usize,
+    cached_write: usize,
 }
 
 impl AudioConsumer {
@@ -338,32 +426,54 @@ impl AudioConsumer {
         self.config
     }
 
-    pub fn try_pop(&self) -> Result<AudioChunk, AudioError> {
-        let format = self.config.format;
-        self.inner.try_read(|samples, sequence| AudioChunk {
-            format,
-            samples: samples.to_vec(),
+    pub fn try_acquire(&mut self) -> Result<AudioReadLease<'_>, AudioError> {
+        let read = self.read;
+        if read == self.cached_write {
+            self.cached_write = self.inner.write.0.load(Ordering::Acquire);
+            if read == self.cached_write {
+                return Err(AudioError::QueueEmpty);
+            }
+        }
+        let slot_index = read % self.inner.slots.len();
+        // SAFETY: the acquire load above makes the published slot visible.
+        let sequence = unsafe { *self.inner.slots[slot_index].sequence.get() };
+        Ok(AudioReadLease {
+            consumer: self,
+            index: read,
             sequence,
         })
     }
 
-    pub fn try_copy_into(&self, destination: &mut [f32]) -> Result<u64, AudioError> {
+    pub fn try_pop(&mut self) -> Result<AudioChunk, AudioError> {
+        let format = self.config.format;
+        let lease = self.try_acquire()?;
+        let chunk = AudioChunk {
+            format,
+            samples: lease.samples().to_vec(),
+            sequence: lease.sequence(),
+        };
+        drop(lease);
+        Ok(chunk)
+    }
+
+    pub fn try_copy_into(&mut self, destination: &mut [f32]) -> Result<u64, AudioError> {
         if destination.len() != self.config.block_samples() {
             return Err(AudioError::BlockSizeMismatch {
                 expected: self.config.block_samples(),
                 actual: destination.len(),
             });
         }
-        self.inner.try_read(|samples, sequence| {
-            destination.copy_from_slice(samples);
-            sequence
-        })
+        let lease = self.try_acquire()?;
+        destination.copy_from_slice(lease.samples());
+        let sequence = lease.sequence();
+        drop(lease);
+        Ok(sequence)
     }
 
     /// Consume all but the newest queued block and copy that block into the
     /// destination. This is useful for a monitor path where old audio is worse
     /// than a single discontinuity.
-    pub fn try_copy_latest_into(&self, destination: &mut [f32]) -> Result<u64, AudioError> {
+    pub fn try_copy_latest_into(&mut self, destination: &mut [f32]) -> Result<u64, AudioError> {
         if destination.len() != self.config.block_samples() {
             return Err(AudioError::BlockSizeMismatch {
                 expected: self.config.block_samples(),
@@ -371,13 +481,16 @@ impl AudioConsumer {
             });
         }
         while self.inner.stats().queued_blocks > 1 {
-            self.inner.discard_one()?;
+            drop(self.try_acquire()?);
         }
         self.try_copy_into(destination)
     }
 
-    pub fn try_read<R>(&self, read: impl FnOnce(&[f32], u64) -> R) -> Result<R, AudioError> {
-        self.inner.try_read(read)
+    pub fn try_read<R>(&mut self, read: impl FnOnce(&[f32], u64) -> R) -> Result<R, AudioError> {
+        let lease = self.try_acquire()?;
+        let result = read(lease.samples(), lease.sequence());
+        drop(lease);
+        Ok(result)
     }
 
     pub fn len(&self) -> usize {
@@ -390,6 +503,36 @@ impl AudioConsumer {
 
     pub fn stats(&self) -> AudioRingStats {
         self.inner.stats()
+    }
+}
+
+/// A consumer-side zero-copy view. The slot is returned to the producer when
+/// this value is dropped.
+#[must_use = "keep the lease alive while reading the slot"]
+pub struct AudioReadLease<'a> {
+    consumer: &'a mut AudioConsumer,
+    index: usize,
+    sequence: u64,
+}
+
+impl AudioReadLease<'_> {
+    pub fn samples(&self) -> &[f32] {
+        let slot = &self.consumer.inner.slots[self.index % self.consumer.inner.slots.len()];
+        // SAFETY: the consumer owns this published slot until the lease drops.
+        unsafe { &*slot.samples.get() }
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl Drop for AudioReadLease<'_> {
+    fn drop(&mut self) {
+        let next = self.index.wrapping_add(1);
+        self.consumer.inner.popped.0.fetch_add(1, Ordering::Relaxed);
+        self.consumer.inner.read.0.store(next, Ordering::Release);
+        self.consumer.read = next;
     }
 }
 
@@ -439,6 +582,30 @@ pub struct WorkerIo {
     pub output: AudioProducer,
 }
 
+impl WorkerIo {
+    /// Borrow the next input block without copying it out of the queue.
+    pub fn try_input(&mut self) -> Result<AudioReadLease<'_>, AudioError> {
+        self.input.try_acquire()
+    }
+
+    /// Reserve the next output block for the inference backend to fill.
+    pub fn try_output(&mut self) -> Result<AudioWriteLease<'_>, AudioError> {
+        self.output.try_acquire()
+    }
+
+    /// Acquire one input and one output slot together. The pair keeps the two
+    /// SPSC queues borrowed independently, allowing an inference step to read
+    /// its input while writing its output without an intermediate buffer.
+    pub fn try_input_output(
+        &mut self,
+    ) -> Result<(AudioReadLease<'_>, AudioWriteLease<'_>), AudioError> {
+        let Self { input, output } = self;
+        let input = input.try_acquire()?;
+        let output = output.try_acquire()?;
+        Ok((input, output))
+    }
+}
+
 /// Assemble arbitrary device callback sizes into fixed inference blocks. The
 /// staging buffer is allocated once and is reused for the lifetime of a
 /// stream.
@@ -460,7 +627,11 @@ impl BlockAssembler {
         })
     }
 
-    pub fn push(&mut self, input: &[f32], producer: &AudioProducer) -> Result<usize, AudioError> {
+    pub fn push(
+        &mut self,
+        input: &[f32],
+        producer: &mut AudioProducer,
+    ) -> Result<usize, AudioError> {
         if !input
             .len()
             .is_multiple_of(self.config.format.channels as usize)
@@ -535,7 +706,7 @@ impl BlockDrainer {
     pub fn drain(
         &mut self,
         output: &mut [f32],
-        consumer: &AudioConsumer,
+        consumer: &mut AudioConsumer,
     ) -> Result<DrainReport, AudioError> {
         if !output
             .len()
@@ -544,6 +715,23 @@ impl BlockDrainer {
             return Err(AudioError::PartialFrame);
         }
         let mut report = DrainReport::default();
+        // The common WASAPI/cpal path uses a fixed engine period equal to one
+        // inference block. Read directly into the device buffer and avoid the
+        // extra `current` staging copy in that case.
+        if self.offset == self.current.len() && output.len() == self.current.len() {
+            match consumer.try_copy_into(output) {
+                Ok(_) => {
+                    report.blocks_consumed = 1;
+                    return Ok(report);
+                }
+                Err(AudioError::QueueEmpty) => {
+                    output.fill(0.0);
+                    report.underflow_samples = output.len();
+                    return Ok(report);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let mut written = 0;
         while written < output.len() {
             if self.offset == self.current.len() {
@@ -582,6 +770,9 @@ pub type F32OutputCallback<'a> = dyn FnMut(&mut [f32]) + Send + 'a;
 #[cfg(feature = "cpal-backend")]
 pub mod cpal_backend;
 
+#[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
+pub mod wasapi_backend;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,7 +803,7 @@ mod tests {
 
     #[test]
     fn split_ring_writes_without_allocating_queue_slots() {
-        let (producer, consumer) = AudioRing::new(config()).unwrap().split();
+        let (mut producer, mut consumer) = AudioRing::new(config()).unwrap().split();
         producer
             .try_write_with(|slot| slot.copy_from_slice(&[1.0, 2.0]))
             .unwrap();
@@ -623,15 +814,56 @@ mod tests {
     }
 
     #[test]
+    fn leases_expose_slots_without_queue_copies() {
+        let (mut producer, mut consumer) = AudioRing::new(config()).unwrap().split();
+        let mut write = producer.try_acquire().unwrap();
+        write.samples_mut().copy_from_slice(&[3.0, 4.0]);
+        assert_eq!(write.commit(), 0);
+
+        let read = consumer.try_acquire().unwrap();
+        assert_eq!(read.sequence(), 0);
+        assert_eq!(read.samples(), &[3.0, 4.0]);
+        drop(read);
+        assert_eq!(producer.available_capacity(), config().queue_blocks);
+    }
+
+    #[test]
+    fn dropped_write_lease_does_not_publish_partial_audio() {
+        let (mut producer, mut consumer) = AudioRing::new(config()).unwrap().split();
+        {
+            let mut lease = producer.try_acquire().unwrap();
+            lease.samples_mut().fill(99.0);
+        }
+        assert!(consumer.try_acquire().is_err());
+
+        producer.try_push(&[5.0, 6.0]).unwrap();
+        assert_eq!(consumer.try_pop().unwrap().samples, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn worker_can_hold_input_and_output_leases_together() {
+        let io = StreamIo::new(config()).unwrap();
+        let (mut device, mut worker) = io.split();
+        device.input.try_push(&[7.0, 8.0]).unwrap();
+
+        let (input, mut output) = worker.try_input_output().unwrap();
+        output.samples_mut().copy_from_slice(input.samples());
+        output.commit();
+        drop(input);
+
+        assert_eq!(device.output.try_pop().unwrap().samples, vec![7.0, 8.0]);
+    }
+
+    #[test]
     fn assembler_and_drainer_handle_non_matching_callback_sizes() {
-        let (producer, consumer) = AudioRing::new(config()).unwrap().split();
+        let (mut producer, mut consumer) = AudioRing::new(config()).unwrap().split();
         let mut assembler = BlockAssembler::new(config()).unwrap();
-        assert_eq!(assembler.push(&[1.0], &producer).unwrap(), 0);
-        assert_eq!(assembler.push(&[2.0, 3.0, 4.0], &producer).unwrap(), 2);
+        assert_eq!(assembler.push(&[1.0], &mut producer).unwrap(), 0);
+        assert_eq!(assembler.push(&[2.0, 3.0, 4.0], &mut producer).unwrap(), 2);
 
         let mut drainer = BlockDrainer::new(config()).unwrap();
         let mut output = [0.0; 3];
-        let report = drainer.drain(&mut output, &consumer).unwrap();
+        let report = drainer.drain(&mut output, &mut consumer).unwrap();
         assert_eq!(output, [1.0, 2.0, 3.0]);
         assert_eq!(report.blocks_consumed, 2);
         assert_eq!(report.underflow_samples, 0);
@@ -639,7 +871,7 @@ mod tests {
 
     #[test]
     fn latest_copy_drops_stale_blocks() {
-        let (producer, consumer) = AudioRing::new(config()).unwrap().split();
+        let (mut producer, mut consumer) = AudioRing::new(config()).unwrap().split();
         producer.try_push(&[1.0, 1.0]).unwrap();
         producer.try_push(&[2.0, 2.0]).unwrap();
         let mut latest = [0.0; 2];

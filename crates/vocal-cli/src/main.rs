@@ -1,0 +1,1029 @@
+use std::{env, fs, path::PathBuf, process::ExitCode};
+#[cfg(feature = "tensorrt-rtx")]
+use std::{io::Read, time::Instant};
+use vocal_audio::{AudioRing, StreamConfig};
+#[cfg(not(feature = "tensorrt-rtx"))]
+use vocal_engine::tensorrt::{TensorRtCompiler, TrtExecCompiler};
+use vocal_engine::{
+    BackendKind, EngineConfig, create_engine,
+    tensorrt::{TensorRtGraphOptions, build_rvc_graph},
+};
+use vocal_model::{
+    ACOUSTIC_TENSOR_SCHEMA, load_cache, load_directory, load_manifest, load_rvc_directory,
+    load_rvc_onnx, load_rvc_pth, write_cache,
+};
+use vocal_types::{AudioChunk, AudioFormat, ConversionConfig};
+
+fn usage() {
+    eprintln!(
+        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
+    );
+    eprintln!("  model benchmark-trt <output.plan> <input.vin> <output.bin> [iterations]");
+}
+
+fn main() -> ExitCode {
+    match run(env::args().skip(1).collect()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    match args.as_slice() {
+        [command] if command == "doctor" => doctor(),
+        [command, subcommand, manifest] if command == "model" && subcommand == "inspect" => {
+            inspect(PathBuf::from(manifest))
+        }
+        [command, subcommand, cache] if command == "model" && subcommand == "inspect-cache" => {
+            inspect_cache(PathBuf::from(cache))
+        }
+        [command, subcommand, cache] if command == "model" && subcommand == "inspect-acoustic" => {
+            inspect_acoustic(PathBuf::from(cache))
+        }
+        [command, subcommand, model_dir, manifest, output]
+            if command == "model" && subcommand == "pack" =>
+        {
+            pack(model_dir.into(), manifest.into(), output.into())
+        }
+        [command, subcommand, model_dir, manifest, output]
+            if command == "model" && subcommand == "pack-rvc" =>
+        {
+            pack_rvc(model_dir.into(), manifest.into(), output.into())
+        }
+        [command, subcommand, model_dir, manifest, checkpoint, output]
+            if command == "model" && subcommand == "convert-pth" =>
+        {
+            convert_pth(
+                model_dir.into(),
+                manifest.into(),
+                checkpoint.into(),
+                output.into(),
+            )
+        }
+        [command, subcommand, model_dir, manifest, onnx, output]
+            if command == "model" && subcommand == "convert-onnx" =>
+        {
+            convert_onnx(
+                model_dir.into(),
+                manifest.into(),
+                onnx.into(),
+                output.into(),
+            )
+        }
+        [command, subcommand, cache, output]
+            if command == "model" && subcommand == "build-graph" =>
+        {
+            build_graph(cache.into(), output.into())
+        }
+        [command, subcommand, cache, output]
+            if command == "model" && subcommand == "compile-trt" =>
+        {
+            compile_trt(cache.into(), output.into(), None)
+        }
+        [command, subcommand, cache, output]
+            if command == "model" && subcommand == "compile-hubert-trt" =>
+        {
+            compile_hubert_trt(cache.into(), output.into())
+        }
+        [command, subcommand, plan, input]
+            if command == "model" && subcommand == "test-hubert-trt" =>
+        {
+            test_hubert_trt(plan.into(), input.into())
+        }
+        [command, subcommand, cache, output, onnx]
+            if command == "model" && subcommand == "compile-trt" =>
+        {
+            compile_trt(cache.into(), output.into(), Some(onnx.into()))
+        }
+        [command, subcommand, cache, hubert, rmvpe, output]
+            if command == "model" && subcommand == "compile-trt-pipeline" =>
+        {
+            compile_trt_pipeline(cache.into(), hubert.into(), rmvpe.into(), output.into())
+        }
+        [command, subcommand, artifacts, cache, input]
+            if command == "model" && subcommand == "test-trt-pipeline" =>
+        {
+            test_trt_pipeline(artifacts.into(), cache.into(), input.into(), false)
+        }
+        [command, subcommand, artifacts, cache, input]
+            if command == "model" && subcommand == "profile-trt-pipeline" =>
+        {
+            test_trt_pipeline(artifacts.into(), cache.into(), input.into(), true)
+        }
+        [command, subcommand, plan] if command == "model" && subcommand == "test-trt" => {
+            test_trt(plan.into(), None)
+        }
+        [command, subcommand, plan, cache] if command == "model" && subcommand == "test-trt" => {
+            test_trt(plan.into(), Some(cache.into()))
+        }
+        [command, subcommand, plan, input, output]
+            if command == "model" && subcommand == "benchmark-trt" =>
+        {
+            benchmark_trt(plan.into(), input.into(), output.into(), 30)
+        }
+        [command, subcommand, plan, input, output, iterations]
+            if command == "model" && subcommand == "benchmark-trt" =>
+        {
+            benchmark_trt(
+                plan.into(),
+                input.into(),
+                output.into(),
+                iterations.parse()?,
+            )
+        }
+        [command] if command == "demo" => demo(4),
+        [command, count] if command == "demo" => demo(count.parse()?),
+        _ => {
+            usage();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn compile_trt_pipeline(
+    cache: PathBuf,
+    hubert: PathBuf,
+    rmvpe: PathBuf,
+    output: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_cache(cache)?;
+    let profile = vocal_tensorrt::RvcTrtProfile::from_env();
+    let options = vocal_tensorrt::NativeBuildOptions::default();
+    let artifacts = vocal_tensorrt::RvcTrtPipelineArtifacts::compile(
+        options,
+        &package,
+        hubert,
+        rmvpe,
+        &output,
+        profile.clone(),
+    )?;
+    let manifest = output.join("pipeline.json");
+    fs::write(&manifest, serde_json::to_vec_pretty(&artifacts)?)?;
+    println!(
+        "compiled HuBERT/RMVPE/frontend/Synth plans; samples=[{}..={}..={}], hubert=[{}..={}..={}], pitch=[{}..={}..={}], rvc=[{}..={}..={}]; manifest={}",
+        profile.min_samples,
+        profile.opt_samples,
+        profile.max_samples,
+        profile.min_hubert_frames,
+        profile.opt_hubert_frames,
+        profile.max_hubert_frames,
+        profile.min_pitch_frames,
+        profile.opt_pitch_frames,
+        profile.max_pitch_frames,
+        profile.min_rvc_frames,
+        profile.opt_rvc_frames,
+        profile.max_rvc_frames,
+        manifest.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn compile_trt_pipeline(
+    _cache: PathBuf,
+    _hubert: PathBuf,
+    _rmvpe: PathBuf,
+    _output: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn test_trt_pipeline(
+    artifacts_path: PathBuf,
+    cache: PathBuf,
+    input: PathBuf,
+    nsight_profile: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let artifacts: vocal_tensorrt::RvcTrtPipelineArtifacts =
+        serde_json::from_slice(&fs::read(&artifacts_path)?)?;
+    let package = load_cache(cache)?;
+    let config = package
+        .rvc_synth_config()?
+        .ok_or("cache has no rvc_synth config")?;
+    let samples = read_f32_audio(&input)?;
+    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load(&artifacts, config)?;
+    // Intermediate D2H copies are opt-in for parity diagnostics. Nsight mode
+    // keeps all activations device-resident and measures the production path.
+    let debug_intermediates =
+        !nsight_profile && env::var("VOCAL_TRT_DEBUG_INTERMEDIATES").ok().as_deref() == Some("1");
+    pipeline.enable_debug_intermediates(debug_intermediates);
+    let profile_layers =
+        !nsight_profile && env::var("VOCAL_TRT_LAYER_PROFILE").ok().as_deref() == Some("1");
+    if profile_layers {
+        pipeline.enable_layer_profiling(true);
+    }
+    let iterations = env::var("VOCAL_TRT_PIPELINE_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(if nsight_profile { 100 } else { 1 });
+    let warmups = env::var("VOCAL_TRT_WARMUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(if nsight_profile { 10 } else { 0 });
+    let realtime_f0 = env::var("VOCAL_TRT_REALTIME_F0")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let realtime_advance = env::var("VOCAL_TRT_REALTIME_ADVANCE_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or((samples.len() / 160).min(25).max(1));
+    let run_once = |pipeline: &mut vocal_tensorrt::RvcTrtPipeline|
+                   -> Result<vocal_tensorrt::RvcTrtOutput, vocal_tensorrt::NativeBuildError> {
+        if realtime_f0 {
+            pipeline.process_realtime(&samples, 0, realtime_advance)
+        } else {
+            pipeline.process(&samples, 0)
+        }
+    };
+    for _ in 0..warmups {
+        let _ = run_once(&mut pipeline)?;
+    }
+    let mut results = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        results.push(run_once(&mut pipeline)?);
+    }
+    let result = results.last().ok_or("pipeline produced no result")?;
+    let debug_path = artifacts_path.with_file_name("trt-debug.json");
+    if debug_intermediates {
+        fs::write(
+            &debug_path,
+            serde_json::to_vec(&serde_json::json!({
+                "hubert_frames": result.hubert_frames, "pitch_frames": result.pitch_frames,
+                "rvc_frames": result.rvc_frames, "hubert_features": result.hubert_features,
+                "rvc_features": result.rvc_features, "pitchf": result.pitchf,
+                "aligned_pitchf": result.aligned_pitchf, "pitch": result.pitch,
+                "audio": result.audio,
+            }))?,
+        )?;
+    }
+    let mean_total = results.iter().map(|r| r.timings.total_ms).sum::<f64>() / iterations as f64;
+    println!(
+        "{}",
+        serde_json::json!({
+            "iterations": iterations, "mean_total_ms": mean_total,
+            "input_samples": samples.len(), "hubert_frames": result.hubert_frames,
+            "pitch_frames": result.pitch_frames, "rvc_frames": result.rvc_frames,
+            "output_samples": result.audio.len(), "timings_ms": {
+                "upload": result.timings.upload_ms, "hubert": result.timings.hubert_enqueue_ms,
+                "rmvpe": result.timings.rmvpe_enqueue_ms, "frontend": result.timings.frontend_enqueue_ms,
+                "synth": result.timings.synth_enqueue_ms, "total": result.timings.total_ms,
+            },
+            "warmups": warmups, "nsight_profile": nsight_profile,
+            "realtime_f0": realtime_f0, "realtime_advance_frames": realtime_advance,
+            "cuda_graph": pipeline.cuda_graph_stats(),
+            "debug_intermediates": debug_intermediates,
+            "layer_profile": if profile_layers { serde_json::to_value(pipeline.layer_timings())? } else { serde_json::Value::Null }
+        })
+    );
+    if debug_intermediates {
+        println!("debug tensors written to {}", debug_path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn test_trt_pipeline(
+    _artifacts: PathBuf,
+    _cache: PathBuf,
+    _input: PathBuf,
+    _nsight_profile: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+fn read_f32_audio(path: &PathBuf) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    if bytes.len() >= 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        let channels = u16::from_le_bytes(bytes[22..24].try_into()?);
+        let bits = u16::from_le_bytes(bytes[34..36].try_into()?);
+        let format = u16::from_le_bytes(bytes[20..22].try_into()?);
+        let marker = bytes
+            .windows(4)
+            .position(|w| w == b"data")
+            .ok_or("WAV data chunk missing")?;
+        let data_pos = marker + 8;
+        let data_len = u32::from_le_bytes(bytes[marker + 4..marker + 8].try_into()?) as usize;
+        let data = &bytes[data_pos..data_pos + data_len.min(bytes.len().saturating_sub(data_pos))];
+        if channels != 1 || format != 1 || bits != 16 {
+            return Err("only mono PCM16 WAV is supported".into());
+        }
+        return Ok(data
+            .chunks_exact(2)
+            .map(|x| i16::from_le_bytes([x[0], x[1]]) as f32 / 32768.0)
+            .collect());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        .collect())
+}
+
+fn doctor() -> Result<(), Box<dyn std::error::Error>> {
+    let config = StreamConfig::default();
+    let ring = AudioRing::new(config)?;
+    println!(
+        "audio: ok ({} Hz, {} channel, {} frame blocks)",
+        config.format.sample_rate, config.format.channels, config.block_frames
+    );
+    println!("engine: CPU RVC pipeline + passthrough baseline ready");
+    println!("cache: VFRM v1 tensor container ready");
+    println!("ring capacity: {} blocks", config.queue_blocks);
+    drop(ring);
+    Ok(())
+}
+
+fn inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = load_manifest(path)?;
+    println!("{} ({})", manifest.display_name, manifest.id);
+    println!(
+        "architecture={} version={} sample_rate={}",
+        manifest.architecture, manifest.version, manifest.sample_rate
+    );
+    println!(
+        "weights={} index={}",
+        manifest.model_file,
+        manifest.index_file.as_deref().unwrap_or("none")
+    );
+    Ok(())
+}
+
+fn pack(
+    model_dir: PathBuf,
+    manifest_path: PathBuf,
+    output: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = load_manifest(&manifest_path)?;
+    let package = load_directory(model_dir, manifest)?;
+    write_cache(&output, &package)?;
+    println!(
+        "wrote {} bytes to {}",
+        fs::metadata(&output)?.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn pack_rvc(
+    model_dir: PathBuf,
+    manifest_path: PathBuf,
+    output: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_rvc_directory(model_dir, load_manifest(manifest_path)?)?;
+    write_cache(&output, &package)?;
+    println!(
+        "wrote {} typed tensors to {}",
+        package.tensors.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn inspect_cache(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_cache(path)?;
+    println!(
+        "{} ({}) tensors={} bytes={}",
+        package.manifest.display_name,
+        package.manifest.id,
+        package.tensors.len(),
+        package
+            .tensors
+            .iter()
+            .map(|tensor| tensor.data.len())
+            .sum::<usize>()
+    );
+    if let Some(schema) = package
+        .metadata
+        .get("canonical_schema")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!(
+            "canonical_schema={} graph_schema={} tensor_map={}",
+            schema,
+            package
+                .metadata
+                .get("graph_schema")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            package
+                .metadata
+                .get("canonical_tensor_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+    }
+    for tensor in package.tensors {
+        println!(
+            "  {} {:?} {:?} {} bytes",
+            tensor.name,
+            tensor.dtype,
+            tensor.shape,
+            tensor.data.len()
+        );
+    }
+    Ok(())
+}
+
+fn inspect_acoustic(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_cache(path)?;
+    let config = package.validate_acoustic(None)?;
+    let nodes = package
+        .metadata
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let ops = package
+        .metadata
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map(|nodes| {
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for node in nodes {
+                if let Some(op) = node.get("op").and_then(serde_json::Value::as_str) {
+                    *counts.entry(op.to_owned()).or_default() += 1;
+                }
+            }
+            counts
+        })
+        .unwrap_or_default();
+    println!(
+        "kind={} schema={} nodes={} tensors={} inputs={} outputs={}",
+        config.kind.as_str(),
+        ACOUSTIC_TENSOR_SCHEMA,
+        nodes,
+        package.tensors.len(),
+        config.inputs.len(),
+        config.outputs.len()
+    );
+    println!("operators={}", serde_json::to_string(&ops)?);
+    for port in config.inputs {
+        println!("input {} {:?} dtype={}", port.name, port.shape, port.dtype);
+    }
+    for port in config.outputs {
+        println!("output {} {:?} dtype={}", port.name, port.shape, port.dtype);
+    }
+    Ok(())
+}
+
+fn convert_pth(
+    model_dir: PathBuf,
+    manifest_path: PathBuf,
+    checkpoint: PathBuf,
+    output: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_rvc_pth(checkpoint, load_manifest(manifest_path)?)?;
+    write_cache(&output, &package)?;
+    println!(
+        "converted {} tensors to {}",
+        package.tensors.len(),
+        output.display()
+    );
+    let _ = model_dir;
+    Ok(())
+}
+
+fn convert_onnx(
+    model_dir: PathBuf,
+    manifest_path: PathBuf,
+    onnx: PathBuf,
+    output: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_rvc_onnx(onnx, load_manifest(manifest_path)?)?;
+    write_cache(&output, &package)?;
+    println!(
+        "converted {} ONNX initializers to {}",
+        package.tensors.len(),
+        output.display()
+    );
+    let _ = model_dir;
+    Ok(())
+}
+
+fn build_graph(cache: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_cache(cache)?;
+    let graph = build_rvc_graph(&package, TensorRtGraphOptions::default())?;
+    graph.write_json(&output)?;
+    println!("wrote {graph} to {}", output.display());
+    Ok(())
+}
+
+#[allow(clippy::needless_return, clippy::field_reassign_with_default)]
+fn compile_trt(
+    cache: PathBuf,
+    output: PathBuf,
+    onnx: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "tensorrt-rtx")]
+    {
+        let package = load_cache(cache)?;
+        let mut options = vocal_tensorrt::NativeBuildOptions::default();
+        options.output = output;
+        let builder = vocal_tensorrt::NativeTensorRtBuilder::new(options);
+        let path = match onnx {
+            Some(onnx) => builder.compile_onnx_file(onnx)?,
+            None => builder.compile_vfrm(&package)?,
+        };
+        println!(
+            "compiled {} with TensorRT-RTX native builder",
+            path.display()
+        );
+        return Ok(());
+    }
+    #[cfg(not(feature = "tensorrt-rtx"))]
+    {
+        let package = load_cache(cache)?;
+        let graph = build_rvc_graph(&package, TensorRtGraphOptions::default())?;
+        let mut compiler = TrtExecCompiler::discover()
+            .ok_or("trtexec was not found; install TensorRT or set VOCAL_TRTEXEC to its path")?;
+        if let Some(onnx) = onnx {
+            compiler = compiler.with_onnx(onnx);
+        }
+        let report = compiler.compile(&graph, &output)?;
+        println!(
+            "compiled {} using {}; graph={}",
+            report.engine_path.as_ref().map_or_else(
+                || "descriptor-only".to_owned(),
+                |path| path.display().to_string()
+            ),
+            report.compiler,
+            report.graph_path.display()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn compile_hubert_trt(cache: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let package = load_cache(cache)?;
+    let mut options = vocal_tensorrt::NativeBuildOptions::default();
+    options.output = output;
+    let path = vocal_tensorrt::NativeTensorRtBuilder::new(options).compile_hubert_vfrm(&package)?;
+    println!("compiled native HuBERT plan {}", path.display());
+    Ok(())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn compile_hubert_trt(_cache: PathBuf, _output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let samples = read_f32_audio(&input)?;
+    let runtime = vocal_tensorrt::Runtime::load(&plan)?;
+    let mut context = runtime.context()?;
+    let stream = vocal_tensorrt::CudaStream::new()?;
+    let waveform = vocal_tensorrt::CudaBuffer::new(samples.len() * 4)?;
+    let max_frames = (samples.len() / 320).saturating_add(8);
+    let features = vocal_tensorrt::CudaBuffer::new(max_frames * 768 * 4)?;
+    let bytes = samples
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    waveform.upload_bytes(&bytes)?;
+    context.set_input_shape("waveform", &[1, samples.len() as i64])?;
+    context.set_tensor_address("waveform", waveform.device_ptr())?;
+    context.set_tensor_address("features", features.device_ptr())?;
+    let start = Instant::now();
+    context.enqueue_named(&stream, Some("rvc.hubert.native"))?;
+    stream.synchronize()?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let shape = context.tensor_shape("features")?;
+    let count = shape
+        .iter()
+        .try_fold(1usize, |a, &d| a.checked_mul(d as usize))
+        .ok_or("feature shape overflow")?;
+    let mut raw = vec![0_u8; count * 4];
+    features.download_bytes(&mut raw)?;
+    let values = raw
+        .chunks_exact(4)
+        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    if let Some(path) = env::var_os("VOCAL_TRT_DUMP_HUBERT") {
+        fs::write(path, &raw)?;
+    }
+    let finite = values.iter().all(|v| v.is_finite());
+    println!(
+        "{}",
+        serde_json::json!({"plan": plan, "input_samples": samples.len(), "shape": shape, "latency_ms": elapsed_ms, "finite": finite, "mean_abs": values.iter().map(|v| v.abs() as f64).sum::<f64>() / values.len().max(1) as f64})
+    );
+    if !finite {
+        return Err("native HuBERT produced non-finite features".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn test_hubert_trt(_plan: PathBuf, _input: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = vocal_tensorrt::Runtime::load(&plan)?;
+    let mut context = runtime.context()?;
+    let stream = vocal_tensorrt::CudaStream::new()?;
+    let Some(cache) = cache else {
+        let buffer = vocal_tensorrt::CudaBuffer::new(4096)?;
+        println!(
+            "loaded {} and created TensorRT execution context; CUDA allocation={} bytes",
+            plan.display(),
+            buffer.bytes
+        );
+        return Ok(());
+    };
+    let package = vocal_model::load_cache(cache)?;
+    let config = package
+        .rvc_synth_config()?
+        .ok_or("cache has no rvc_synth config")?;
+    let frames = env::var("VOCAL_TRT_TEST_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8_i64);
+    let up = config
+        .upsample_rates
+        .iter()
+        .try_fold(1_i64, |value, rate| value.checked_mul(*rate as i64))
+        .ok_or("upsample product overflow")?;
+    let alloc = |elements: i64| -> Result<vocal_tensorrt::CudaBuffer, Box<dyn std::error::Error>> {
+        let bytes = usize::try_from(elements.checked_mul(4).ok_or("buffer size overflow")?)?;
+        let buffer = vocal_tensorrt::CudaBuffer::new(bytes)?;
+        buffer.zero()?;
+        Ok(buffer)
+    };
+    let feats = alloc(frames * config.feature_width as i64)?;
+    let p_len = alloc(1)?;
+    let sid = alloc(1)?;
+    let rnd = alloc(config.latent_channels as i64 * frames)?;
+    let pitch = config.uses_f0.then(|| alloc(frames)).transpose()?;
+    let pitchf = config.uses_f0.then(|| alloc(frames)).transpose()?;
+    let noise = config.uses_f0.then(|| alloc(frames * up)).transpose()?;
+    let audio = alloc(frames * up + 4096)?;
+    let feature_values = (0..(frames as usize * config.feature_width as usize))
+        .map(|index| 0.02_f32 * ((index as f32) * 0.013).sin())
+        .collect::<Vec<_>>();
+    feats.upload_f32(&feature_values)?;
+    let rnd_values = (0..(frames as usize * config.latent_channels as usize))
+        .map(|index| 0.01_f32 * ((index as f32) * 0.017).cos())
+        .collect::<Vec<_>>();
+    rnd.upload_f32(&rnd_values)?;
+    let length_bytes = (frames as i32).to_le_bytes();
+    p_len.upload_bytes(&length_bytes)?;
+    let sid_bytes = 0_i32.to_le_bytes();
+    sid.upload_bytes(&sid_bytes)?;
+    if let (Some(pitch), Some(pitchf)) = (&pitch, &pitchf) {
+        let pitch_bytes = (0..frames)
+            .flat_map(|_| 220_i32.to_le_bytes())
+            .collect::<Vec<_>>();
+        pitch.upload_bytes(&pitch_bytes)?;
+        let pitchf_bytes = (0..frames)
+            .flat_map(|_| 220.0_f32.to_le_bytes())
+            .collect::<Vec<_>>();
+        pitchf.upload_bytes(&pitchf_bytes)?;
+    }
+    if let Some(noise) = &noise {
+        let noise_values = (0..(frames as usize * up as usize))
+            .map(|index| 0.001_f32 * ((index as f32) * 0.011).sin())
+            .collect::<Vec<_>>();
+        noise.upload_f32(&noise_values)?;
+    }
+    eprintln!("test: buffers allocated up={up}");
+    context.set_input_shape("feats", &[1, frames, config.feature_width as i64])?;
+    context.set_input_shape("rnd", &[1, config.latent_channels as i64, frames])?;
+    if config.uses_f0 {
+        context.set_input_shape("pitch", &[1, frames])?;
+        context.set_input_shape("pitchf", &[1, frames])?;
+        context.set_input_shape("nsf_noise", &[1, 1, frames * up])?;
+    }
+    eprintln!("test: input shapes set");
+    let mut addresses = vec![
+        ("feats", &feats),
+        ("p_len", &p_len),
+        ("sid", &sid),
+        ("rnd", &rnd),
+        ("audio", &audio),
+    ];
+    if let (Some(pitch), Some(pitchf), Some(noise)) = (&pitch, &pitchf, &noise) {
+        addresses.extend([("pitch", pitch), ("pitchf", pitchf), ("nsf_noise", noise)]);
+    }
+    for (name, buffer) in addresses {
+        context.set_tensor_address(name, buffer.device_ptr())?;
+    }
+    eprintln!("test: tensor addresses set");
+    let start = Instant::now();
+    context.enqueue(&stream)?;
+    eprintln!("test: enqueue returned");
+    stream.synchronize()?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let mut audio_bytes = vec![0_u8; audio.bytes];
+    audio.download_bytes(&mut audio_bytes)?;
+    let (audio_chunks, audio_remainder) = audio_bytes.as_chunks::<4>();
+    let values = audio_chunks
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect::<Vec<_>>();
+    if let Some(path) = env::var_os("VOCAL_TRT_DUMP_AUDIO") {
+        fs::write(path, &audio_bytes)?;
+    }
+    if !audio_remainder.is_empty() || values.iter().any(|sample| !sample.is_finite()) {
+        return Err("native TensorRT output contains a non-finite sample".into());
+    }
+    let max_abs = values
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f32, f32::max);
+    let mean_abs =
+        values.iter().map(|value| value.abs() as f64).sum::<f64>() / values.len().max(1) as f64;
+    println!(
+        "{}",
+        serde_json::json!({
+            "plan": plan,
+            "frames": frames,
+            "upsample": up,
+            "output_capacity_bytes": audio.bytes,
+            "elapsed_ms": elapsed_ms,
+            "finite": true,
+            "max_abs": max_abs,
+            "mean_abs": mean_abs
+        })
+    );
+    Ok(())
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+struct BenchmarkInput {
+    frames: i64,
+    feature_width: i64,
+    latent: i64,
+    upsample: i64,
+    feats: Vec<u8>,
+    p_len: Vec<u8>,
+    sid: Vec<u8>,
+    rnd: Vec<u8>,
+    pitch: Vec<u8>,
+    pitchf: Vec<u8>,
+    noise: Vec<u8>,
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn take_bytes<'a>(
+    bytes: &mut &'a [u8],
+    count: usize,
+) -> Result<&'a [u8], Box<dyn std::error::Error>> {
+    if bytes.len() < count {
+        return Err("benchmark input is truncated".into());
+    }
+    let (head, tail) = bytes.split_at(count);
+    *bytes = tail;
+    Ok(head)
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn read_benchmark_input(path: &PathBuf) -> Result<BenchmarkInput, Box<dyn std::error::Error>> {
+    let mut raw = Vec::new();
+    fs::File::open(path)?.read_to_end(&mut raw)?;
+    let mut bytes = raw.as_slice();
+    if take_bytes(&mut bytes, 8)? != b"VFRTEST1" {
+        return Err("invalid benchmark input magic".into());
+    }
+    let read_u32 = |bytes: &mut &[u8]| -> Result<u32, Box<dyn std::error::Error>> {
+        Ok(u32::from_le_bytes(take_bytes(bytes, 4)?.try_into()?))
+    };
+    let frames = i64::from(read_u32(&mut bytes)?);
+    let feature_width = i64::from(read_u32(&mut bytes)?);
+    let latent = i64::from(read_u32(&mut bytes)?);
+    let upsample = i64::from(read_u32(&mut bytes)?);
+    let _p_len = read_u32(&mut bytes)?;
+    let _sid = read_u32(&mut bytes)?;
+    if !(1..=2048).contains(&frames)
+        || !(1..=4096).contains(&feature_width)
+        || !(1..=4096).contains(&latent)
+        || !(1..=4096).contains(&upsample)
+    {
+        return Err("benchmark dimensions are outside supported bounds".into());
+    }
+    let bytes_for = |elements: i64| -> Result<usize, Box<dyn std::error::Error>> {
+        usize::try_from(elements.checked_mul(4).ok_or("benchmark size overflow")?)
+            .map_err(|_| "benchmark size exceeds host usize".into())
+    };
+    let feats = take_bytes(&mut bytes, bytes_for(frames * feature_width)?)?.to_vec();
+    let p_len = take_bytes(&mut bytes, 4)?.to_vec();
+    let sid = take_bytes(&mut bytes, 4)?.to_vec();
+    let rnd = take_bytes(&mut bytes, bytes_for(frames * latent)?)?.to_vec();
+    let pitch = take_bytes(&mut bytes, bytes_for(frames)?)?.to_vec();
+    let pitchf = take_bytes(&mut bytes, bytes_for(frames)?)?.to_vec();
+    let noise = take_bytes(&mut bytes, bytes_for(frames * upsample)?)?.to_vec();
+    if !bytes.is_empty() {
+        return Err("benchmark input has trailing bytes".into());
+    }
+    Ok(BenchmarkInput {
+        frames,
+        feature_width,
+        latent,
+        upsample,
+        feats,
+        p_len,
+        sid,
+        rnd,
+        pitch,
+        pitchf,
+        noise,
+    })
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn benchmark_trt(
+    plan: PathBuf,
+    input: PathBuf,
+    output: PathBuf,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if iterations == 0 {
+        return Err("benchmark iterations must be positive".into());
+    }
+    let input = read_benchmark_input(&input)?;
+    let runtime = vocal_tensorrt::Runtime::load(&plan)?;
+    let mut context = runtime.context()?;
+    let stream = vocal_tensorrt::CudaStream::new()?;
+    let alloc = |bytes: usize| -> Result<vocal_tensorrt::CudaBuffer, Box<dyn std::error::Error>> {
+        Ok(vocal_tensorrt::CudaBuffer::new(bytes.max(4))?)
+    };
+    let feats = alloc(input.feats.len())?;
+    let p_len = alloc(input.p_len.len())?;
+    let sid = alloc(input.sid.len())?;
+    let rnd = alloc(input.rnd.len())?;
+    let pitch = alloc(input.pitch.len())?;
+    let pitchf = alloc(input.pitchf.len())?;
+    let noise = alloc(input.noise.len())?;
+    let debug_outputs = env::var("VOCAL_TRT_DEBUG_GRAPH_OUTPUTS")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let mut debug_buffers: Vec<(String, vocal_tensorrt::CudaBuffer, usize)> = Vec::new();
+    let output_bytes = usize::try_from(
+        input
+            .frames
+            .checked_mul(input.upsample)
+            .and_then(|x| x.checked_mul(4))
+            .ok_or("benchmark output size overflow")?,
+    )?;
+    let audio = alloc(output_bytes + 16 * 1024)?;
+    for (buffer, bytes) in [
+        (&feats, input.feats.as_slice()),
+        (&p_len, input.p_len.as_slice()),
+        (&sid, input.sid.as_slice()),
+        (&rnd, input.rnd.as_slice()),
+        (&pitch, input.pitch.as_slice()),
+        (&pitchf, input.pitchf.as_slice()),
+        (&noise, input.noise.as_slice()),
+    ] {
+        buffer.upload_bytes(bytes)?;
+    }
+    context.set_input_shape("feats", &[1, input.frames, input.feature_width])?;
+    context.set_input_shape("rnd", &[1, input.latent, input.frames])?;
+    context.set_input_shape("pitch", &[1, input.frames])?;
+    context.set_input_shape("pitchf", &[1, input.frames])?;
+    context.set_input_shape("nsf_noise", &[1, 1, input.frames * input.upsample])?;
+    if debug_outputs {
+        let names = [
+            "encoder_z",
+            "flow_z",
+            "nsf_source",
+            "decoder_pre",
+            "decoder_up_0",
+            "decoder_noise_0",
+            "decoder_res_0",
+            "decoder_up_1",
+            "decoder_noise_1",
+            "decoder_res_1",
+            "decoder_up_2",
+            "decoder_noise_2",
+            "decoder_res_2",
+            "decoder_up_3",
+            "decoder_noise_3",
+            "decoder_res_3",
+            "audio_pre_tanh",
+            "decoder_post_input",
+        ];
+        for name in names {
+            let shape = context.tensor_shape(name)?;
+            let elements = shape
+                .iter()
+                .try_fold(1_usize, |acc, dimension| {
+                    usize::try_from(*dimension)
+                        .ok()
+                        .and_then(|value| acc.checked_mul(value))
+                })
+                .ok_or_else(|| format!("invalid debug output shape for {name}"))?;
+            let bytes = elements
+                .checked_mul(4)
+                .ok_or("debug output size overflow")?;
+            debug_buffers.push((name.to_owned(), alloc(bytes)?, bytes));
+        }
+    }
+    for (name, buffer) in [
+        ("feats", &feats),
+        ("p_len", &p_len),
+        ("sid", &sid),
+        ("rnd", &rnd),
+        ("pitch", &pitch),
+        ("pitchf", &pitchf),
+        ("nsf_noise", &noise),
+        ("audio", &audio),
+    ] {
+        context.set_tensor_address(name, buffer.device_ptr())?;
+    }
+    for (name, buffer, _) in &debug_buffers {
+        context.set_tensor_address(name, buffer.device_ptr())?;
+    }
+    for _ in 0..5 {
+        context.enqueue(&stream)?;
+        stream.synchronize()?;
+    }
+    let mut timings = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        context.enqueue(&stream)?;
+        stream.synchronize()?;
+        timings.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mut sorted = timings.clone();
+    sorted.sort_by(f64::total_cmp);
+    let percentile = |fraction: f64| -> f64 {
+        let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+        sorted[index]
+    };
+    let mean = timings.iter().sum::<f64>() / timings.len() as f64;
+    let mut output_bytes_host = vec![0_u8; output_bytes];
+    audio.download_bytes(&mut output_bytes_host)?;
+    fs::write(&output, output_bytes_host)?;
+    for (name, buffer, bytes) in &debug_buffers {
+        let mut values = vec![0_u8; *bytes];
+        buffer.download_bytes(&mut values)?;
+        fs::write(output.with_extension(format!("{name}.f32")), &values)?;
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "backend": "tensorrt-rtx-native",
+            "frames": input.frames,
+            "output_samples": input.frames * input.upsample,
+            "iterations": iterations,
+            "mean_ms": mean,
+            "median_ms": percentile(0.50),
+            "p95_ms": percentile(0.95),
+            "min_ms": sorted[0],
+            "max_ms": *sorted.last().expect("timings are non-empty"),
+            "debug_outputs": debug_outputs,
+        })
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn test_trt(_plan: PathBuf, _cache: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn benchmark_trt(
+    _plan: PathBuf,
+    _input: PathBuf,
+    _output: PathBuf,
+    _iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+fn demo(blocks: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let format = AudioFormat::MONO_16K;
+    let mut engine = create_engine(EngineConfig {
+        backend: BackendKind::RvcCpuPipeline,
+        model: vocal_types::ModelDescriptor {
+            id: "fixture".into(),
+            display_name: "Fixture".into(),
+            architecture: "rvc-v2".into(),
+            sample_rate: format.sample_rate,
+            version: "0.1".into(),
+        },
+    })?;
+    for sequence in 0..blocks {
+        let input = AudioChunk {
+            format,
+            samples: vec![0.0; 160],
+            sequence: sequence as u64,
+        };
+        let _output = engine.process(&input, ConversionConfig::default())?;
+    }
+    println!(
+        "processed {} blocks; metrics={:?}",
+        blocks,
+        engine.metrics()
+    );
+    Ok(())
+}

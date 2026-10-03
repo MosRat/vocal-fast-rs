@@ -71,11 +71,7 @@ impl WasapiStream {
         config: StreamConfig,
         mode: WasapiMode,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
-        Self::open_with_queue_config(
-            config,
-            mode,
-            StreamQueueConfig::symmetric(config.queue_blocks),
-        )
+        Self::open_with_queue_config(config, mode, StreamQueueConfig::default())
     }
 
     pub fn open_with_queue_config(
@@ -94,12 +90,7 @@ impl WasapiStream {
         mode: WasapiMode,
         clock: AudioClock,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
-        Self::open_profiled_with_queue_config(
-            config,
-            mode,
-            StreamQueueConfig::symmetric(config.queue_blocks),
-            clock,
-        )
+        Self::open_profiled_with_queue_config(config, mode, StreamQueueConfig::default(), clock)
     }
 
     pub fn open_profiled_with_queue_config(

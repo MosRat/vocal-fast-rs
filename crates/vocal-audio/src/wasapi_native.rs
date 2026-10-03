@@ -56,7 +56,7 @@ pub struct NativeWasapiStream {
 
 impl NativeWasapiStream {
     pub fn open(config: StreamConfig) -> Result<(Self, WorkerIo), NativeWasapiError> {
-        Self::open_with_queue_config(config, StreamQueueConfig::symmetric(config.queue_blocks))
+        Self::open_with_queue_config(config, StreamQueueConfig::default())
     }
 
     pub fn open_with_queue_config(
@@ -70,11 +70,7 @@ impl NativeWasapiStream {
         config: StreamConfig,
         clock: AudioClock,
     ) -> Result<(Self, WorkerIo), NativeWasapiError> {
-        Self::open_profiled_with_queue_config(
-            config,
-            StreamQueueConfig::symmetric(config.queue_blocks),
-            clock,
-        )
+        Self::open_profiled_with_queue_config(config, StreamQueueConfig::default(), clock)
     }
 
     pub fn open_profiled_with_queue_config(

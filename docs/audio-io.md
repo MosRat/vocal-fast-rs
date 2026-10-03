@@ -43,7 +43,9 @@ model execution are included.
 methods accept independent `StreamQueueConfig` capacities. The default
 `StreamIo::new` remains symmetric for simple callers; a low-latency duplex
 setup can use three input blocks and two output blocks so render backlog is
-bounded more tightly than capture scheduling slack.
+bounded more tightly than capture scheduling slack. Both WASAPI `open` entry
+points use that 3/2 profile by default; pass an explicit queue config to
+override it.
 
 The producer publishes a generation after every commit. On Windows the worker
 waits with `WaitOnAddress` and the callback wakes it with

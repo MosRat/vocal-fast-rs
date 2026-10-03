@@ -109,3 +109,17 @@ rtk powershell -NoProfile -File scripts/profile-trt-nsight.ps1 `
 该脚本仍使用 TensorRT-RTX 原生 graph 和 node-level CUDA graph tracing；
 `cufftExecR2C`、`gather_window`、`magnitude_kernel` 会和 RMVPE 的 TensorRT
 kernel 一起出现在同一条 CUDA stream 上。
+
+### Nsight Systems 结果（RTX 3060，44960）
+
+对该固定计划执行 5 次 warmup、20 次测量并丢弃捕获阶段后，NVTX 的稳态
+stage envelope 为 HuBERT `0.352 ms`、RMVPE `1.626 ms`、frontend
+`0.063 ms`、Synth `0.573 ms`。CUDA kernel 聚合中，25 次记录的三个外部
+前端 kernel 总时间分别为：`gather_window 0.251 ms`、cuFFT R2C
+`0.248 ms`、`magnitude_kernel 0.240 ms`，即每次约 `10 us` 量级。它们远低于
+RMVPE U-Net 与 Synth convolution；继续优化 FFT 不会显著降低端到端延迟。
+
+同一 steady replay 的内存复制总时间约 `0.640 ms`，主要是 TensorRT/输入的
+H2D；因此后续优先级是固定 profile 的 tactic/timing cache、RMVPE U-Net
+convolution 融合以及 Synth decoder/resblock，而不是把 FFT 改成插件或再写
+一套 mel 权重。

@@ -1,0 +1,27 @@
+{
+  "id": "default-v2",
+  "display_name": "RVC V2 Default Voice",
+  "architecture": "rvc-v2",
+  "version": "v2",
+  "sample_rate": 40000,
+  "model_file": "default.pth",
+  "index_file": "added_IVF511_Flat_nprobe_1_default_v2.index",
+  "source": "https://huggingface.co/PhoenixStormJr/RVC-V2-default-voice",
+  "uses_f0": true,
+  "feature_model": "hubert_base",
+  "pitch_model": "rmvpe",
+  "source_repository": "https://huggingface.co/PhoenixStormJr/RVC-V2-default-voice",
+  "source_revision": "main",
+  "license": "MIT (according to the model repository)",
+  "notes": "Public RVC v2 test voice. Verify upstream terms before redistribution.",
+  "files": {
+    "default.pth": {
+      "bytes": 55223136,
+      "sha256": "c9d6b0ac7aa8df91917757894561cd690e5c4b66e97a9f92630c0a7257fbfccc"
+    },
+    "added_IVF511_Flat_nprobe_1_default_v2.index": {
+      "bytes": 63016939,
+      "sha256": "93e0fbf723992b5ff6a1af3cae4e15f3bbb1dd860880fbd76565be23549aa1b7"
+    }
+  }
+}

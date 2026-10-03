@@ -1,0 +1,60 @@
+{
+  "source_repository": "https://huggingface.co/lj1995/VoiceConversionWebUI",
+  "revision": "main",
+  "license": "MIT (repository metadata; verify model terms before redistribution)",
+  "files": [
+    {
+      "component": "hubert",
+      "path": "hubert_base/config.json",
+      "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base/config.json",
+      "bytes": 1492
+    },
+    {
+      "component": "hubert",
+      "path": "hubert_base/preprocessor_config.json",
+      "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base/preprocessor_config.json",
+      "bytes": 225
+    },
+    {
+      "component": "hubert",
+      "path": "hubert_base/pytorch_model.bin",
+      "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base/pytorch_model.bin",
+      "bytes": 189206711,
+      "sha256": "cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5"
+    },
+    {
+      "component": "hubert",
+      "path": "hubert_base/hubert_features.onnx",
+      "source": "generated locally from pytorch_model.bin with scripts/export-hubert-onnx.py",
+      "bytes": 1429634,
+      "sha256": "6cbe717a531bea1acf59f1688fa5814b186a0618e2c511253a306b770583f475",
+      "external_data": "hubert_features.onnx.data",
+      "opset": 18,
+      "input": "waveform[1,samples]",
+      "output": "features[1,frames,768]"
+    },
+    {
+      "component": "rmvpe",
+      "path": "rmvpe/rmvpe.pt",
+      "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt",
+      "bytes": 181184272,
+      "sha256": "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193"
+    },
+    {
+      "component": "rmvpe",
+      "path": "rmvpe/rmvpe.onnx",
+      "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx",
+      "bytes": 361688443,
+      "sha256": "5370e71ac80af8b4b7c793d27efd51fd8bf962de3a7ede0766dac0befa3660fd"
+    },
+    {
+      "component": "rmvpe",
+      "path": "rmvpe/rmvpe_20231006.onnx",
+      "url": "https://huggingface.co/wok000/weights_gpl/resolve/main/rmvpe/rmvpe_20231006.onnx",
+      "bytes": 362003174,
+      "sha256": "84f0586308e36157f75b77c8591bf636d6719c0c4ba95f8faf3df479e7566219",
+      "input": "waveform[1,samples],threshold[1]",
+      "output": "pitchf[1,frames]"
+    }
+  ]
+}

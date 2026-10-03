@@ -1,0 +1,11 @@
+{
+  "id": "fixture-rvc-v2",
+  "display_name": "Fixture RVC v2",
+  "architecture": "rvc-v2",
+  "version": "0.1-fixture",
+  "sample_rate": 16000,
+  "model_file": "model.pth",
+  "index_file": "model.index",
+  "source": "local fixture; replace with a licensed RVC checkpoint",
+  "notes": "The binary files are intentionally tiny deterministic fixtures for loader and cache tests."
+}

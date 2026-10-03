@@ -1,0 +1,15 @@
+{
+  "id": "tsukuyomi-v2",
+  "display_name": "Tsukuyomi RVC v2 ONNX test voice",
+  "architecture": "rvc-v2",
+  "version": "v2",
+  "sample_rate": 40000,
+  "model_file": "model.onnx",
+  "index_file": null,
+  "source": "https://huggingface.co/wok000/vcclient_model",
+  "model_url": "https://huggingface.co/wok000/vcclient_model/resolve/main/rvc_v2_alpha/tsukuyomi-chan/tsukuyomi_v2_40k_e100_simple.onnx",
+  "terms_of_use_url": "https://huggingface.co/wok000/vcclient_model/raw/main/rvc_v2_alpha/tsukuyomi-chan/terms_of_use.txt",
+  "model_bytes": 55382411,
+  "model_sha256": "99d294dd30b1fcb2881285af9e9fcf0f5fab19187703ffdd746d5fb7b725fcf6",
+  "notes": "RVC v2 F0 ONNX export used to validate the ONNX importer. See upstream terms_of_use.txt."
+}

@@ -58,6 +58,11 @@ convert(input.samples(), output.samples_mut());
 output.commit();
 ```
 
+When the render queue is intentionally shallow, a worker can use
+`WorkerIo::wait_output(timeout)` instead of retrying `try_output()`. The
+consumer only signals the space generation when it releases a slot from a
+full ring, so the normal render callback path does not issue wakeups.
+
 The input lease is released after the model has finished reading it. Dropping
 an output lease aborts its reservation without publishing a partially written
 block.

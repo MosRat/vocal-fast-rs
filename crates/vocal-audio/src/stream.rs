@@ -131,6 +131,18 @@ impl WorkerIo {
         self.output.try_acquire()
     }
 
+    /// Wait for output space before reserving a slot. This avoids a worker
+    /// busy loop when render is temporarily consuming the previous block.
+    pub fn wait_output(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<AudioWriteLease<'_>, AudioError> {
+        if !self.output.wait_for_capacity(timeout) {
+            return Err(AudioError::QueueFull);
+        }
+        self.output.try_acquire()
+    }
+
     /// Acquire one input and one output slot together. The pair keeps the two
     /// SPSC queues borrowed independently, allowing an inference step to read
     /// its input while writing its output without an intermediate buffer.

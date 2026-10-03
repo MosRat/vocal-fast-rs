@@ -43,6 +43,7 @@ struct RingInner {
     config: StreamConfig,
     slots: Box<[RingSlot]>,
     wake: AudioWake,
+    space_wake: AudioWake,
     write: CachePadded<AtomicUsize>,
     read: CachePadded<AtomicUsize>,
     next_sequence: AtomicU64,
@@ -75,6 +76,7 @@ impl RingInner {
             config,
             slots,
             wake: AudioWake::new(),
+            space_wake: AudioWake::new(),
             write: CachePadded(AtomicUsize::new(0)),
             read: CachePadded(AtomicUsize::new(0)),
             next_sequence: AtomicU64::new(0),
@@ -114,6 +116,7 @@ impl RingInner {
         let next = write.wrapping_add(1);
         self.update_high_water(next);
         self.write.0.store(next, Ordering::Release);
+        self.wake.notify();
         Ok(sequence)
     }
 
@@ -151,6 +154,9 @@ impl RingInner {
         };
         self.popped.0.fetch_add(1, Ordering::Relaxed);
         self.read.0.store(read.wrapping_add(1), Ordering::Release);
+        if write.wrapping_sub(read) >= self.slots.len() {
+            self.space_wake.notify();
+        }
         Ok(result)
     }
 
@@ -398,6 +404,20 @@ impl AudioProducer {
             .saturating_sub(self.inner.stats().queued_blocks)
     }
 
+    /// Wait until at least one unpublished slot is available. This is meant
+    /// for a worker producing output; device callbacks should continue using
+    /// the non-blocking acquire methods.
+    pub fn wait_for_capacity(&self, timeout: Option<Duration>) -> bool {
+        if self.available_capacity() > 0 {
+            return true;
+        }
+        let observed = self.inner.space_wake.generation();
+        if self.available_capacity() > 0 {
+            return true;
+        }
+        self.inner.space_wake.wait(observed, timeout) && self.available_capacity() > 0
+    }
+
     pub fn stats(&self) -> AudioRingStats {
         self.inner.stats()
     }
@@ -632,6 +652,10 @@ impl Drop for AudioReadLease<'_> {
         let next = self.index.wrapping_add(1);
         self.consumer.inner.popped.0.fetch_add(1, Ordering::Relaxed);
         self.consumer.inner.read.0.store(next, Ordering::Release);
+        let write = self.consumer.inner.write.0.load(Ordering::Acquire);
+        if write.wrapping_sub(self.index) >= self.consumer.inner.slots.len() {
+            self.consumer.inner.space_wake.notify();
+        }
         self.consumer.read = next;
     }
 }

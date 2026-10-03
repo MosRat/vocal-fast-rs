@@ -245,6 +245,20 @@ mod tests {
     }
 
     #[test]
+    fn output_wait_wakes_after_render_releases_full_queue() {
+        let io = StreamIo::new(config().with_queue_blocks(1)).unwrap();
+        let (mut device, mut worker) = io.split();
+        worker.output.try_push(&[1.0, 2.0]).unwrap();
+        assert!(!worker.output.wait_for_capacity(Some(Duration::ZERO)));
+        drop(device.output.try_acquire().unwrap());
+        assert!(
+            worker
+                .output
+                .wait_for_capacity(Some(Duration::from_millis(1)))
+        );
+    }
+
+    #[test]
     fn drainer_reports_source_timestamp_for_profiled_audio() {
         let clock = AudioClock::new();
         let timestamp = clock.now();

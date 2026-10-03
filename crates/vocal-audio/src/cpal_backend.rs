@@ -9,7 +9,10 @@ use std::sync::Arc;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use thiserror::Error;
 
-use crate::{AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo};
+use crate::{
+    AudioClock, AudioError, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp,
+    BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo,
+};
 
 #[derive(Debug, Error)]
 pub enum CpalError {
@@ -39,6 +42,7 @@ pub enum CpalError {
 pub struct CpalDuplexStream {
     input: cpal::Stream,
     output: cpal::Stream,
+    latency: Option<Arc<AudioLatencyStats>>,
 }
 
 impl CpalDuplexStream {
@@ -48,6 +52,10 @@ impl CpalDuplexStream {
 
     pub fn output(&self) -> &cpal::Stream {
         &self.output
+    }
+
+    pub fn latency(&self) -> Option<AudioLatencySnapshot> {
+        self.latency.as_deref().map(AudioLatencyStats::snapshot)
     }
 }
 
@@ -63,6 +71,49 @@ pub fn build_duplex(
     config: StreamConfig,
     device_io: DeviceIo,
     worker_io: WorkerIo,
+    error_handler: impl Fn(cpal::Error) + Send + Sync + 'static,
+) -> Result<(CpalDuplexStream, WorkerIo), CpalError> {
+    build_duplex_inner(
+        input_device,
+        output_device,
+        config,
+        device_io,
+        worker_io,
+        None,
+        error_handler,
+    )
+}
+
+/// Profiled variant of [`build_duplex`]. Capture blocks are timestamped with
+/// `clock`; the inference worker should propagate that timestamp to its output
+/// lease with [`crate::AudioWriteLease::set_timestamp`].
+pub fn build_duplex_profiled(
+    input_device: &cpal::Device,
+    output_device: &cpal::Device,
+    config: StreamConfig,
+    device_io: DeviceIo,
+    worker_io: WorkerIo,
+    clock: AudioClock,
+    error_handler: impl Fn(cpal::Error) + Send + Sync + 'static,
+) -> Result<(CpalDuplexStream, WorkerIo), CpalError> {
+    build_duplex_inner(
+        input_device,
+        output_device,
+        config,
+        device_io,
+        worker_io,
+        Some(clock),
+        error_handler,
+    )
+}
+
+fn build_duplex_inner(
+    input_device: &cpal::Device,
+    output_device: &cpal::Device,
+    config: StreamConfig,
+    device_io: DeviceIo,
+    worker_io: WorkerIo,
+    clock: Option<AudioClock>,
     error_handler: impl Fn(cpal::Error) + Send + Sync + 'static,
 ) -> Result<(CpalDuplexStream, WorkerIo), CpalError> {
     let config = config.validate()?;
@@ -98,6 +149,7 @@ pub fn build_duplex(
         output: mut output_consumer,
     } = device_io;
     let mut assembler = BlockAssembler::new(config)?;
+    let input_clock = clock.clone();
     let input_error = Arc::clone(&callback_error);
     let input = input_device
         .build_input_stream(
@@ -106,7 +158,11 @@ pub fn build_duplex(
                 // A full queue is a real-time overflow. Dropping the newest
                 // block bounds latency; the ring and assembler expose counters
                 // for diagnostics.
-                let _ = assembler.push(data, &mut input_producer);
+                let timestamp = input_clock
+                    .as_ref()
+                    .map(AudioClock::now)
+                    .unwrap_or(AudioTimestamp::ZERO);
+                let _ = assembler.push_at(data, &mut input_producer, timestamp);
             },
             move |error| input_error(error),
             None,
@@ -114,6 +170,11 @@ pub fn build_duplex(
         .map_err(CpalError::BuildInput)?;
 
     let mut drainer = BlockDrainer::new(config)?;
+    let output_clock = clock;
+    let latency = output_clock
+        .as_ref()
+        .map(|_| Arc::new(AudioLatencyStats::default()));
+    let output_latency = latency.clone();
     let output_error = Arc::clone(&callback_error);
     let output = output_device
         .build_output_stream(
@@ -121,7 +182,17 @@ pub fn build_duplex(
             move |data: &mut [f32], _| {
                 // Silence is written on underflow so the native callback never
                 // blocks behind inference.
-                let _ = drainer.drain(data, &mut output_consumer);
+                if let Ok(report) = drainer.drain(data, &mut output_consumer)
+                    && let (Some(clock), Some(latency)) =
+                        (output_clock.as_ref(), output_latency.as_ref())
+                    && let Some(age) = report
+                        .source_timestamp
+                        .is_set()
+                        .then(|| clock.elapsed(report.source_timestamp))
+                        .flatten()
+                {
+                    latency.record(age);
+                }
             },
             move |error| output_error(error),
             None,
@@ -131,7 +202,14 @@ pub fn build_duplex(
     input.play().map_err(CpalError::PlayInput)?;
     output.play().map_err(CpalError::PlayOutput)?;
 
-    Ok((CpalDuplexStream { input, output }, worker_io))
+    Ok((
+        CpalDuplexStream {
+            input,
+            output,
+            latency,
+        },
+        worker_io,
+    ))
 }
 
 /// Prefer the native Windows host. On other platforms this returns cpal's

@@ -17,6 +17,7 @@ use wasapi::{
     SampleType, StreamMode, WaveFormat, initialize_mta,
 };
 
+use crate::{AudioClock, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp};
 use crate::{AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo};
 
 #[cfg(not(target_endian = "little"))]
@@ -42,12 +43,18 @@ pub enum WasapiBackendError {
     Spawn(#[source] std::io::Error),
 }
 
+struct LatencyProfile {
+    clock: Option<AudioClock>,
+    stats: Option<Arc<AudioLatencyStats>>,
+}
+
 /// Handles the capture and render event threads. Device interfaces are
 /// thread-affine in the `wasapi` crate, so the handles never leave their
 /// owning threads.
 pub struct WasapiStream {
     stop: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
+    latency: Option<Arc<AudioLatencyStats>>,
     joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
 }
 
@@ -57,6 +64,25 @@ impl WasapiStream {
     pub fn open(
         config: StreamConfig,
         mode: WasapiMode,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        Self::open_inner(config, mode, None)
+    }
+
+    /// Profiled variant of [`Self::open`]. Capture blocks receive a monotonic
+    /// timestamp; the worker should copy it to its output lease so the stream
+    /// can report measured capture-to-render age.
+    pub fn open_profiled(
+        config: StreamConfig,
+        mode: WasapiMode,
+        clock: AudioClock,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        Self::open_inner(config, mode, Some(clock))
+    }
+
+    fn open_inner(
+        config: StreamConfig,
+        mode: WasapiMode,
+        clock: Option<AudioClock>,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
         let config = config.validate()?;
         let io = crate::StreamIo::new(config)?;
@@ -72,6 +98,7 @@ impl WasapiStream {
             input: input_producer,
             output: output_consumer,
         } = device_io;
+        let capture_clock = clock.clone();
         let capture = thread::Builder::new()
             .name("vocal-wasapi-capture".into())
             .spawn(move || {
@@ -82,12 +109,21 @@ impl WasapiStream {
                     capture_stop,
                     capture_errors,
                     capture_ready_tx,
+                    capture_clock,
                 );
             })
             .map_err(WasapiBackendError::Spawn)?;
 
         let render_stop = Arc::clone(&stop);
         let render_errors = Arc::clone(&errors);
+        let render_clock = clock;
+        let latency = render_clock
+            .as_ref()
+            .map(|_| Arc::new(AudioLatencyStats::default()));
+        let render_profile = LatencyProfile {
+            clock: render_clock,
+            stats: latency.clone(),
+        };
         let render = match thread::Builder::new()
             .name("vocal-wasapi-render".into())
             .spawn(move || {
@@ -98,6 +134,7 @@ impl WasapiStream {
                     render_stop,
                     render_errors,
                     render_ready_tx,
+                    render_profile,
                 );
             }) {
             Ok(render) => render,
@@ -131,6 +168,7 @@ impl WasapiStream {
             Self {
                 stop,
                 errors,
+                latency,
                 joins: Some((capture, render)),
             },
             worker_io,
@@ -142,6 +180,10 @@ impl WasapiStream {
             .lock()
             .map(|mut errors| std::mem::take(&mut *errors))
             .unwrap_or_default()
+    }
+
+    pub fn latency(&self) -> Option<AudioLatencySnapshot> {
+        self.latency.as_deref().map(AudioLatencyStats::snapshot)
     }
 
     pub fn stop(mut self) {
@@ -163,8 +205,10 @@ impl Drop for WasapiStream {
     }
 }
 
-fn period_hns(config: StreamConfig) -> i64 {
-    ((config.block_frames as u128 * 10_000_000).div_ceil(config.format.sample_rate as u128)) as i64
+fn period_hns(config: StreamConfig) -> Result<i64, String> {
+    let period =
+        (config.block_frames as u128 * 10_000_000).div_ceil(config.format.sample_rate as u128);
+    i64::try_from(period).map_err(|_| "WASAPI period exceeds i64::MAX 100 ns units".into())
 }
 
 fn stream_mode(
@@ -181,7 +225,7 @@ fn stream_mode(
             })
         }
         WasapiMode::ExclusiveEvent => Ok(StreamMode::EventsExclusive {
-            period_hns: period_hns(config),
+            period_hns: period_hns(config)?,
         }),
     }
 }
@@ -298,6 +342,7 @@ fn capture_loop(
     stop: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    clock: Option<AudioClock>,
 ) {
     let com_result = initialize_mta();
     if com_result.is_err() {
@@ -348,6 +393,10 @@ fn capture_loop(
                 );
                 break;
             }
+            let timestamp = clock
+                .as_ref()
+                .map(AudioClock::now)
+                .unwrap_or(AudioTimestamp::ZERO);
             let (frames, info) =
                 match capture.read_from_device(&mut f32_bytes_mut(&mut samples)[..byte_count]) {
                     Ok(value) => value,
@@ -360,7 +409,7 @@ fn capture_loop(
             if info.flags.silent {
                 samples[..sample_count].fill(0.0);
             }
-            let _ = assembler.push(&samples[..sample_count], &mut input);
+            let _ = assembler.push_at(&samples[..sample_count], &mut input, timestamp);
         }
     }
     let _ = client.stop_stream();
@@ -374,6 +423,7 @@ fn render_loop(
     stop: Arc<AtomicBool>,
     errors: Arc<Mutex<Vec<String>>>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    profile: LatencyProfile,
 ) {
     let com_result = initialize_mta();
     if com_result.is_err() {
@@ -416,7 +466,16 @@ fn render_loop(
         }
         let frames = frames.min(samples.len() / channels);
         let sample_count = frames * channels;
-        let _ = drainer.drain(&mut samples[..sample_count], &mut output);
+        if let Ok(report) = drainer.drain(&mut samples[..sample_count], &mut output)
+            && let (Some(clock), Some(latency)) = (profile.clock.as_ref(), profile.stats.as_ref())
+            && let Some(age) = report
+                .source_timestamp
+                .is_set()
+                .then(|| clock.elapsed(report.source_timestamp))
+                .flatten()
+        {
+            latency.record(age);
+        }
         if let Err(error) =
             render.write_to_device(frames, f32_bytes(&samples[..sample_count]), None)
         {

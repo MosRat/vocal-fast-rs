@@ -28,6 +28,13 @@ producers/consumers against one queue. A monitor path can call
 `AudioConsumer::try_copy_latest_into` to drop stale blocks and bound latency;
 the main render path should use FIFO draining to preserve every block.
 
+`DeviceIo::stats()` and `WorkerIo::stats()` expose queue depth, pushes, pops,
+and overflow counters. `AudioIoStats::estimated_queue_latency()` converts the
+current ring depth to a lower-bound queue budget. For example, a 480-frame
+block at 48 kHz is 10 ms, so four queued input blocks plus two queued output
+blocks represent 60 ms of ring residency before device safety buffers and
+model execution are included.
+
 The zero-copy worker loop is shaped like this:
 
 ```rust,ignore
@@ -39,6 +46,22 @@ output.commit();
 The input lease is released after the model has finished reading it. Dropping
 an output lease aborts its reservation without publishing a partially written
 block.
+
+For an actual capture-to-render profile, opt into timestamps only in the
+profile build. Create one `AudioClock` per stream, call
+`AudioProducer::try_acquire_at(clock.now())` (or `push_at`) when a capture
+block is published, copy `AudioReadLease::timestamp()` to the output lease
+with `set_timestamp`, and read the timestamp from the render-side lease. The
+render thread can then report `clock.elapsed(timestamp)` as the measured age.
+When using `BlockDrainer`, the same source timestamp is returned in
+`DrainReport::source_timestamp`.
+`cpal_backend::build_duplex_profiled` and
+`wasapi_backend::WasapiStream::open_profiled` collect the latest and maximum
+ages in their `latency()` snapshots. A zero sample count means the inference
+worker did not propagate timestamps, rather than that the device measured zero
+latency.
+The default methods write `AudioTimestamp::ZERO`, so production streams do not
+pay for a clock read on every callback.
 
 ## Windows backend choice
 

@@ -39,6 +39,12 @@ block at 48 kHz is 10 ms, so three queued input blocks plus three queued output
 blocks represent 60 ms of ring residency before device safety buffers and
 model execution are included.
 
+`StreamIo::new_with_queue_config` and the WASAPI `*_with_queue_config` open
+methods accept independent `StreamQueueConfig` capacities. The default
+`StreamIo::new` remains symmetric for simple callers; a low-latency duplex
+setup can use three input blocks and two output blocks so render backlog is
+bounded more tightly than capture scheduling slack.
+
 The producer publishes a generation after every commit. On Windows the worker
 waits with `WaitOnAddress` and the callback wakes it with
 `WakeByAddressSingle`; the callback never takes a mutex or sleeps. Portable

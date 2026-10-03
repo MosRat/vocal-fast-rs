@@ -18,7 +18,9 @@ use wasapi::{
 };
 
 use crate::{AudioClock, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp};
-use crate::{AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo};
+use crate::{
+    AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, StreamQueueConfig, WorkerIo,
+};
 
 pub use crate::threading::MmcssGuard;
 pub use crate::wasapi_native::{NativeWasapiError, NativeWasapiStream};
@@ -68,7 +70,19 @@ impl WasapiStream {
         config: StreamConfig,
         mode: WasapiMode,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
-        Self::open_inner(config, mode, None)
+        Self::open_with_queue_config(
+            config,
+            mode,
+            StreamQueueConfig::symmetric(config.queue_blocks),
+        )
+    }
+
+    pub fn open_with_queue_config(
+        config: StreamConfig,
+        mode: WasapiMode,
+        queues: StreamQueueConfig,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        Self::open_inner(config, mode, queues, None)
     }
 
     /// Profiled variant of [`Self::open`]. Capture blocks receive a monotonic
@@ -79,16 +93,31 @@ impl WasapiStream {
         mode: WasapiMode,
         clock: AudioClock,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
-        Self::open_inner(config, mode, Some(clock))
+        Self::open_profiled_with_queue_config(
+            config,
+            mode,
+            StreamQueueConfig::symmetric(config.queue_blocks),
+            clock,
+        )
+    }
+
+    pub fn open_profiled_with_queue_config(
+        config: StreamConfig,
+        mode: WasapiMode,
+        queues: StreamQueueConfig,
+        clock: AudioClock,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        Self::open_inner(config, mode, queues, Some(clock))
     }
 
     fn open_inner(
         config: StreamConfig,
         mode: WasapiMode,
+        queues: StreamQueueConfig,
         clock: Option<AudioClock>,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
         let config = config.validate()?;
-        let io = crate::StreamIo::new(config)?;
+        let io = crate::StreamIo::new_with_queue_config(config, queues)?;
         let (device_io, worker_io) = io.split();
         let stop = Arc::new(AtomicBool::new(false));
         let errors = Arc::new(Mutex::new(Vec::new()));

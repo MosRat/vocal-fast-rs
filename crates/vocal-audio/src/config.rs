@@ -13,6 +13,49 @@ pub struct StreamConfig {
     pub queue_blocks: usize,
 }
 
+/// Independent queue capacities for the capture and render sides of a
+/// duplex stream. Capture normally benefits from one extra period of slack,
+/// while render should stay shallow so an underperforming worker cannot turn
+/// into an audible backlog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamQueueConfig {
+    pub input_blocks: usize,
+    pub output_blocks: usize,
+}
+
+impl StreamQueueConfig {
+    pub const fn new(input_blocks: usize, output_blocks: usize) -> Self {
+        Self {
+            input_blocks,
+            output_blocks,
+        }
+    }
+
+    pub const fn symmetric(blocks: usize) -> Self {
+        Self::new(blocks, blocks)
+    }
+
+    pub fn validate(self) -> Result<Self, AudioError> {
+        if self.input_blocks == 0 || self.output_blocks == 0 {
+            return Err(AudioError::InvalidConfig(
+                "input_blocks and output_blocks must be non-zero".into(),
+            ));
+        }
+        if self.input_blocks > isize::MAX as usize || self.output_blocks > isize::MAX as usize {
+            return Err(AudioError::InvalidConfig(
+                "queue capacity is too large for a bounded ring".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for StreamQueueConfig {
+    fn default() -> Self {
+        Self::new(3, 2)
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
@@ -29,6 +72,11 @@ impl Default for StreamConfig {
 }
 
 impl StreamConfig {
+    pub const fn with_queue_blocks(mut self, queue_blocks: usize) -> Self {
+        self.queue_blocks = queue_blocks;
+        self
+    }
+
     pub fn validate(self) -> Result<Self, AudioError> {
         if self.format.sample_rate == 0
             || self.format.channels == 0

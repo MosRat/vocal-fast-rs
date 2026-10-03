@@ -60,6 +60,24 @@ mod tests {
     }
 
     #[test]
+    fn duplex_queue_capacities_are_independent() {
+        let queues = StreamQueueConfig::new(4, 1);
+        let io = StreamIo::new_with_queue_config(config(), queues).unwrap();
+        assert_eq!(io.queue_config(), queues);
+        let (device, worker) = io.split();
+        assert_eq!(device.input.available_capacity(), 4);
+        assert_eq!(worker.output.available_capacity(), 1);
+    }
+
+    #[test]
+    fn queue_capacity_rejects_zero_sides() {
+        assert!(matches!(
+            StreamIo::new_with_queue_config(config(), StreamQueueConfig::new(0, 2)),
+            Err(AudioError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
     fn opt_in_timestamps_survive_the_ring_boundary() {
         let clock = AudioClock::new();
         let timestamp = clock.now();

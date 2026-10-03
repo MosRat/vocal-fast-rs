@@ -1,4 +1,4 @@
-use super::config::{AudioError, StreamConfig, allocate_samples};
+use super::config::{AudioError, StreamConfig, StreamQueueConfig, allocate_samples};
 use super::ring::{
     AudioConsumer, AudioIoStats, AudioProducer, AudioReadLease, AudioRing, AudioWriteLease,
 };
@@ -14,15 +14,34 @@ pub struct StreamIo {
 
 impl StreamIo {
     pub fn new(config: StreamConfig) -> Result<Self, AudioError> {
+        Self::new_with_queue_config(config, StreamQueueConfig::symmetric(config.queue_blocks))
+    }
+
+    /// Construct a duplex stream with separate capture and render ring
+    /// capacities. `StreamConfig::queue_blocks` remains the symmetric default
+    /// used by [`Self::new`].
+    pub fn new_with_queue_config(
+        config: StreamConfig,
+        queues: StreamQueueConfig,
+    ) -> Result<Self, AudioError> {
+        let config = config.validate()?;
+        let queues = queues.validate()?;
         Ok(Self {
             config,
-            input: AudioRing::new(config)?,
-            output: AudioRing::new(config)?,
+            input: AudioRing::new(config.with_queue_blocks(queues.input_blocks))?,
+            output: AudioRing::new(config.with_queue_blocks(queues.output_blocks))?,
         })
     }
 
     pub fn config(&self) -> StreamConfig {
         self.config
+    }
+
+    pub fn queue_config(&self) -> StreamQueueConfig {
+        StreamQueueConfig::new(
+            self.input.config().queue_blocks,
+            self.output.config().queue_blocks,
+        )
     }
 
     pub fn split(self) -> (DeviceIo, WorkerIo) {

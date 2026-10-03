@@ -31,7 +31,7 @@ use windows::core::Interface;
 use crate::threading::MmcssGuard;
 use crate::{
     AudioClock, AudioError, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp,
-    BlockAssembler, BlockDrainer, StreamConfig, WorkerIo,
+    BlockAssembler, BlockDrainer, StreamConfig, StreamQueueConfig, WorkerIo,
 };
 
 #[derive(Debug, Error)]
@@ -55,22 +55,42 @@ pub struct NativeWasapiStream {
 
 impl NativeWasapiStream {
     pub fn open(config: StreamConfig) -> Result<(Self, WorkerIo), NativeWasapiError> {
-        Self::open_inner(config, None)
+        Self::open_with_queue_config(config, StreamQueueConfig::symmetric(config.queue_blocks))
+    }
+
+    pub fn open_with_queue_config(
+        config: StreamConfig,
+        queues: StreamQueueConfig,
+    ) -> Result<(Self, WorkerIo), NativeWasapiError> {
+        Self::open_inner(config, queues, None)
     }
 
     pub fn open_profiled(
         config: StreamConfig,
         clock: AudioClock,
     ) -> Result<(Self, WorkerIo), NativeWasapiError> {
-        Self::open_inner(config, Some(clock))
+        Self::open_profiled_with_queue_config(
+            config,
+            StreamQueueConfig::symmetric(config.queue_blocks),
+            clock,
+        )
+    }
+
+    pub fn open_profiled_with_queue_config(
+        config: StreamConfig,
+        queues: StreamQueueConfig,
+        clock: AudioClock,
+    ) -> Result<(Self, WorkerIo), NativeWasapiError> {
+        Self::open_inner(config, queues, Some(clock))
     }
 
     fn open_inner(
         config: StreamConfig,
+        queues: StreamQueueConfig,
         clock: Option<AudioClock>,
     ) -> Result<(Self, WorkerIo), NativeWasapiError> {
         let config = config.validate()?;
-        let io = crate::StreamIo::new(config)?;
+        let io = crate::StreamIo::new_with_queue_config(config, queues)?;
         let (device, worker) = io.split();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_event = EventHandle(

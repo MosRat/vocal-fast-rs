@@ -127,8 +127,9 @@ underflow still use the bounded staging buffers.
 
 Capture and render event threads register with Windows MMCSS under the
 `Pro Audio` task category. Registration is scoped to each thread and is
-reverted on exit. A model worker can use the exported `MmcssGuard` when its
-inference loop must share the same scheduling policy.
+reverted on exit. A model worker can call `WorkerIo::register_mmcss("Audio")`
+on its own inference thread when it must share the same scheduling policy; the
+guard must be retained until that loop exits.
 
 ## Initial tuning
 

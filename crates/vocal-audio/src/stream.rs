@@ -89,6 +89,14 @@ impl WorkerIo {
 }
 
 impl WorkerIo {
+    /// Register the current worker thread with Windows MMCSS. The call must
+    /// happen on the thread that owns the inference loop; the returned guard
+    /// should stay alive until that loop exits.
+    #[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
+    pub fn register_mmcss(&self, task: &str) -> Option<crate::threading::MmcssGuard> {
+        crate::threading::MmcssGuard::register(task)
+    }
+
     /// Borrow the next input block without copying it out of the queue.
     pub fn try_input(&mut self) -> Result<AudioReadLease<'_>, AudioError> {
         self.input.try_acquire()

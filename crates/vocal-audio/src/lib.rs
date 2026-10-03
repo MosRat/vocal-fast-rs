@@ -13,3 +13,6 @@ pub mod cpal_backend;
 
 #[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
 pub mod wasapi_backend;
+
+#[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
+mod threading;

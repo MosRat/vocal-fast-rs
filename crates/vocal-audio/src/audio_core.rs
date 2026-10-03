@@ -8,6 +8,8 @@ mod ring;
 mod stream;
 #[path = "timing.rs"]
 mod timing;
+#[path = "wake.rs"]
+mod wake;
 
 pub use config::*;
 pub use ring::*;
@@ -79,6 +81,32 @@ mod tests {
         assert_eq!(snapshot.samples, 2);
         assert_eq!(snapshot.last, Some(Duration::from_millis(7)));
         assert_eq!(snapshot.max, Some(Duration::from_millis(7)));
+        assert_eq!(snapshot.mean, Some(Duration::from_millis(5)));
+        assert!(snapshot.p50.unwrap() >= Duration::from_millis(3));
+        assert!(snapshot.p95.unwrap() >= Duration::from_millis(7));
+    }
+
+    #[test]
+    fn latency_stats_include_io_health_counters() {
+        let stats = AudioLatencyStats::default();
+        stats.record_underflow(4);
+        stats.record_device_timestamp(true);
+        stats.record_device_timestamp(false);
+        stats.record_discontinuity();
+        stats.record_queue_depth(3);
+        stats.record_queue_depth(2);
+        stats.record_endpoint(480, 48_000);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.underflow_samples, 4);
+        assert_eq!(snapshot.timestamped_packets, 1);
+        assert_eq!(snapshot.timestamp_errors, 1);
+        assert_eq!(snapshot.discontinuities, 1);
+        assert_eq!(snapshot.max_queue_blocks, 3);
+        assert_eq!(snapshot.max_endpoint_frames, 480);
+        assert_eq!(
+            snapshot.max_endpoint_latency,
+            Some(Duration::from_millis(10))
+        );
     }
 
     #[test]
@@ -107,6 +135,30 @@ mod tests {
         let sequence = consumer.try_copy_into(&mut block).unwrap();
         assert_eq!(sequence, 0);
         assert_eq!(block, [1.0, 2.0]);
+        assert_eq!(producer.stats().high_water_blocks, 1);
+    }
+
+    #[test]
+    fn worker_wait_times_out_when_input_is_empty() {
+        let (_, consumer) = AudioRing::new(config()).unwrap().split();
+        assert!(!consumer.wait_for_data(Some(Duration::ZERO)));
+    }
+
+    #[test]
+    fn producer_wakes_a_waiting_worker_without_losing_the_publish() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (mut producer, consumer) = AudioRing::new(config()).unwrap().split();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            consumer.wait_for_data(Some(Duration::from_secs(1)))
+        });
+        barrier.wait();
+        producer.try_push(&[9.0, 10.0]).unwrap();
+        assert!(worker.join().unwrap());
     }
 
     #[test]

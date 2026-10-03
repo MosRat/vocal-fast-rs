@@ -20,6 +20,8 @@ use wasapi::{
 use crate::{AudioClock, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp};
 use crate::{AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo};
 
+pub use crate::threading::MmcssGuard;
+
 #[cfg(not(target_endian = "little"))]
 compile_error!("the WASAPI f32 path requires a little-endian Windows target");
 
@@ -91,9 +93,13 @@ impl WasapiStream {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let (capture_ready_tx, capture_ready_rx) = mpsc::sync_channel(1);
         let (render_ready_tx, render_ready_rx) = mpsc::sync_channel(1);
+        let latency = clock
+            .as_ref()
+            .map(|_| Arc::new(AudioLatencyStats::default()));
 
         let capture_stop = Arc::clone(&stop);
         let capture_errors = Arc::clone(&errors);
+        let capture_latency = latency.clone();
         let DeviceIo {
             input: input_producer,
             output: output_consumer,
@@ -110,6 +116,7 @@ impl WasapiStream {
                     capture_errors,
                     capture_ready_tx,
                     capture_clock,
+                    capture_latency,
                 );
             })
             .map_err(WasapiBackendError::Spawn)?;
@@ -117,9 +124,6 @@ impl WasapiStream {
         let render_stop = Arc::clone(&stop);
         let render_errors = Arc::clone(&errors);
         let render_clock = clock;
-        let latency = render_clock
-            .as_ref()
-            .map(|_| Arc::new(AudioLatencyStats::default()));
         let render_profile = LatencyProfile {
             clock: render_clock,
             stats: latency.clone(),
@@ -343,6 +347,7 @@ fn capture_loop(
     errors: Arc<Mutex<Vec<String>>>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
+    latency: Option<Arc<AudioLatencyStats>>,
 ) {
     let com_result = initialize_mta();
     if com_result.is_err() {
@@ -351,6 +356,7 @@ fn capture_loop(
         record_error(&errors, error);
         return;
     }
+    let _mmcss = MmcssGuard::register("Pro Audio");
     let setup = setup_capture(config, mode);
     let (client, event, capture, mut assembler, mut samples) = match setup {
         Ok(value) => {
@@ -365,6 +371,12 @@ fn capture_loop(
         }
     };
     let bytes_per_frame = config.format.channels as usize * std::mem::size_of::<f32>();
+    if let Some(latency) = latency.as_ref() {
+        latency.record_endpoint(
+            samples.len() / config.format.channels as usize,
+            config.format.sample_rate,
+        );
+    }
     while !stop.load(Ordering::Acquire) {
         if let Err(error) = event.wait_for_event(1000) {
             if !matches!(error, wasapi::WasapiError::EventTimeout) {
@@ -393,10 +405,6 @@ fn capture_loop(
                 );
                 break;
             }
-            let timestamp = clock
-                .as_ref()
-                .map(AudioClock::now)
-                .unwrap_or(AudioTimestamp::ZERO);
             let (frames, info) =
                 match capture.read_from_device(&mut f32_bytes_mut(&mut samples)[..byte_count]) {
                     Ok(value) => value,
@@ -409,7 +417,27 @@ fn capture_loop(
             if info.flags.silent {
                 samples[..sample_count].fill(0.0);
             }
+            if let Some(latency) = latency.as_ref() {
+                if info.flags.data_discontinuity {
+                    latency.record_discontinuity();
+                }
+            }
+            let timestamp = match clock.as_ref() {
+                Some(clock) => {
+                    let mapped = (!info.flags.timestamp_error && info.timestamp != 0)
+                        .then(|| clock.from_wasapi_qpc(info.timestamp))
+                        .flatten();
+                    if let Some(latency) = latency.as_ref() {
+                        latency.record_device_timestamp(mapped.is_some());
+                    }
+                    mapped.unwrap_or_else(|| clock.now())
+                }
+                None => AudioTimestamp::ZERO,
+            };
             let _ = assembler.push_at(&samples[..sample_count], &mut input, timestamp);
+            if let Some(latency) = latency.as_ref() {
+                latency.record_queue_depth(input.stats().high_water_blocks);
+            }
         }
     }
     let _ = client.stop_stream();
@@ -432,6 +460,7 @@ fn render_loop(
         record_error(&errors, error);
         return;
     }
+    let _mmcss = MmcssGuard::register("Pro Audio");
     let setup = setup_render(config, mode);
     let (client, event, render, mut drainer, mut samples) = match setup {
         Ok(value) => {
@@ -466,21 +495,37 @@ fn render_loop(
         }
         let frames = frames.min(samples.len() / channels);
         let sample_count = frames * channels;
-        if let Ok(report) = drainer.drain(&mut samples[..sample_count], &mut output)
-            && let (Some(clock), Some(latency)) = (profile.clock.as_ref(), profile.stats.as_ref())
-            && let Some(age) = report
-                .source_timestamp
-                .is_set()
-                .then(|| clock.elapsed(report.source_timestamp))
-                .flatten()
-        {
-            latency.record(age);
+        let report = match drainer.drain(&mut samples[..sample_count], &mut output) {
+            Ok(report) => report,
+            Err(error) => {
+                record_error(&errors, error.to_string());
+                break;
+            }
+        };
+        if let Some(latency) = profile.stats.as_ref() {
+            latency.record_underflow(report.underflow_samples);
+            latency.record_queue_depth(output.stats().high_water_blocks);
         }
         if let Err(error) =
             render.write_to_device(frames, f32_bytes(&samples[..sample_count]), None)
         {
             record_error(&errors, error.to_string());
             break;
+        }
+        if let Some(latency) = profile.stats.as_ref() {
+            if let Ok(padding) = client.get_current_padding() {
+                latency.record_endpoint(padding as usize, config.format.sample_rate);
+            }
+            if let Some(clock) = profile.clock.as_ref() {
+                let age = report
+                    .source_timestamp
+                    .is_set()
+                    .then(|| clock.elapsed(report.source_timestamp))
+                    .flatten();
+                if let Some(age) = age {
+                    latency.record(age);
+                }
+            }
         }
     }
     let _ = client.stop_stream();

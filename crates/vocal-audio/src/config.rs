@@ -20,7 +20,10 @@ impl Default for StreamConfig {
             // 10 ms at 48 kHz. A real-time model can choose a larger block
             // when its receptive field requires it.
             block_frames: 480,
-            queue_blocks: 8,
+            // Three 10 ms blocks give the worker enough scheduling slack
+            // without allowing a stalled model to accumulate 80 ms of stale
+            // input or output on each side of the duplex path.
+            queue_blocks: 3,
         }
     }
 }

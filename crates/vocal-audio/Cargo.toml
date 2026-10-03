@@ -16,3 +16,4 @@ cpal = { version = "0.18", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = { version = "0.25", optional = true }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Performance", "Win32_System_Threading"] }

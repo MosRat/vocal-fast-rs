@@ -3,6 +3,7 @@ use super::ring::{
     AudioConsumer, AudioIoStats, AudioProducer, AudioReadLease, AudioRing, AudioWriteLease,
 };
 use super::timing::AudioTimestamp;
+use std::time::Duration;
 
 /// The callback side and the worker side of a duplex stream.
 pub struct StreamIo {
@@ -71,6 +72,20 @@ impl WorkerIo {
 impl WorkerIo {
     /// Borrow the next input block without copying it out of the queue.
     pub fn try_input(&mut self) -> Result<AudioReadLease<'_>, AudioError> {
+        self.input.try_acquire()
+    }
+
+    /// Block until an input block is available, then borrow it in place.
+    ///
+    /// The producer side only publishes an atomic generation and wakes the
+    /// waiter; no callback thread takes a mutex or waits for the worker.
+    pub fn wait_input(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<AudioReadLease<'_>, AudioError> {
+        if !self.input.wait_for_data(timeout) {
+            return Err(AudioError::QueueEmpty);
+        }
         self.input.try_acquire()
     }
 

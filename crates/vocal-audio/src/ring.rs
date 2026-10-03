@@ -8,6 +8,7 @@ use vocal_types::AudioChunk;
 
 use super::config::{AudioError, StreamConfig, allocate_samples};
 use super::timing::AudioTimestamp;
+use super::wake::AudioWake;
 
 #[repr(align(64))]
 struct CachePadded<T>(T);
@@ -41,12 +42,14 @@ unsafe impl Sync for RingSlot {}
 struct RingInner {
     config: StreamConfig,
     slots: Box<[RingSlot]>,
+    wake: AudioWake,
     write: CachePadded<AtomicUsize>,
     read: CachePadded<AtomicUsize>,
     next_sequence: AtomicU64,
     pushed: CachePadded<AtomicU64>,
     popped: CachePadded<AtomicU64>,
     dropped_full: CachePadded<AtomicU64>,
+    high_water: CachePadded<AtomicUsize>,
 }
 
 unsafe impl Send for RingInner {}
@@ -70,12 +73,14 @@ impl RingInner {
         Ok(Arc::new(Self {
             config,
             slots,
+            wake: AudioWake::new(),
             write: CachePadded(AtomicUsize::new(0)),
             read: CachePadded(AtomicUsize::new(0)),
             next_sequence: AtomicU64::new(0),
             pushed: CachePadded(AtomicU64::new(0)),
             popped: CachePadded(AtomicU64::new(0)),
             dropped_full: CachePadded(AtomicU64::new(0)),
+            high_water: CachePadded(AtomicUsize::new(0)),
         }))
     }
 
@@ -104,8 +109,27 @@ impl RingInner {
             *slot.timestamp.get() = timestamp;
         }
         self.pushed.0.fetch_add(1, Ordering::Relaxed);
-        self.write.0.store(write.wrapping_add(1), Ordering::Release);
+        let next = write.wrapping_add(1);
+        self.update_high_water(next);
+        self.write.0.store(next, Ordering::Release);
         Ok(sequence)
+    }
+
+    fn update_high_water(&self, write: usize) {
+        let read = self.read.0.load(Ordering::Acquire);
+        let depth = write.wrapping_sub(read).min(self.slots.len());
+        let mut current = self.high_water.0.load(Ordering::Relaxed);
+        while depth > current {
+            match self.high_water.0.compare_exchange_weak(
+                current,
+                depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
     }
 
     fn try_read<R>(&self, read_fn: impl FnOnce(&[f32], u64) -> R) -> Result<R, AudioError> {
@@ -136,6 +160,7 @@ impl RingInner {
             pushed: self.pushed.0.load(Ordering::Relaxed),
             popped: self.popped.0.load(Ordering::Relaxed),
             dropped_full: self.dropped_full.0.load(Ordering::Relaxed),
+            high_water_blocks: self.high_water.0.load(Ordering::Relaxed),
         }
     }
 }
@@ -148,11 +173,16 @@ pub struct AudioRingStats {
     pub pushed: u64,
     pub popped: u64,
     pub dropped_full: u64,
+    pub high_water_blocks: usize,
 }
 
 impl AudioRingStats {
     pub fn queued_frames(self, block_frames: usize) -> Option<usize> {
         self.queued_blocks.checked_mul(block_frames)
+    }
+
+    pub fn high_water_frames(self, block_frames: usize) -> Option<usize> {
+        self.high_water_blocks.checked_mul(block_frames)
     }
 }
 
@@ -412,6 +442,8 @@ impl AudioWriteLease<'_> {
         }
         inner.pushed.0.fetch_add(1, Ordering::Relaxed);
         inner.write.0.store(next, Ordering::Release);
+        inner.update_high_water(next);
+        inner.wake.notify();
         self.producer.write = next;
         self.producer.next_sequence = sequence.wrapping_add(1);
         sequence
@@ -436,6 +468,20 @@ pub struct AudioConsumer {
 impl AudioConsumer {
     pub fn config(&self) -> StreamConfig {
         self.config
+    }
+
+    /// Wait for input to become available without taking a mutex in the
+    /// producer callback. The queue is checked before and after the observed
+    /// generation to avoid a lost wake-up.
+    pub fn wait_for_data(&self, timeout: Option<Duration>) -> bool {
+        if !self.is_empty() {
+            return true;
+        }
+        let observed = self.inner.wake.generation();
+        if !self.is_empty() {
+            return true;
+        }
+        self.inner.wake.wait(observed, timeout) && !self.is_empty()
     }
 
     pub fn try_acquire(&mut self) -> Result<AudioReadLease<'_>, AudioError> {

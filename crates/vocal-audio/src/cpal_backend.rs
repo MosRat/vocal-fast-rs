@@ -143,6 +143,9 @@ fn build_duplex_inner(
         buffer_size: cpal::BufferSize::Fixed(config.block_frames as u32),
     };
     let callback_error = Arc::new(error_handler);
+    let latency = clock
+        .as_ref()
+        .map(|_| Arc::new(AudioLatencyStats::default()));
 
     let DeviceIo {
         input: mut input_producer,
@@ -150,6 +153,7 @@ fn build_duplex_inner(
     } = device_io;
     let mut assembler = BlockAssembler::new(config)?;
     let input_clock = clock.clone();
+    let input_latency = latency.clone();
     let input_error = Arc::clone(&callback_error);
     let input = input_device
         .build_input_stream(
@@ -163,6 +167,9 @@ fn build_duplex_inner(
                     .map(AudioClock::now)
                     .unwrap_or(AudioTimestamp::ZERO);
                 let _ = assembler.push_at(data, &mut input_producer, timestamp);
+                if let Some(latency) = input_latency.as_ref() {
+                    latency.record_queue_depth(input_producer.stats().high_water_blocks);
+                }
             },
             move |error| input_error(error),
             None,
@@ -171,9 +178,6 @@ fn build_duplex_inner(
 
     let mut drainer = BlockDrainer::new(config)?;
     let output_clock = clock;
-    let latency = output_clock
-        .as_ref()
-        .map(|_| Arc::new(AudioLatencyStats::default()));
     let output_latency = latency.clone();
     let output_error = Arc::clone(&callback_error);
     let output = output_device
@@ -182,16 +186,21 @@ fn build_duplex_inner(
             move |data: &mut [f32], _| {
                 // Silence is written on underflow so the native callback never
                 // blocks behind inference.
-                if let Ok(report) = drainer.drain(data, &mut output_consumer)
-                    && let (Some(clock), Some(latency)) =
-                        (output_clock.as_ref(), output_latency.as_ref())
-                    && let Some(age) = report
-                        .source_timestamp
-                        .is_set()
-                        .then(|| clock.elapsed(report.source_timestamp))
-                        .flatten()
-                {
-                    latency.record(age);
+                if let Ok(report) = drainer.drain(data, &mut output_consumer) {
+                    if let Some(latency) = output_latency.as_ref() {
+                        latency.record_underflow(report.underflow_samples);
+                        latency.record_queue_depth(output_consumer.stats().high_water_blocks);
+                        if let Some(clock) = output_clock.as_ref() {
+                            let age = report
+                                .source_timestamp
+                                .is_set()
+                                .then(|| clock.elapsed(report.source_timestamp))
+                                .flatten();
+                            if let Some(age) = age {
+                                latency.record(age);
+                            }
+                        }
+                    }
                 }
             },
             move |error| output_error(error),

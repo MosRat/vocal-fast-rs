@@ -1,0 +1,14 @@
+[package]
+name = "vocal-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cpal-backend = ["dep:cpal"]
+
+[dependencies]
+thiserror.workspace = true
+vocal-types.workspace = true
+cpal = { version = "0.15", optional = true }

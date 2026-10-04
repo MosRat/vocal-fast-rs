@@ -567,7 +567,12 @@ fn run_capture(
             }
             let timestamp =
                 packet_timestamp(clock.as_ref(), latency.as_deref(), flags, qpc_position);
-            let direct = if frames as usize == config.block_frames && input.available_capacity() > 0
+            if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
+                assembler.reset();
+            }
+            let direct = if assembler.buffered_samples() == 0
+                && frames as usize == config.block_frames
+                && input.available_capacity() > 0
             {
                 match input.try_acquire() {
                     Ok(mut lease) => {

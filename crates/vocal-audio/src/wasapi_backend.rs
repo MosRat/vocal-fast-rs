@@ -479,43 +479,48 @@ fn capture_loop(
             // endpoint staging buffer plus the assembler copy. If the packet
             // shape changes, or the ring is full, fall back to the general
             // assembler path below so the capture packet is still released.
-            let direct_result =
-                if packet_frames == config.block_frames && input.available_capacity() > 0 {
-                    match input.try_acquire() {
-                        Ok(mut lease) => {
-                            match capture.read_from_device(f32_bytes_mut(lease.samples_mut())) {
-                                Ok((frames, info)) => {
-                                    let sample_count = (frames as usize)
-                                        .saturating_mul(config.format.channels as usize);
-                                    let timestamp =
-                                        packet_timestamp(clock.as_ref(), latency.as_deref(), &info);
-                                    if frames as usize == config.block_frames {
-                                        if info.flags.silent {
-                                            lease.samples_mut().fill(0.0);
-                                        }
-                                        lease.set_timestamp(timestamp);
-                                        lease.commit();
-                                        Ok(Some((true, sample_count, timestamp)))
-                                    } else if sample_count > samples.len() {
-                                        Err("WASAPI capture packet exceeds endpoint buffer".into())
-                                    } else {
-                                        samples[..sample_count]
-                                            .copy_from_slice(&lease.samples()[..sample_count]);
-                                        if info.flags.silent {
-                                            samples[..sample_count].fill(0.0);
-                                        }
-                                        Ok(Some((false, sample_count, timestamp)))
-                                    }
+            let direct_result = if assembler.buffered_samples() == 0
+                && packet_frames == config.block_frames
+                && input.available_capacity() > 0
+            {
+                match input.try_acquire() {
+                    Ok(mut lease) => {
+                        match capture.read_from_device(f32_bytes_mut(lease.samples_mut())) {
+                            Ok((frames, info)) => {
+                                let sample_count = (frames as usize)
+                                    .saturating_mul(config.format.channels as usize);
+                                let timestamp =
+                                    packet_timestamp(clock.as_ref(), latency.as_deref(), &info);
+                                if info.flags.data_discontinuity {
+                                    assembler.reset();
                                 }
-                                Err(error) => Err(error.to_string()),
+                                if frames as usize == config.block_frames {
+                                    if info.flags.silent {
+                                        lease.samples_mut().fill(0.0);
+                                    }
+                                    lease.set_timestamp(timestamp);
+                                    lease.commit();
+                                    Ok(Some((true, sample_count, timestamp)))
+                                } else if sample_count > samples.len() {
+                                    Err("WASAPI capture packet exceeds endpoint buffer".into())
+                                } else {
+                                    samples[..sample_count]
+                                        .copy_from_slice(&lease.samples()[..sample_count]);
+                                    if info.flags.silent {
+                                        samples[..sample_count].fill(0.0);
+                                    }
+                                    Ok(Some((false, sample_count, timestamp)))
+                                }
                             }
+                            Err(error) => Err(error.to_string()),
                         }
-                        Err(AudioError::QueueFull) => Ok(None),
-                        Err(error) => Err(error.to_string()),
                     }
-                } else {
-                    Ok(None)
-                };
+                    Err(AudioError::QueueFull) => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                }
+            } else {
+                Ok(None)
+            };
             match direct_result {
                 Ok(Some((true, _, _))) => {
                     if let Some(latency) = latency.as_ref() {
@@ -558,6 +563,9 @@ fn capture_loop(
                     }
                 };
             let sample_count = frames as usize * config.format.channels as usize;
+            if info.flags.data_discontinuity {
+                assembler.reset();
+            }
             if info.flags.silent {
                 samples[..sample_count].fill(0.0);
             }

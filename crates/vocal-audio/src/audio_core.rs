@@ -287,6 +287,18 @@ mod tests {
     }
 
     #[test]
+    fn assembler_reset_drops_partial_block_at_discontinuity() {
+        let (mut producer, mut consumer) = AudioRing::new(config()).unwrap().split();
+        let mut assembler = BlockAssembler::new(config()).unwrap();
+        assert_eq!(assembler.push(&[1.0], &mut producer).unwrap(), 0);
+        assembler.reset();
+        assert_eq!(assembler.push(&[2.0, 3.0], &mut producer).unwrap(), 1);
+        let mut block = [0.0; 2];
+        consumer.try_copy_into(&mut block).unwrap();
+        assert_eq!(block, [2.0, 3.0]);
+    }
+
+    #[test]
     fn latest_copy_drops_stale_blocks() {
         let (mut producer, mut consumer) = AudioRing::new(config()).unwrap().split();
         producer.try_push(&[1.0, 1.0]).unwrap();

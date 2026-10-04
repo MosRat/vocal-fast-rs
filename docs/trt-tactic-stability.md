@@ -31,6 +31,17 @@ the workspace produced a large Synth-only error while another `0x3` plan with
 the same graph options passed, which shows why serialized plans must be gated
 by output parity rather than trusted from their option manifest alone.
 
+The gate must still be run per graph. Rebuilding every graph with edge-only
+tactics while leaving HuBERT at FP16 produced full-chain cosine `0.96919` on
+the same waveform; the Synth-only cosine stayed `0.99999932`, while HuBERT
+feature drift dominated the final error. Rebuilding the same edge-only plan
+with HuBERT FP32 produced full-chain cosine `0.99572`, Synth-only cosine
+`0.99999935`, and a 20-replay host mean of `56.25 ms`. This is the current
+parity preset. HuBERT FP16 remains the throughput preset, but it must pass the
+full acoustic gate for each TensorRT build. A future refinement should allow
+separate tactic-source masks for HuBERT, RMVPE, and Synth instead of applying
+one global mask.
+
 Build the edge-only preset with:
 
 ```powershell

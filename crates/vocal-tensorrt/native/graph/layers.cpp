@@ -57,8 +57,7 @@ T Layers::quantized_activation(T x,std::string const& name) {
     require(scale_tensor,"W8A8 activation scale output");
     auto* q=n.addQuantize(*x,*scale_tensor,DataType::kINT8);
     require(q,"W8A8 activation quantize");
-    auto* q_tensor=q->getOutput(0);
-    require(q_tensor,"W8A8 activation quantize output");
+    auto* q_tensor=output(q,name+".w8a8_q");
     auto* dq=n.addDequantize(*q_tensor,*scale_tensor,real_type());
     require(dq,"W8A8 activation dequantize");
     return output(dq,name+".w8a8_dq");
@@ -122,9 +121,8 @@ T Layers::quantized_parameter(std::string const& name,Dims d,int axis) {
     auto& scale_storage=floats.back();
     auto* scale_layer=n.addConstant(dims({channels}),{DataType::kFLOAT,scale_storage.data(),channels});
     require(scale_layer,"INT8 weight scale");
-    auto* raw=raw_layer->getOutput(0);
-    auto* scale_tensor=scale_layer->getOutput(0);
-    require(raw && scale_tensor,"INT8 weight tensors");
+    auto* raw=output(raw_layer,name+".int8_q");
+    auto* scale_tensor=output(scale_layer,name+".int8_scale");
     auto* dq=n.addDequantize(*raw,*scale_tensor,real_type());
     require(dq,"INT8 weight dequantize");
     dq->setAxis(axis);
@@ -191,7 +189,14 @@ T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool
             bias_weights={real_type(),low.data(),channels};
         }
     }
-    if(w8a8_selected(p)) x=quantized_activation(x,p);
+    bool const w8a8=w8a8_selected(p);
+    if(w8a8) {
+        require(real_type()==DataType::kHALF,
+                "W8A8 selected convolution requires FP16 decoder precision: "+p);
+        require(x->getType()==DataType::kHALF,
+                "W8A8 selected convolution entered with non-FP16 activation: "+p);
+        x=quantized_activation(x,p);
+    }
     auto x4=reshape(x,dims({1,x->getDimensions().d[1],1,-1}));
     IConvolutionLayer* l=nullptr;
     if((o.quantize_weights || w8a16_selected(p) || w8a8_selected(p)) && weight_scale==1.0f) {
@@ -207,6 +212,10 @@ T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool
         require(l,"conv "+p);
     }
     l->setStrideNd(dims({1,stride}));l->setDilationNd(dims({1,dilation}));l->setPaddingNd(dims({0,padding<0?(kernel-1)*dilation/2:padding}));
+    if(w8a8) {
+        require(l->getOutput(0)->getType()==DataType::kHALF,
+                "W8A8 selected convolution did not infer FP16 output: "+p);
+    }
     return reshape(output(l,p),dims({1,channels,-1}));
 }
 T Layers::fused_qkv_conv(T x,std::string const& p,int channels) {

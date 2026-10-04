@@ -107,17 +107,28 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
                 auto suffix=std::to_string(k);
                 int const dilation_index=j*(c.resblock_type==1?3:2)+k;
                 auto a=y;
-                if(a->getType()!=conv1_type) a=cast(a,conv1_type);
-                active_type=conv1_type;
+                auto conv1_name=p+(c.resblock_type==1?".convs1.":".convs.")+suffix;
+                // A selected W8A8 node must live in the decoder's low
+                // precision domain.  Previously the default FP32 residual
+                // accumulator won here, so the graph became
+                //   FP32 -> Q/DQ -> FP32 convolution
+                // and TensorRT had no typed low-precision convolution to
+                // which it could apply an INT8 tactic.  Keep the residual
+                // sum in FP32, but make the selected convolution itself
+                // explicitly FP16 (the W8A8 path is currently FP16-only).
+                auto current_conv1_type=w8a8_selected(conv1_name)?decoder_type:conv1_type;
+                if(a->getType()!=current_conv1_type) a=cast(a,current_conv1_type);
+                active_type=current_conv1_type;
                 a=act(a,ActivationType::kLEAKY_RELU,0.1f);
-                a=conv(a,p+(c.resblock_type==1?".convs1.":".convs.")+suffix,1,c.res_dilations[dilation_index]);
+                a=conv(a,conv1_name,1,c.res_dilations[dilation_index]);
                 if(c.resblock_type==1) {
                     // The validated W8A16 mask is applied only to selected
                     // Conv2 nodes.  Keep the surrounding residual sum in
                     // FP32 unless the existing stage precision explicitly
                     // requests low-precision accumulation.
                     auto conv2_name=p+".convs2."+suffix;
-                    auto current_conv2_type=w8a16_selected(conv2_name)?DataType::kHALF:conv2_type;
+                    auto current_conv2_type=w8a8_selected(conv2_name)?decoder_type:
+                        (w8a16_selected(conv2_name)?DataType::kHALF:conv2_type);
                     if(a->getType()!=current_conv2_type) a=cast(a,current_conv2_type);
                     active_type=current_conv2_type;
                     a=conv(act(a,ActivationType::kLEAKY_RELU,0.1f),p+".convs2."+suffix);

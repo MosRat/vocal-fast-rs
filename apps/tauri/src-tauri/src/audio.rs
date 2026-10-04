@@ -230,6 +230,7 @@ impl AudioSession {
                         ) => {}
                         Err(error) => {
                             worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                            worker_alive_flag.store(false, Ordering::Release);
                             worker_report(error.to_string());
                             worker_stop.store(true, Ordering::Release);
                             break;
@@ -239,6 +240,7 @@ impl AudioSession {
                 }));
                 if result.is_err() {
                     worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                    worker_alive_flag.store(false, Ordering::Release);
                     worker_report("audio worker panicked".into());
                     worker_stop.store(true, Ordering::Release);
                 }

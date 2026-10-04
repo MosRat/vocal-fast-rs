@@ -1286,3 +1286,51 @@ fn period_duration(frames: usize, sample_rate: u32) -> Duration {
 fn record_error(errors: &BackendErrorState, error: String) {
     errors.record(error);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vocal_types::AudioFormat;
+
+    fn config() -> StreamConfig {
+        StreamConfig {
+            format: AudioFormat::MONO_48K,
+            block_frames: 480,
+            queue_blocks: 3,
+        }
+    }
+
+    #[test]
+    fn clock_estimator_reports_rate_error_over_a_long_window() {
+        let mut estimator = DeviceClockEstimator::default();
+        assert_eq!(estimator.observe(0, 1_000_000, 48_000), None);
+        // One second of QPC with five extra frames is approximately +104 ppm.
+        let ppm = estimator.observe(48_005, 11_000_000, 48_000).unwrap();
+        assert!((ppm - 104).abs() <= 1, "ppm={ppm}");
+    }
+
+    #[test]
+    fn capture_ahead_drops_and_render_ahead_duplicates() {
+        let mut controller = AudioDriftController::new(config());
+        controller.last_tick = Instant::now() - Duration::from_secs(1);
+        assert_eq!(controller.next_slip(1, true, Some(100)), FrameSlip::Drop);
+
+        let mut controller = AudioDriftController::new(config());
+        controller.last_tick = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            controller.next_slip(1, true, Some(-100)),
+            FrameSlip::Duplicate
+        );
+    }
+
+    #[test]
+    fn queue_fallback_is_conservative_and_never_slips_without_source() {
+        let mut controller = AudioDriftController::new(config());
+        controller.last_tick = Instant::now() - Duration::from_secs(1);
+        assert_eq!(controller.next_slip(2, true, None), FrameSlip::Drop);
+
+        let mut controller = AudioDriftController::new(config());
+        controller.last_tick = Instant::now() - Duration::from_secs(1);
+        assert_eq!(controller.next_slip(0, false, None), FrameSlip::None);
+    }
+}

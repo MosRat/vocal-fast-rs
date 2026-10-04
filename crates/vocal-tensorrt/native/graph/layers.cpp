@@ -29,6 +29,20 @@ Weights Layers::w(std::string const& name) {
         dst[static_cast<size_t>(i)]=o.precision==1?float_to_half_bits(p.data[i]):float_to_bf16_bits(p.data[i]);
     return {real_type(),dst.data(),p.count};
 }
+Weights Layers::w_scaled(std::string const& name,float scale) {
+    if(scale==1.0f) return w(name);
+    auto& p=weight(name);
+    require(!o.quantize_weights,"scaled Synth weights are incompatible with weight-only INT8");
+    floats.emplace_back(static_cast<size_t>(p.count));
+    auto& values=floats.back();
+    for(int64_t i=0;i<p.count;++i) values[static_cast<size_t>(i)]=p.data[i]*scale;
+    if(real_type()==DataType::kFLOAT) return {DataType::kFLOAT,values.data(),p.count};
+    low_constants.emplace_back(static_cast<size_t>(p.count));
+    auto& dst=low_constants.back();
+    for(int64_t i=0;i<p.count;++i)
+        dst[static_cast<size_t>(i)]=o.precision==1?float_to_half_bits(values[static_cast<size_t>(i)]):float_to_bf16_bits(values[static_cast<size_t>(i)]);
+    return {real_type(),dst.data(),p.count};
+}
 T Layers::quantized_parameter(std::string const& name,Dims d,int axis) {
     auto& p=weight(name);
     // Keep biases, normalization affine terms and scalar lookup tables in
@@ -111,7 +125,7 @@ T Layers::range(T length,int maximum) {
     auto l=n.addSlice(*integer(v,dims({maximum})),dims({0}),dims({1}),dims({1}));require(l,"range slice");l->setInput(2,*length);return output(l);
 }
 T Layers::matmul(T a,T b,bool tb) { return output(n.addMatrixMultiply(*a,MatrixOperation::kNONE,*b,tb?MatrixOperation::kTRANSPOSE:MatrixOperation::kNONE)); }
-T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool bias) {
+T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool bias,float weight_scale) {
     auto& k=weight(p+".weight");require(k.rank==3,"conv rank "+p);int channels=static_cast<int>(k.dims[0]),kernel=static_cast<int>(k.dims[2]);
     // TensorRT accepts an empty Weights object for a bias-less convolution,
     // but TensorRT-RTX has produced unstable results for that form in some
@@ -136,12 +150,16 @@ T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool
     }
     auto x4=reshape(x,dims({1,x->getDimensions().d[1],1,-1}));
     IConvolutionLayer* l=nullptr;
-    if(o.quantize_weights) {
+    if(o.quantize_weights && weight_scale==1.0f) {
         auto kernel_tensor=quantized_parameter(p+".weight",dims({channels,k.dims[1],1,kernel}),0);
         l=n.addConvolutionNd(*x4,channels,dims({1,kernel}),Weights{real_type(),nullptr,0},bias_weights);
         require(l,"conv "+p); l->setInput(1,*kernel_tensor);
     } else {
-        l=n.addConvolutionNd(*x4,channels,dims({1,kernel}),w(p+".weight"),bias_weights);
+        // Folding a preceding residual scale into a convolution scales only
+        // the kernel.  The affine bias is applied after the convolution and
+        // must remain unchanged: W*(s*x)+b == (s*W)*x+b.
+        Weights kernel_weights=w_scaled(p+".weight",weight_scale);
+        l=n.addConvolutionNd(*x4,channels,dims({1,kernel}),kernel_weights,bias_weights);
         require(l,"conv "+p);
     }
     l->setStrideNd(dims({1,stride}));l->setDilationNd(dims({1,dilation}));l->setPaddingNd(dims({0,padding<0?(kernel-1)*dilation/2:padding}));
@@ -201,18 +219,97 @@ T Layers::fused_qkv_conv(T x,std::string const& p,int channels) {
     layer->setPaddingNd(dims({0,(kernel-1)/2}));
     return reshape(output(layer,p+"qkv"),dims({1,3*channels,-1}));
 }
-T Layers::deconv(T x,std::string const& p,int stride,int padding) {
+T Layers::deconv(T x,std::string const& p,int stride,int padding,float weight_scale) {
     auto& k=weight(p+".weight");int channels=static_cast<int>(k.dims[1]);
     IDeconvolutionLayer* l=nullptr;
-    if(o.quantize_weights) {
+    if(o.quantize_weights && weight_scale==1.0f) {
         auto kernel_tensor=quantized_parameter(p+".weight",dims({k.dims[0],k.dims[1],1,k.dims[2]}),1);
         l=n.addDeconvolutionNd(*reshape(x,dims({1,k.dims[0],1,-1})),channels,dims({1,k.dims[2]}),Weights{real_type(),nullptr,0},w(p+".bias"));
         require(l,"deconv "+p); l->setInput(1,*kernel_tensor);
     } else {
-        l=n.addDeconvolutionNd(*reshape(x,dims({1,k.dims[0],1,-1})),channels,dims({1,k.dims[2]}),w(p+".weight"),w(p+".bias"));
+        // See conv(): residual-scale folding never scales the bias term.
+        l=n.addDeconvolutionNd(*reshape(x,dims({1,k.dims[0],1,-1})),channels,dims({1,k.dims[2]}),w_scaled(p+".weight",weight_scale),w(p+".bias"));
         require(l,"deconv "+p);
     }
     l->setStrideNd(dims({1,stride}));l->setPaddingNd(dims({0,padding}));return reshape(output(l,p),dims({1,channels,-1}));
+}
+T Layers::polyphase_deconv(T x,std::string const& p,int stride,int padding,float weight_scale) {
+    auto& k=weight(p+".weight");
+    auto& b=weight(p+".bias");
+    require(!o.quantize_weights,"polyphase upsample does not support weight-only INT8");
+    require(k.rank==3 && b.rank==1,"polyphase deconv rank "+p);
+    require(stride>0 && k.dims[2]>0,
+            "polyphase kernel/stride must be positive: "+p);
+    require(padding==(k.dims[2]-stride)/2,
+            "polyphase padding is not symmetric: "+p);
+    int input_channels=static_cast<int>(k.dims[0]);
+    int output_channels=static_cast<int>(k.dims[1]);
+    int kernel=static_cast<int>(k.dims[2]);
+    require(b.count==output_channels,"polyphase bias shape "+p);
+
+    // Split every phase when padding is non-zero.  Even divisible kernels
+    // (K=4/stride=2) have wrapped phases, so one symmetric Conv1d cannot
+    // represent all phase boundaries with one symmetric padding value.  The
+    // phase path below uses asymmetric pre/post padding to keep exactly one
+    // output sample per input sample for every phase.
+    std::vector<T> phases;
+    phases.reserve(static_cast<size_t>(stride));
+    for(int phase=0;phase<stride;++phase) {
+        int first=(phase+padding)%stride;
+        int phase_taps=(kernel-first+stride-1)/stride;
+        require(phase_taps>0,"polyphase phase has no taps");
+        // A wrapped phase corresponds to q=n+t-1 rather than q=n+t.
+        // Asymmetric pre/post padding expresses that shift while keeping
+        // exactly one output sample per input sample.
+        bool wrapped=first<padding;
+        require(!wrapped || phase_taps>=2,
+                "wrapped polyphase phase needs at least two taps");
+        std::vector<float> phase_weights(static_cast<size_t>(output_channels)*input_channels*phase_taps,0.0f);
+        for(int co=0;co<output_channels;++co)
+            for(int ci=0;ci<input_channels;++ci)
+                for(int t=0;t<phase_taps;++t) {
+                    int source_kernel=first+stride*t;
+                    int conv_t=phase_taps-1-t;
+                    size_t dst=((static_cast<size_t>(co)*input_channels+ci)*phase_taps)+conv_t;
+                    size_t src=(static_cast<size_t>(ci)*output_channels+co)*kernel+source_kernel;
+                    phase_weights[dst]=k.data[src]*weight_scale;
+                }
+        std::vector<float> phase_bias(static_cast<size_t>(output_channels));
+        std::copy(b.data,b.data+b.count,phase_bias.data());
+        Weights phase_kernel;
+        Weights phase_bias_weights;
+        if(real_type()==DataType::kFLOAT) {
+            floats.push_back(std::move(phase_weights));
+            floats.push_back(std::move(phase_bias));
+            phase_kernel={DataType::kFLOAT,floats[floats.size()-2].data(),
+                          static_cast<int64_t>(floats[floats.size()-2].size())};
+            phase_bias_weights={DataType::kFLOAT,floats.back().data(),
+                                static_cast<int64_t>(floats.back().size())};
+        } else {
+            low_constants.emplace_back(phase_weights.size());
+            auto& low_kernel=low_constants.back();
+            for(size_t i=0;i<phase_weights.size();++i)
+                low_kernel[i]=o.precision==1?float_to_half_bits(phase_weights[i]):float_to_bf16_bits(phase_weights[i]);
+            low_constants.emplace_back(phase_bias.size());
+            auto& low_bias=low_constants.back();
+            for(size_t i=0;i<phase_bias.size();++i)
+                low_bias[i]=o.precision==1?float_to_half_bits(phase_bias[i]):float_to_bf16_bits(phase_bias[i]);
+            phase_kernel={real_type(),low_kernel.data(),static_cast<int64_t>(low_kernel.size())};
+            phase_bias_weights={real_type(),low_bias.data(),static_cast<int64_t>(low_bias.size())};
+        }
+        auto* layer=n.addConvolutionNd(*reshape(x,dims({1,input_channels,1,-1})),
+                                       output_channels,dims({1,phase_taps}),phase_kernel,phase_bias_weights);
+        require(layer,"polyphase phase convolution "+p);
+        // Non-wrapped phases need x[q-t].  Wrapped phases need x[q+1-t].
+        // Asymmetric padding expresses that shift while retaining length L.
+        layer->setPrePadding(dims({0,wrapped?phase_taps-2:phase_taps-1}));
+        layer->setPostPadding(dims({0,wrapped?1:0}));
+        T phase_output=reshape(output(layer,p+".phase_"+std::to_string(phase)),dims({1,output_channels,-1}));
+        phases.push_back(phase_output);
+    }
+    auto packed=concat(phases,1);
+    auto packed_shape=reshape(packed,dims({1,stride,output_channels,-1}));
+    return reshape(transpose(packed_shape,{0,2,3,1}),dims({1,output_channels,-1}));
 }
 T Layers::norm(T x,std::string const& p) {
     auto mean=output(n.addReduce(*x,ReduceOperation::kAVG,1U<<1,true));auto centered=sub(x,mean);

@@ -88,6 +88,16 @@ struct Options {
     int32_t synth_resblock_precision;
     // Bit mask selecting low-precision residual stages; bit 0 is stage 0.
     int32_t synth_resblock_stage_mask;
+    // Optional per-operation residual precision. A zero mask inherits the
+    // stage-wide precision fields above.
+    int32_t synth_resblock_conv1_precision;
+    int32_t synth_resblock_conv1_stage_mask;
+    int32_t synth_resblock_conv2_precision;
+    int32_t synth_resblock_conv2_stage_mask;
+    // Fold residual average into the following decoder weights.
+    int32_t synth_fuse_resblock_scale;
+    // Replace ConvTranspose1d with polyphase Conv1d + shuffle.
+    int32_t synth_polyphase_upsample;
     // RMVPE mixed-precision regions. Public I/O remains FP32. STFT, GRU, and
     // logits are fixed to FP32 by the native graph; their fields document the
     // ABI contract and are reserved for future experiments.

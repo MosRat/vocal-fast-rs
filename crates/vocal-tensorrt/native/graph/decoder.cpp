@@ -48,8 +48,19 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             harmonic=source(pitchf,noise);
         }
     }
+    auto precision_type=[&](int code)->DataType {
+        return code==1?DataType::kHALF:code==2?DataType::kBF16:DataType::kFLOAT;
+    };
+    bool fuse_residual_scale=o.synth_fuse_resblock_scale!=0;
+    float residual_scale=1.0f/static_cast<float>(c.resblock_count);
     for(int i=0;i<c.upsample_count;i++) {
-        x=deconv(act(x,ActivationType::kLEAKY_RELU,0.1f),"dec.ups."+std::to_string(i),c.rates[i],(c.kernels[i]-c.rates[i])/2);
+        float input_scale=fuse_residual_scale && i>0?residual_scale:1.0f;
+        auto up_prefix="dec.ups."+std::to_string(i);
+        auto up_input=act(x,ActivationType::kLEAKY_RELU,0.1f);
+        if(o.synth_polyphase_upsample)
+            x=polyphase_deconv(up_input,up_prefix,c.rates[i],(c.kernels[i]-c.rates[i])/2,input_scale);
+        else
+            x=deconv(up_input,up_prefix,c.rates[i],(c.kernels[i]-c.rates[i])/2,input_scale);
         if(o.debug_outputs)mark(x,("decoder_up_"+std::to_string(i)).c_str());
         if(harmonic) {
             int tail=1;for(int j=i+1;j<c.upsample_count;j++)tail*=c.rates[j];
@@ -70,6 +81,7 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         // source phase is the most sensitive NSF path.
         bool residual_low=decoder_type!=DataType::kFLOAT && o.synth_resblock_precision!=0 &&
             ((o.synth_resblock_stage_mask >> i) & 1) != 0;
+        DataType accum_type=residual_low?decoder_type:DataType::kFLOAT;
         if(!residual_low) {
             if(decoder_type!=DataType::kFLOAT) {
                 active_type=DataType::kFLOAT;
@@ -78,20 +90,44 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         } else {
             active_type=decoder_type;
         }
+        auto operation_type=[&](int precision,int mask)->DataType {
+            if(decoder_type==DataType::kFLOAT) return DataType::kFLOAT;
+            if(precision!=0 && ((mask>>i)&1)!=0) return precision_type(precision);
+            return accum_type;
+        };
+        DataType conv1_type=operation_type(o.synth_resblock_conv1_precision,
+                                           o.synth_resblock_conv1_stage_mask);
+        DataType conv2_type=operation_type(o.synth_resblock_conv2_precision,
+                                           o.synth_resblock_conv2_stage_mask);
         T sum=nullptr;
         for(int j=0;j<c.resblock_count;j++) {
             auto p="dec.resblocks."+std::to_string(i*c.resblock_count+j);auto y=x;
             int count=c.resblock_type==1?3:2;
             for(int k=0;k<count;k++) {
-                auto a=act(y,ActivationType::kLEAKY_RELU,0.1f);auto suffix=std::to_string(k);
+                auto suffix=std::to_string(k);
                 int const dilation_index=j*(c.resblock_type==1?3:2)+k;
+                auto a=y;
+                if(a->getType()!=conv1_type) a=cast(a,conv1_type);
+                active_type=conv1_type;
+                a=act(a,ActivationType::kLEAKY_RELU,0.1f);
                 a=conv(a,p+(c.resblock_type==1?".convs1.":".convs.")+suffix,1,c.res_dilations[dilation_index]);
-                if(c.resblock_type==1) a=conv(act(a,ActivationType::kLEAKY_RELU,0.1f),p+".convs2."+suffix);
+                if(c.resblock_type==1) {
+                    if(a->getType()!=conv2_type) a=cast(a,conv2_type);
+                    active_type=conv2_type;
+                    a=conv(act(a,ActivationType::kLEAKY_RELU,0.1f),p+".convs2."+suffix);
+                }
+                if(a->getType()!=accum_type) a=cast(a,accum_type);
+                active_type=accum_type;
                 y=add(y,a);
             }
             sum=sum?add(sum,y):y;
         }
-        x=scale(sum,1.0f/c.resblock_count);
+        if(fuse_residual_scale) {
+            x=sum;
+        } else {
+            active_type=accum_type;
+            x=scale(sum,residual_scale);
+        }
         if(!residual_low && decoder_type!=DataType::kFLOAT) {
             active_type=decoder_type;
             x=cast(x,decoder_type);
@@ -105,10 +141,12 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     T pre=nullptr;
     if(decoder_type!=DataType::kFLOAT) {
         active_type=DataType::kFLOAT;
-        pre=conv(cast(post_input,DataType::kFLOAT),"dec.conv_post",1,1,-1,false);
+        pre=conv(cast(post_input,DataType::kFLOAT),"dec.conv_post",1,1,-1,false,
+                 fuse_residual_scale?residual_scale:1.0f);
         active_type=decoder_type;
     } else {
-        pre=conv(post_input,"dec.conv_post",1,1,-1,false);
+        pre=conv(post_input,"dec.conv_post",1,1,-1,false,
+                 fuse_residual_scale?residual_scale:1.0f);
     }
     if(o.debug_outputs)mark(pre,"audio_pre_tanh");
     if(decoder_type!=DataType::kFLOAT) {

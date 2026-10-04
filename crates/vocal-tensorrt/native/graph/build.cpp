@@ -1,19 +1,62 @@
 #include "layers.h"
+#include <cstdio>
+#include <fstream>
 namespace vocal {
 extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t count,Options const* options,Build** out,char** error) noexcept {
     return guarded(error,[&]{
         require(c&&weights&&options&&out&&c->abi_version==2,"invalid RVC build ABI");
         require(options->min_frames>0&&options->min_frames<=options->opt_frames&&options->opt_frames<=options->max_frames,"invalid frame profile");
         require(options->synth_resblock_stage_mask>=0,"invalid Synth residual stage mask");
+        require(options->synth_resblock_conv1_precision>=0 && options->synth_resblock_conv1_precision<=2,
+                "invalid Synth conv1 precision");
+        require(options->synth_resblock_conv2_precision>=0 && options->synth_resblock_conv2_precision<=2,
+                "invalid Synth conv2 precision");
+        require(options->synth_resblock_conv1_stage_mask>=0 && options->synth_resblock_conv2_stage_mask>=0,
+                "invalid Synth residual operation mask");
         uint32_t valid_stage_mask=c->upsample_count>=31?0xffffffffu:((1u<<c->upsample_count)-1u);
         require((static_cast<uint32_t>(options->synth_resblock_stage_mask)&~valid_stage_mask)==0,
                 "Synth residual stage mask exceeds upsample stages");
+        require((static_cast<uint32_t>(options->synth_resblock_conv1_stage_mask)&~valid_stage_mask)==0 &&
+                    (static_cast<uint32_t>(options->synth_resblock_conv2_stage_mask)&~valid_stage_mask)==0,
+                "Synth residual operation mask exceeds upsample stages");
+        if(options->synth_polyphase_upsample) {
+            for(int i=0;i<c->upsample_count;++i) {
+                require(c->rates[i]>0 && c->kernels[i]>=c->rates[i] &&
+                            (c->kernels[i]-c->rates[i])%2==0,
+                        "Synth polyphase upsample requires symmetric output-length kernels");
+            }
+            require(options->quantize_weights==0,
+                    "Synth polyphase upsample does not support weight-only INT8");
+        }
         auto b=std::unique_ptr<IBuilder>(createInferBuilder(logger()));require(bool(b),"createInferBuilder");
         auto n=std::unique_ptr<INetworkDefinition>(b->createNetworkV2(0));require(bool(n),"createNetwork");
         auto bc=std::unique_ptr<IBuilderConfig>(b->createBuilderConfig());require(bool(bc),"builder config");
         bc->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE,options->workspace);
         bc->clearFlag(BuilderFlag::kTF32); // keep the baseline deterministic
         bc->setProfilingVerbosity(ProfilingVerbosity::kDETAILED);
+        // TensorRT-RTX 1.6 exposes the standard timing-cache ABI but marks it
+        // deprecated/no-op. Keep the file contract anyway: on SDKs that
+        // implement it this persists fixed-profile tactics, while RTX 1.6
+        // safely reports an empty cache and continues with normal selection.
+        std::unique_ptr<ITimingCache> timing_cache;
+        std::string timing_cache_path;
+        if(auto const* path=std::getenv("VOCAL_TRT_TIMING_CACHE");path && path[0]!='\0') {
+            timing_cache_path=path;
+            std::vector<unsigned char> blob;
+            std::ifstream input(timing_cache_path,std::ios::binary);
+            if(input) {
+                input.seekg(0,std::ios::end);
+                auto size=input.tellg();
+                require(size>=0,"timing cache seek failed");
+                blob.resize(static_cast<size_t>(size));
+                input.seekg(0,std::ios::beg);
+                if(!blob.empty()) input.read(reinterpret_cast<char*>(blob.data()),static_cast<std::streamsize>(blob.size()));
+                require(input.good() || input.eof(),"timing cache read failed");
+            }
+            timing_cache.reset(bc->createTimingCache(blob.empty()?nullptr:blob.data(),blob.size()));
+            require(bool(timing_cache),"create timing cache failed");
+            require(bc->setTimingCache(*timing_cache,true),"attach timing cache failed");
+        }
         // Synth precision is represented explicitly in the native graph by
         // Layers::real_type(). The public bindings remain FP32 and are cast at
         // the graph boundary, so no Rust buffer ABI changes are required.
@@ -62,6 +105,22 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         auto result=new Build();
         result->mem=b->buildSerializedNetwork(*n,*bc);
         require(result->mem,"buildSerializedNetwork RVC failed");
+        if(timing_cache) {
+            std::unique_ptr<IHostMemory> serialized(timing_cache->serialize());
+            if(serialized && serialized->size()>0 && !timing_cache_path.empty()) {
+                std::string temporary=timing_cache_path+".tmp";
+                std::ofstream output(temporary,std::ios::binary|std::ios::trunc);
+                require(bool(output),"open timing cache output failed");
+                output.write(static_cast<char const*>(serialized->data()),static_cast<std::streamsize>(serialized->size()));
+                require(output.good(),"write timing cache failed");
+                output.close();
+                std::remove(timing_cache_path.c_str());
+                require(std::rename(temporary.c_str(),timing_cache_path.c_str())==0,"replace timing cache failed");
+                std::fprintf(stderr,"[RVC] timing cache updated path=%s bytes=%zu\n",timing_cache_path.c_str(),serialized->size());
+            } else if(!timing_cache_path.empty()) {
+                std::fprintf(stderr,"[RVC] timing cache API returned no serialized data path=%s\n",timing_cache_path.c_str());
+            }
+        }
         *out=result;
     });
 }

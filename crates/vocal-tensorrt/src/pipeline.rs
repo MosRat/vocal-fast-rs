@@ -372,6 +372,18 @@ pub struct RvcTrtPipelineArtifacts {
     #[serde(default)]
     pub synth_resblock_stage_mask: u32,
     #[serde(default)]
+    pub synth_resblock_conv1_precision: PrecisionMode,
+    #[serde(default)]
+    pub synth_resblock_conv1_stage_mask: u32,
+    #[serde(default)]
+    pub synth_resblock_conv2_precision: PrecisionMode,
+    #[serde(default)]
+    pub synth_resblock_conv2_stage_mask: u32,
+    #[serde(default)]
+    pub synth_fuse_resblock_scale: bool,
+    #[serde(default)]
+    pub synth_polyphase_upsample: bool,
+    #[serde(default)]
     pub dispatch_tune: DispatchTune,
     /// Whether the Synth graph was built with experimental static INT8
     /// weight Q/DQ nodes. This is recorded for reproducible benchmarking;
@@ -459,6 +471,12 @@ impl RvcTrtPipelineArtifacts {
         let synth_precision = builder_options.synth_precision;
         let synth_resblock_precision = builder_options.synth_resblock_precision;
         let synth_resblock_stage_mask = builder_options.synth_resblock_stage_mask;
+        let synth_resblock_conv1_precision = builder_options.synth_resblock_conv1_precision;
+        let synth_resblock_conv1_stage_mask = builder_options.synth_resblock_conv1_stage_mask;
+        let synth_resblock_conv2_precision = builder_options.synth_resblock_conv2_precision;
+        let synth_resblock_conv2_stage_mask = builder_options.synth_resblock_conv2_stage_mask;
+        let synth_fuse_resblock_scale = builder_options.synth_fuse_resblock_scale;
+        let synth_polyphase_upsample = builder_options.synth_polyphase_upsample;
         let dispatch_tune = if builder_options.dispatch_tune == DispatchTune::Auto {
             if profile.min_samples == 11_200 && profile.max_samples == 11_200 {
                 DispatchTune::Realtime11200
@@ -555,6 +573,12 @@ impl RvcTrtPipelineArtifacts {
             synth_precision,
             synth_resblock_precision,
             synth_resblock_stage_mask,
+            synth_resblock_conv1_precision,
+            synth_resblock_conv1_stage_mask,
+            synth_resblock_conv2_precision,
+            synth_resblock_conv2_stage_mask,
+            synth_fuse_resblock_scale,
+            synth_polyphase_upsample,
             dispatch_tune,
             weight_int8,
             fused_qkv,

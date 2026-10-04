@@ -185,6 +185,30 @@ pub struct NativeBuildOptions {
     /// FP32 Synth graph.
     #[serde(default)]
     pub synth_resblock_stage_mask: u32,
+    /// Optional per-operation precision override for residual `convs1`.
+    /// A zero stage mask inherits `synth_resblock_precision` and
+    /// `synth_resblock_stage_mask`, preserving the original behavior.
+    #[serde(default)]
+    pub synth_resblock_conv1_precision: PrecisionMode,
+    #[serde(default)]
+    pub synth_resblock_conv1_stage_mask: u32,
+    /// Optional per-operation precision override for residual `convs2`.
+    #[serde(default)]
+    pub synth_resblock_conv2_precision: PrecisionMode,
+    #[serde(default)]
+    pub synth_resblock_conv2_stage_mask: u32,
+    /// Fold the residual-block average into the following decoder weights.
+    /// This removes four elementwise scale kernels while keeping the same
+    /// FP32 operation order. It is opt-in because low-precision constants are
+    /// rounded at build time.
+    #[serde(default)]
+    pub synth_fuse_resblock_scale: bool,
+    /// Replace ConvTranspose1d with an equivalent phase-split Conv1d + shuffle
+    /// graph. Phase-dependent asymmetric padding handles both divisible and
+    /// non-divisible RVC kernel/stride pairs; unsupported output-length
+    /// contracts are rejected at build time.
+    #[serde(default)]
+    pub synth_polyphase_upsample: bool,
     #[serde(default)]
     pub dispatch_tune: DispatchTune,
 }
@@ -294,6 +318,26 @@ impl Default for NativeBuildOptions {
                     }
                 })
                 .unwrap_or(0),
+            synth_resblock_conv1_precision: PrecisionMode::from_env_or(
+                "VOCAL_TRT_SYNTH_RESBLOCK_CONV1_PRECISION",
+                PrecisionMode::Fp32,
+            ),
+            synth_resblock_conv1_stage_mask: stage_mask_from_env(
+                "VOCAL_TRT_SYNTH_RESBLOCK_CONV1_STAGE_MASK",
+            ),
+            synth_resblock_conv2_precision: PrecisionMode::from_env_or(
+                "VOCAL_TRT_SYNTH_RESBLOCK_CONV2_PRECISION",
+                PrecisionMode::Fp32,
+            ),
+            synth_resblock_conv2_stage_mask: stage_mask_from_env(
+                "VOCAL_TRT_SYNTH_RESBLOCK_CONV2_STAGE_MASK",
+            ),
+            synth_fuse_resblock_scale: env::var("VOCAL_TRT_SYNTH_FUSE_RESBLOCK_SCALE")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            synth_polyphase_upsample: env::var("VOCAL_TRT_SYNTH_UPSAMPLE_IMPL")
+                .ok()
+                .is_some_and(|v| v.eq_ignore_ascii_case("polyphase")),
             dispatch_tune: DispatchTune::from_env(),
         }
     }
@@ -305,6 +349,23 @@ fn env_i32(name: &str, fallback: i32) -> i32 {
         .and_then(|value| value.parse::<i32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(fallback)
+}
+
+fn stage_mask_from_env(name: &str) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| {
+            let value = value.trim();
+            if let Some(hex) = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+            {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                value.parse::<u32>().ok()
+            }
+        })
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

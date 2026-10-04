@@ -26,6 +26,7 @@ struct Layers {
     T output(ILayer* layer, std::string const& name="");
     Weight const& weight(std::string const& name);
     Weights w(std::string const& name);
+    Weights w_scaled(std::string const& name, float scale);
     DataType real_type() const;
     T cast_real(T x);
     void use_low_precision();
@@ -57,9 +58,10 @@ struct Layers {
     T slice(T x,int axis,int start,int count,int stride=1);
     T range(T length,int maximum);
     T matmul(T a,T b,bool transpose_b=false);
-    T conv(T x,std::string const& prefix,int stride=1,int dilation=1,int padding=-1,bool bias=true);
+    T conv(T x,std::string const& prefix,int stride=1,int dilation=1,int padding=-1,bool bias=true,float weight_scale=1.0f);
     T fused_qkv_conv(T x,std::string const& prefix,int channels);
-    T deconv(T x,std::string const& prefix,int stride,int padding);
+    T deconv(T x,std::string const& prefix,int stride,int padding,float weight_scale=1.0f);
+    T polyphase_deconv(T x,std::string const& prefix,int stride,int padding,float weight_scale=1.0f);
     T norm(T x,std::string const& prefix);
     T select(T condition,T yes,T no) { return output(n.addSelect(*condition,*yes,*no)); }
     T resize(T x,int factor);

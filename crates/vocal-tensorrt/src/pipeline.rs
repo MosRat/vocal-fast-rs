@@ -650,6 +650,10 @@ struct StageEvents {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RvcCudaGraphStats {
     pub enabled: bool,
+    /// Opt-in two-stream HuBERT/RMVPE execution. It is reported so benchmark
+    /// JSON cannot be mistaken for the serial graph path.
+    #[serde(default)]
+    pub parallel_acoustic: bool,
     /// TensorRT-RTX owns capture/replay through IRuntimeConfig. This is the
     /// preferred path on RTX 1.6 and does not increment the application-level
     /// capture/replay counters below.
@@ -682,6 +686,9 @@ pub struct RvcTrtPipeline {
     frontend: OwnedContext,
     synth: OwnedContext,
     stream: CudaStream,
+    acoustic_hubert_stream: CudaStream,
+    acoustic_rmvpe_stream: CudaStream,
+    parallel_acoustic: bool,
     rmvpe_external_stft: bool,
     cufft_frontends: Vec<(usize, CufftFrontend)>,
     stage_events: StageEvents,
@@ -799,6 +806,19 @@ impl RvcTrtPipeline {
         let frontend = OwnedContext::create_with_cuda_graphs(frontend_runtime, native_cuda_graphs)?;
         let synth = OwnedContext::create_with_cuda_graphs(synth_runtime, native_cuda_graphs)?;
         let stream = CudaStream::new()?;
+        let acoustic_hubert_stream = CudaStream::new()?;
+        let acoustic_rmvpe_stream = CudaStream::new()?;
+        // The external path remains requested until the first concrete shape
+        // and all tensor bindings have been installed.  The parallel path is
+        // deliberately restricted to TensorRT-RTX's native graph strategy;
+        // a host-side CUDA stream capture cannot contain the synchronization
+        // between the two acoustic streams.
+        let external_cuda_graphs = graph_requested && !native_cuda_graphs;
+        let parallel_acoustic = native_cuda_graphs
+            && !external_cuda_graphs
+            && std::env::var("VOCAL_TRT_PARALLEL_ACOUSTIC")
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+                .unwrap_or(false);
         let rmvpe_external_stft = artifacts.rmvpe_external_stft;
         let mut cufft_frontends = Vec::new();
         if rmvpe_external_stft {
@@ -809,14 +829,16 @@ impl RvcTrtPipeline {
                 p.max_samples as usize,
             ]);
             for samples in shapes {
-                cufft_frontends.push((samples, CufftFrontend::new(samples, &stream)?));
+                let cufft_stream = if parallel_acoustic {
+                    &acoustic_rmvpe_stream
+                } else {
+                    &stream
+                };
+                cufft_frontends.push((samples, CufftFrontend::new(samples, cufft_stream)?));
             }
         }
-        // The external path remains requested until the first concrete shape
-        // and all tensor bindings have been installed. `isStreamCapturable`
-        // is shape-sensitive on dynamic engines, so it is queried lazily in
-        // `process_inner` rather than at context creation.
-        let external_cuda_graphs = graph_requested && !native_cuda_graphs;
+        // `isStreamCapturable` is queried lazily in `process_inner` because
+        // dynamic TensorRT shapes are not concrete at context creation.
         let stage_events = StageEvents {
             hubert_start: CudaEvent::new()?,
             hubert_end: CudaEvent::new()?,
@@ -858,6 +880,9 @@ impl RvcTrtPipeline {
             frontend,
             synth,
             stream,
+            acoustic_hubert_stream,
+            acoustic_rmvpe_stream,
+            parallel_acoustic,
             rmvpe_external_stft,
             cufft_frontends,
             stage_events,
@@ -956,6 +981,7 @@ impl RvcTrtPipeline {
     pub fn cuda_graph_stats(&self) -> RvcCudaGraphStats {
         RvcCudaGraphStats {
             enabled: self.native_cuda_graphs || self.cuda_graphs,
+            parallel_acoustic: self.parallel_acoustic,
             native_strategy: self.native_cuda_graphs,
             external_strategy: self.cuda_graphs,
             native_captures: self.native_graph_captures,
@@ -1024,6 +1050,15 @@ impl RvcTrtPipeline {
         rmvpe_samples: usize,
         rmvpe_waveform: *const std::ffi::c_void,
     ) -> Result<(), NativeBuildError> {
+        if self.parallel_acoustic {
+            return self.enqueue_parallel_acoustic(
+                streaming_f0,
+                pitch_frames,
+                advance_frames,
+                rmvpe_samples,
+                rmvpe_waveform,
+            );
+        }
         let trace = std::env::var("VOCAL_TRT_TRACE").ok().as_deref() == Some("1");
         self.stage_events.hubert_start.record(&self.stream)?;
         if trace {
@@ -1113,6 +1148,121 @@ impl RvcTrtPipeline {
         if trace {
             eprintln!("trt trace: all enqueued");
         }
+        Ok(())
+    }
+
+    /// Run HuBERT and RMVPE on independent streams after the waveform upload
+    /// has completed.  Their outputs are consumed only after both streams are
+    /// synchronized, so frontend/Synth retain the same ordering and bindings
+    /// as the serial path.  This is opt-in because TensorRT-RTX tactic and GPU
+    /// clock behavior can make the overlap workload dependent.
+    fn enqueue_parallel_acoustic(
+        &mut self,
+        streaming_f0: bool,
+        pitch_frames: usize,
+        advance_frames: usize,
+        rmvpe_samples: usize,
+        rmvpe_waveform: *const std::ffi::c_void,
+    ) -> Result<(), NativeBuildError> {
+        let trace = std::env::var("VOCAL_TRT_TRACE").ok().as_deref() == Some("1");
+        // The waveform upload is queued on the owner stream.  A host-side
+        // synchronization is enough here: it occurs once per callback and
+        // avoids introducing a cross-stream event into the native graph path.
+        self.stream.synchronize()?;
+        self.stage_events
+            .hubert_start
+            .record(&self.acoustic_hubert_stream)?;
+        if trace {
+            eprintln!("trt trace: enqueue hubert parallel");
+        }
+        self.hubert
+            .enqueue_named(&self.acoustic_hubert_stream, Some("rvc.hubert"))?;
+        self.stage_events
+            .hubert_end
+            .record(&self.acoustic_hubert_stream)?;
+
+        self.stage_events
+            .rmvpe_start
+            .record(&self.acoustic_rmvpe_stream)?;
+        if self.rmvpe_external_stft {
+            let frontend = self
+                .cufft_frontends
+                .iter_mut()
+                .find(|(samples, _)| *samples == rmvpe_samples)
+                .map(|(_, frontend)| frontend)
+                .ok_or_else(|| {
+                    NativeBuildError::Argument(format!(
+                        "missing cuFFT frontend plan for {rmvpe_samples} samples"
+                    ))
+                })?;
+            frontend.enqueue(
+                rmvpe_waveform,
+                rmvpe_samples * std::mem::size_of::<f32>(),
+                &self.rmvpe_magnitude,
+                &self.acoustic_rmvpe_stream,
+            )?;
+        }
+        if trace {
+            eprintln!("trt trace: enqueue rmvpe parallel streaming={streaming_f0}");
+        }
+        if streaming_f0 {
+            self.rmvpe_realtime
+                .enqueue_named(&self.acoustic_rmvpe_stream, Some("rvc.rmvpe.realtime"))?;
+        } else {
+            self.rmvpe_full
+                .enqueue_named(&self.acoustic_rmvpe_stream, Some("rvc.rmvpe.full"))?;
+        }
+        if streaming_f0 {
+            let append_frames = pitch_frames
+                .saturating_sub(RVC_F0_LEFT_TRIM + RVC_F0_RIGHT_TRIM)
+                .min(RVC_F0_CACHE_FRAMES);
+            if append_frames == 0 || advance_frames >= RVC_F0_CACHE_FRAMES {
+                return Err(NativeBuildError::Argument(
+                    "RMVPE streaming output/cache geometry is invalid".into(),
+                ));
+            }
+            let retained = RVC_F0_CACHE_FRAMES - advance_frames;
+            self.pitch_cache_scratch.device_copy_from(
+                &self.pitch_cache,
+                0,
+                advance_frames * std::mem::size_of::<f32>(),
+                retained * std::mem::size_of::<f32>(),
+                &self.acoustic_rmvpe_stream,
+            )?;
+            self.pitch_cache_scratch.device_copy_from(
+                &self.pitchf_raw,
+                (RVC_F0_CACHE_FRAMES - append_frames) * std::mem::size_of::<f32>(),
+                RVC_F0_LEFT_TRIM * std::mem::size_of::<f32>(),
+                append_frames * std::mem::size_of::<f32>(),
+                &self.acoustic_rmvpe_stream,
+            )?;
+            self.pitch_cache.device_copy_from(
+                &self.pitch_cache_scratch,
+                0,
+                0,
+                RVC_F0_CACHE_FRAMES * std::mem::size_of::<f32>(),
+                &self.acoustic_rmvpe_stream,
+            )?;
+        }
+        self.stage_events
+            .rmvpe_end
+            .record(&self.acoustic_rmvpe_stream)?;
+        self.acoustic_hubert_stream.synchronize()?;
+        self.acoustic_rmvpe_stream.synchronize()?;
+
+        self.stage_events.frontend_start.record(&self.stream)?;
+        if trace {
+            eprintln!("trt trace: enqueue frontend after parallel acoustic");
+        }
+        self.frontend
+            .enqueue_named(&self.stream, Some("rvc.frontend"))?;
+        self.stage_events.frontend_end.record(&self.stream)?;
+        self.stage_events.synth_start.record(&self.stream)?;
+        if trace {
+            eprintln!("trt trace: enqueue synth after parallel acoustic");
+        }
+        self.synth.enqueue_named(&self.stream, Some("rvc.synth"))?;
+        self.stage_events.synth_end.record(&self.stream)?;
         Ok(())
     }
 

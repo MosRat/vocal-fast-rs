@@ -164,7 +164,14 @@ impl InferenceEngine for PipelineEngine {
         };
         output_block.resize(mono.len(), 0.0);
         let keep_from = self.history.len().saturating_sub(context);
-        self.history = self.history[keep_from..].to_vec();
+        // Keep the allocation owned by the streaming engine. Rebuilding a
+        // Vec from a slice here used to allocate and copy the retained
+        // context on every audio block, which showed up as periodic latency
+        // spikes for the CPU backend. `drain` shifts the small retained tail
+        // in place and reuses the existing capacity on the next block.
+        if keep_from > 0 {
+            self.history.drain(..keep_from);
+        }
         let mut samples = Vec::with_capacity(output_block.len() * channels);
         for sample in output_block {
             samples.extend(std::iter::repeat_n(sample, channels));

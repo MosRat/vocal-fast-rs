@@ -21,6 +21,27 @@ pub enum AudioError {
     Timeout,
 }
 
+impl AudioError {
+    /// Stable machine-readable identifier for control-plane adapters.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::QueueFull => "audio.queue_full",
+            Self::QueueEmpty => "audio.queue_empty",
+            Self::InvalidConfig(_) => "audio.invalid_config",
+            Self::BlockSizeMismatch { .. } => "audio.block_size_mismatch",
+            Self::PartialFrame => "audio.partial_frame",
+            Self::AllocationFailed(_) => "audio.allocation_failed",
+            Self::Timeout => "audio.timeout",
+        }
+    }
+
+    /// Queue pressure and scheduler timeouts can be retried without tearing
+    /// down the device. Configuration and memory errors require intervention.
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::QueueFull | Self::QueueEmpty | Self::Timeout)
+    }
+}
+
 /// Coarse class attached to a backend fault. The audio callback records only
 /// compact atomics; formatting and logging happen on the control plane.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -64,6 +85,17 @@ impl AudioFault {
             direction,
             message,
             occurrences: 1,
+        }
+    }
+
+    pub const fn code(&self) -> &'static str {
+        match self.kind {
+            AudioFaultKind::Unknown => "audio.backend_unknown",
+            AudioFaultKind::Startup => "audio.backend_startup",
+            AudioFaultKind::Capture => "audio.backend_capture",
+            AudioFaultKind::Render => "audio.backend_render",
+            AudioFaultKind::Worker => "audio.backend_worker",
+            AudioFaultKind::Shutdown => "audio.backend_shutdown",
         }
     }
 }

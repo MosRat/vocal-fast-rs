@@ -17,3 +17,20 @@ pub enum ModelError {
     #[error("invalid model loader configuration: {0}")]
     InvalidConfig(String),
 }
+
+impl ModelError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "model.io",
+            Self::Json(_) => "model.json",
+            Self::InvalidCache(_) => "model.invalid_cache",
+            Self::MissingFile(_) => "model.missing_file",
+            Self::UnsupportedModel(_) => "model.unsupported",
+            Self::InvalidConfig(_) => "model.invalid_config",
+        }
+    }
+
+    pub const fn is_recoverable(&self) -> bool {
+        matches!(self, Self::MissingFile(_) | Self::InvalidConfig(_))
+    }
+}

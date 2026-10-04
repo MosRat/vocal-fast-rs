@@ -118,8 +118,10 @@ native shared client cannot be opened.
 
 The optional `cpal-backend` adapter is a portable first integration. It requests
 f32 and a fixed callback size, then still uses the assembler/drainer because a
-driver may provide another size. On Windows this uses cpal's WASAPI host, but
-the adapter does not promise WASAPI exclusive mode. A native `wasapi` adapter
+driver may provide another size. It rejects devices whose default sample rate
+or channel count does not match the stream format, avoiding an implicit
+conversion path. On Windows this uses cpal's WASAPI host, but the adapter does
+not promise WASAPI exclusive mode. A native `wasapi` adapter
 can replace only the device layer while keeping `StreamIo` unchanged.
 The native adapter keeps one pre-allocated `f32` endpoint buffer per event
 thread and views it as bytes only at the WASAPI FFI boundary, so capture and

@@ -26,6 +26,16 @@ pub enum CpalError {
         input: cpal::SampleFormat,
         output: cpal::SampleFormat,
     },
+    #[error(
+        "cpal {direction} device format is {sample_rate} Hz/{channels} channels; expected {expected_sample_rate} Hz/{expected_channels} channels"
+    )]
+    DeviceFormatMismatch {
+        direction: &'static str,
+        sample_rate: u32,
+        channels: u16,
+        expected_sample_rate: u32,
+        expected_channels: u16,
+    },
     #[error("invalid cpal stream configuration: {0}")]
     InvalidConfig(#[from] AudioError),
     #[error("failed to build input stream: {0}")]
@@ -135,6 +145,30 @@ fn build_duplex_inner(
         return Err(CpalError::UnsupportedSampleFormat {
             input: input_default.sample_format(),
             output: output_default.sample_format(),
+        });
+    }
+    let expected_channels = config.format.channels;
+    let expected_sample_rate = config.format.sample_rate;
+    if input_default.channels() != expected_channels
+        || input_default.sample_rate() != expected_sample_rate
+    {
+        return Err(CpalError::DeviceFormatMismatch {
+            direction: "input",
+            sample_rate: input_default.sample_rate(),
+            channels: input_default.channels(),
+            expected_sample_rate,
+            expected_channels,
+        });
+    }
+    if output_default.channels() != expected_channels
+        || output_default.sample_rate() != expected_sample_rate
+    {
+        return Err(CpalError::DeviceFormatMismatch {
+            direction: "output",
+            sample_rate: output_default.sample_rate(),
+            channels: output_default.channels(),
+            expected_sample_rate,
+            expected_channels,
         });
     }
 

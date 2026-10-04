@@ -26,18 +26,18 @@ pub fn run() {
                 .join("config.json");
             let state = app.state::<AppState>();
             if let Err(error) = state.set_config_store(ConfigStore::new(PathBuf::from(path))) {
-                tracing::warn!(target: "vocal_gui", error = %error, "failed to load persisted GUI config");
+                tracing::warn!(target: "vocal.gui", error = %error, "failed to load persisted GUI config");
             }
             if let Ok(Some(model_path)) = state.persisted_model_path() {
                 if std::path::Path::new(&model_path).is_file() {
                     let state = state.inner().clone();
                     tauri::async_runtime::spawn_blocking(move || {
                         if let Err(error) = state.load_model(model_path) {
-                            tracing::warn!(target: "vocal_gui", error = %error, "failed to restore persisted model");
+                            tracing::warn!(target: "vocal.gui", error = %error, "failed to restore persisted model");
                         }
                     });
                 } else {
-                    tracing::warn!(target: "vocal_gui", path = %model_path, "persisted model path is unavailable");
+                    tracing::warn!(target: "vocal.gui", path = %model_path, "persisted model path is unavailable");
                 }
             }
             Ok(())

@@ -1,4 +1,4 @@
-pub const LOG_TARGET: &str = "vocal_engine";
+pub const LOG_TARGET: &str = "vocal.engine";
 
 pub(crate) fn created(backend: &'static str) {
     tracing::debug!(target: LOG_TARGET, backend, "engine created");

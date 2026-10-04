@@ -1,4 +1,4 @@
-pub const LOG_TARGET: &str = "vocal_cli";
+pub const LOG_TARGET: &str = "vocal.cli";
 
 pub fn init() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

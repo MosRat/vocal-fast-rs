@@ -1,4 +1,4 @@
-pub const LOG_TARGET: &str = "vocal_model";
+pub const LOG_TARGET: &str = "vocal.model";
 
 pub(crate) fn load_started(operation: &'static str) {
     tracing::debug!(target: LOG_TARGET, operation, "model load started");

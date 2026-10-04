@@ -11,7 +11,7 @@ use super::state::StreamStatus;
 
 pub(crate) fn state(component: &'static str, status: StreamStatus) {
     tracing::info!(
-        target: "vocal_audio",
+        target: "vocal.audio",
         component,
         lifecycle = ?status.lifecycle,
         transitions = status.transitions,
@@ -21,11 +21,11 @@ pub(crate) fn state(component: &'static str, status: StreamStatus) {
 }
 
 pub(crate) fn started(component: &'static str) {
-    tracing::info!(target: "vocal_audio", component, "audio backend started");
+    tracing::info!(target: "vocal.audio", component, "audio backend started");
 }
 
 pub(crate) fn stopped(component: &'static str) {
-    tracing::debug!(target: "vocal_audio", component, "audio backend stopped");
+    tracing::debug!(target: "vocal.audio", component, "audio backend stopped");
 }
 
 pub(crate) fn fault(
@@ -35,7 +35,7 @@ pub(crate) fn fault(
     message: &str,
 ) {
     tracing::error!(
-        target: "vocal_audio",
+        target: "vocal.audio",
         component,
         kind = ?kind,
         direction = ?direction,

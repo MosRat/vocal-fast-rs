@@ -3,7 +3,7 @@ use super::ring::{
     AudioConsumer, AudioIoStats, AudioProducer, AudioReadLease, AudioRing, AudioWriteLease,
 };
 use super::timing::AudioTimestamp;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The callback side and the worker side of a duplex stream.
 pub struct StreamIo {
@@ -77,6 +77,34 @@ impl DeviceIo {
 pub struct WorkerIo {
     pub input: AudioConsumer,
     pub output: AudioProducer,
+}
+
+/// Input policy for the standard worker scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerInputPolicy {
+    /// Preserve every block in FIFO order. This is appropriate when the model
+    /// must not skip source audio.
+    Fifo,
+    /// Drop all but the newest queued block before processing. This bounds
+    /// age after a transient model or scheduler stall.
+    Latest,
+}
+
+/// Blocking policy for one model step. The wait itself never runs on a device
+/// callback thread; callbacks only publish a generation and wake the worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerSchedule {
+    pub input_policy: WorkerInputPolicy,
+    pub timeout: Option<Duration>,
+}
+
+impl Default for WorkerSchedule {
+    fn default() -> Self {
+        Self {
+            input_policy: WorkerInputPolicy::Fifo,
+            timeout: None,
+        }
+    }
 }
 
 impl WorkerIo {
@@ -161,6 +189,37 @@ impl WorkerIo {
         let output = output.try_acquire()?;
         let input = input.try_acquire()?;
         Ok((input, output))
+    }
+
+    /// Wait for one input block and one output slot, run the model callback,
+    /// and publish the output with the input timestamp. This gives callers a
+    /// single standard scheduler primitive instead of accidentally composing
+    /// non-blocking `try_input`/`try_output` calls into a busy loop.
+    pub fn process_once(
+        &mut self,
+        schedule: WorkerSchedule,
+        process: impl FnOnce(&[f32], &mut [f32]) -> Result<(), AudioError>,
+    ) -> Result<(), AudioError> {
+        let deadline = schedule.timeout.map(|timeout| Instant::now() + timeout);
+        let remaining =
+            || deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if !self.output.wait_for_capacity(remaining()) {
+            return Err(AudioError::QueueFull);
+        }
+        // Match `try_input_output`: reserve output capacity first so a full
+        // render queue never consumes an input block that cannot be emitted.
+        if !self.input.wait_for_data(remaining()) {
+            return Err(AudioError::QueueEmpty);
+        }
+        if schedule.input_policy == WorkerInputPolicy::Latest {
+            self.input.discard_stale();
+        }
+        let (input, mut output) = self.try_input_output()?;
+        let timestamp = input.timestamp();
+        process(input.samples(), output.samples_mut())?;
+        output.set_timestamp(timestamp);
+        output.commit();
+        Ok(())
     }
 }
 
@@ -380,6 +439,13 @@ impl BlockDrainer {
 
     pub fn stats(&self) -> DrainStats {
         self.stats
+    }
+
+    /// Samples already staged locally and waiting to be copied to the next
+    /// device callback. This is separate from output ring depth in latency
+    /// profiles because it can hide an additional partial block.
+    pub fn pending_samples(&self) -> usize {
+        self.current.len().saturating_sub(self.offset)
     }
 
     /// Whether the next device block can be read directly from the ring.

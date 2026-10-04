@@ -18,7 +18,7 @@ use wasapi::{
     SampleType, StreamMode, WaveFormat, initialize_mta,
 };
 
-use crate::{AudioClock, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp};
+use crate::{AudioClock, AudioDirection, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp};
 use crate::{
     AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, StreamQueueConfig, WorkerIo,
 };
@@ -38,6 +38,12 @@ pub enum WasapiMode {
     /// the driver and must be supported by the endpoint.
     ExclusiveEvent,
 }
+
+// The legacy wrapper cannot expose its private WASAPI event handle for a
+// combined WaitForMultipleObjects call. Keep the fallback's shutdown bound
+// small; the native IAudioClient3 path uses a dedicated stop event and does
+// not poll.
+const LEGACY_WAIT_TIMEOUT_MS: u32 = 50;
 
 #[derive(Debug, Error)]
 pub enum WasapiBackendError {
@@ -482,13 +488,18 @@ fn record_callback_tick(
     latency: Option<&AudioLatencyStats>,
     last_callback: &mut Option<Instant>,
     expected: Duration,
+    direction: AudioDirection,
 ) {
     let Some(latency) = latency else {
         return;
     };
     let now = Instant::now();
     if let Some(previous) = last_callback.replace(now) {
-        latency.record_callback_period(now.saturating_duration_since(previous), expected);
+        latency.record_callback_period_for(
+            direction,
+            now.saturating_duration_since(previous),
+            expected,
+        );
     }
 }
 
@@ -525,14 +536,15 @@ fn capture_loop(
     };
     let bytes_per_frame = config.format.channels as usize * std::mem::size_of::<f32>();
     if let Some(latency) = latency.as_ref() {
-        latency.record_endpoint(
+        latency.record_endpoint_capacity_for(
+            AudioDirection::Capture,
             samples.len() / config.format.channels as usize,
             config.format.sample_rate,
         );
     }
     let mut last_callback = None;
     'capture_loop: while !stop.load(Ordering::Acquire) {
-        if let Err(error) = event.wait_for_event(1000) {
+        if let Err(error) = event.wait_for_event(LEGACY_WAIT_TIMEOUT_MS) {
             if !matches!(error, wasapi::WasapiError::EventTimeout) {
                 record_error(&errors, error.to_string());
                 break 'capture_loop;
@@ -543,6 +555,7 @@ fn capture_loop(
             latency.as_deref(),
             &mut last_callback,
             config.block_duration(),
+            AudioDirection::Capture,
         );
         loop {
             let packet_frames = match capture.get_next_packet_size() {
@@ -618,7 +631,8 @@ fn capture_loop(
                 Ok(Some((true, _, _))) => {
                     if let Some(latency) = latency.as_ref() {
                         let stats = input.stats();
-                        latency.record_queue_state(
+                        latency.record_queue_state_for(
+                            AudioDirection::Capture,
                             stats.queued_blocks,
                             stats.high_water_blocks,
                             stats.dropped_full,
@@ -638,7 +652,8 @@ fn capture_loop(
                     }
                     if let Some(latency) = latency.as_ref() {
                         let stats = input.stats();
-                        latency.record_queue_state(
+                        latency.record_queue_state_for(
+                            AudioDirection::Capture,
                             stats.queued_blocks,
                             stats.high_water_blocks,
                             stats.dropped_full,
@@ -678,7 +693,8 @@ fn capture_loop(
             }
             if let Some(latency) = latency.as_ref() {
                 let stats = input.stats();
-                latency.record_queue_state(
+                latency.record_queue_state_for(
+                    AudioDirection::Capture,
                     stats.queued_blocks,
                     stats.high_water_blocks,
                     stats.dropped_full,
@@ -724,7 +740,7 @@ fn render_loop(
     let channels = config.format.channels as usize;
     let mut last_callback = None;
     while !stop.load(Ordering::Acquire) {
-        if let Err(error) = event.wait_for_event(1000) {
+        if let Err(error) = event.wait_for_event(LEGACY_WAIT_TIMEOUT_MS) {
             if !matches!(error, wasapi::WasapiError::EventTimeout) {
                 record_error(&errors, error.to_string());
                 break;
@@ -735,6 +751,7 @@ fn render_loop(
             profile.stats.as_deref(),
             &mut last_callback,
             config.block_duration(),
+            AudioDirection::Render,
         );
         let frames = match client.get_available_space_in_frames() {
             Ok(frames) => frames as usize,
@@ -767,14 +784,19 @@ fn render_loop(
                     drainer.record_direct_block();
                     if let Some(latency) = profile.stats.as_ref() {
                         let stats = output.stats();
-                        latency.record_queue_state(
+                        latency.record_queue_state_for(
+                            AudioDirection::Render,
                             stats.queued_blocks,
                             stats.high_water_blocks,
                             stats.dropped_full,
                             stats.dropped_stale,
                         );
                         if let Ok(padding) = client.get_current_padding() {
-                            latency.record_endpoint(padding as usize, config.format.sample_rate);
+                            latency.record_endpoint_for(
+                                AudioDirection::Render,
+                                padding as usize,
+                                config.format.sample_rate,
+                            );
                         }
                         if let Some(clock) = profile.clock.as_ref()
                             && let Some(age) = timestamp
@@ -804,7 +826,8 @@ fn render_loop(
         if let Some(latency) = profile.stats.as_ref() {
             latency.record_underflow(report.underflow_samples);
             let stats = output.stats();
-            latency.record_queue_state(
+            latency.record_queue_state_for(
+                AudioDirection::Render,
                 stats.queued_blocks,
                 stats.high_water_blocks,
                 stats.dropped_full,
@@ -819,7 +842,11 @@ fn render_loop(
         }
         if let Some(latency) = profile.stats.as_ref() {
             if let Ok(padding) = client.get_current_padding() {
-                latency.record_endpoint(padding as usize, config.format.sample_rate);
+                latency.record_endpoint_for(
+                    AudioDirection::Render,
+                    padding as usize,
+                    config.format.sample_rate,
+                );
             }
             if let Some(clock) = profile.clock.as_ref() {
                 let age = report

@@ -17,8 +17,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOU
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, EDataFlow,
-    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioRenderClient, MMDeviceEnumerator,
-    eCapture, eConsole, eRender,
+    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioClock, IAudioRenderClient,
+    MMDeviceEnumerator, eCapture, eConsole, eRender,
 };
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
@@ -31,8 +31,8 @@ use windows::core::Interface;
 
 use crate::threading::MmcssGuard;
 use crate::{
-    AudioClock, AudioError, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp,
-    BlockAssembler, BlockDrainer, StreamConfig, StreamQueueConfig, WorkerIo,
+    AudioClock, AudioDirection, AudioError, AudioLatencySnapshot, AudioLatencyStats,
+    AudioTimestamp, BlockAssembler, BlockDrainer, StreamConfig, StreamQueueConfig, WorkerIo,
 };
 
 #[derive(Debug, Error)]
@@ -313,6 +313,7 @@ impl Drop for CoTaskMemFormat {
 struct CaptureSetup {
     client: IAudioClient,
     capture: IAudioCaptureClient,
+    clock: Option<IAudioClock>,
     event: EventHandle,
     endpoint_frames: usize,
     period_frames: usize,
@@ -321,6 +322,7 @@ struct CaptureSetup {
 struct RenderSetup {
     client: IAudioClient,
     render: IAudioRenderClient,
+    clock: Option<IAudioClock>,
     event: EventHandle,
     block_align: usize,
     endpoint_frames: usize,
@@ -330,7 +332,17 @@ struct RenderSetup {
 fn setup_client(
     config: StreamConfig,
     flow: EDataFlow,
-) -> Result<(IAudioClient, EventHandle, usize, usize, usize), String> {
+) -> Result<
+    (
+        IAudioClient,
+        Option<IAudioClock>,
+        EventHandle,
+        usize,
+        usize,
+        usize,
+    ),
+    String,
+> {
     let enumerator: windows::Win32::Media::Audio::IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|error| error.to_string())?;
@@ -386,6 +398,10 @@ fn setup_client(
             )
             .map_err(|error| error.to_string())?;
     }
+    // IAudioClock is present on normal WASAPI endpoints, but it is telemetry
+    // rather than a data-path dependency. Keep the stream usable with an
+    // unusual driver that does not expose the service.
+    let clock = unsafe { client.GetService::<IAudioClock>().ok() };
     let period = choose_period(config.block_frames, fundamental_period, min_period, max_period)
         .ok_or_else(|| {
             format!(
@@ -413,6 +429,7 @@ fn setup_client(
     let endpoint_frames = unsafe { client.GetBufferSize() }.map_err(|error| error.to_string())?;
     Ok((
         client,
+        clock,
         event,
         block_align,
         endpoint_frames as usize,
@@ -424,19 +441,73 @@ fn choose_period(target: usize, fundamental: u32, min: u32, max: u32) -> Option<
     if fundamental == 0 || min == 0 || max < min || max < fundamental {
         return None;
     }
-    let target = target.clamp(min as usize, max as usize) as u32;
-    let down = target / fundamental;
-    let up = target.div_ceil(fundamental);
-    let candidate = if down.saturating_mul(fundamental) >= min {
-        down.saturating_mul(fundamental)
-    } else {
-        up.saturating_mul(fundamental)
+    let target = target.clamp(min as usize, max as usize) as u64;
+    let fundamental = u64::from(fundamental);
+    let first = u64::from(min).div_ceil(fundamental);
+    let last = u64::from(max) / fundamental;
+    if first > last {
+        return None;
+    }
+
+    // IAUDIOCLIENT3 accepts only fundamental-period multiples. Prefer an
+    // exact model block, then a period that tiles the model block (or vice
+    // versa), and finally the candidate whose least common multiple reaches
+    // a block boundary in the fewest callbacks. This keeps the assembler and
+    // drainer on stable boundaries instead of merely picking the numerically
+    // closest period.
+    let mut best: Option<(u8, u64, u64)> = None;
+    let mut consider = |candidate: u64| {
+        if candidate < u64::from(min)
+            || candidate > u64::from(max)
+            || !candidate.is_multiple_of(fundamental)
+        {
+            return;
+        }
+        let alignment_class = if candidate == target {
+            0
+        } else if target.is_multiple_of(candidate) || candidate.is_multiple_of(target) {
+            1
+        } else {
+            2
+        };
+        let gcd = gcd_u64(target, candidate);
+        let callbacks_to_boundary = target / gcd;
+        let score = (alignment_class, callbacks_to_boundary, candidate);
+        if best.map_or(true, |current| score < current) {
+            best = Some(score);
+        }
     };
-    Some(candidate.clamp(min, max))
+
+    // Engine periods are normally in the tens or hundreds of frames. Keep
+    // malformed driver ranges bounded while still examining all legal values
+    // for normal devices.
+    let span = last.saturating_sub(first);
+    if span <= 16_384 {
+        for multiplier in first..=last {
+            consider(multiplier.saturating_mul(fundamental));
+        }
+    } else {
+        consider(first.saturating_mul(fundamental));
+        consider(last.saturating_mul(fundamental));
+        let nearest = target / fundamental;
+        for multiplier in nearest.saturating_sub(2)..=nearest.saturating_add(2) {
+            consider(multiplier.saturating_mul(fundamental));
+        }
+    }
+    best.map(|(_, _, candidate)| candidate as u32)
+}
+
+fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn setup_capture(config: StreamConfig) -> Result<CaptureSetup, String> {
-    let (client, event, _block_align, endpoint_frames, period_frames) =
+    let (client, clock, event, _block_align, endpoint_frames, period_frames) =
         setup_client(config, eCapture)?;
     let capture =
         unsafe { client.GetService::<IAudioCaptureClient>() }.map_err(|error| error.to_string())?;
@@ -444,6 +515,7 @@ fn setup_capture(config: StreamConfig) -> Result<CaptureSetup, String> {
     Ok(CaptureSetup {
         client,
         capture,
+        clock,
         event,
         endpoint_frames,
         period_frames,
@@ -451,7 +523,7 @@ fn setup_capture(config: StreamConfig) -> Result<CaptureSetup, String> {
 }
 
 fn setup_render(config: StreamConfig) -> Result<RenderSetup, String> {
-    let (client, event, block_align, endpoint_frames, period_frames) =
+    let (client, clock, event, block_align, endpoint_frames, period_frames) =
         setup_client(config, eRender)?;
     let render =
         unsafe { client.GetService::<IAudioRenderClient>() }.map_err(|error| error.to_string())?;
@@ -459,6 +531,7 @@ fn setup_render(config: StreamConfig) -> Result<RenderSetup, String> {
     Ok(RenderSetup {
         client,
         render,
+        clock,
         event,
         block_align,
         endpoint_frames,
@@ -488,6 +561,7 @@ fn run_capture(
     let CaptureSetup {
         client,
         capture,
+        clock: device_clock,
         event,
         endpoint_frames,
         period_frames,
@@ -501,7 +575,11 @@ fn run_capture(
         }
     };
     if let Some(latency) = latency.as_ref() {
-        latency.record_endpoint(endpoint_frames, config.format.sample_rate);
+        latency.record_endpoint_capacity_for(
+            AudioDirection::Capture,
+            endpoint_frames,
+            config.format.sample_rate,
+        );
     }
     let mut assembler = match BlockAssembler::new(config) {
         Ok(assembler) => assembler,
@@ -539,7 +617,27 @@ fn run_capture(
             record_error(&errors, "native WASAPI capture event wait failed".into());
             break;
         }
-        record_callback_tick(latency.as_deref(), &mut last_callback, expected_period);
+        record_callback_tick(
+            latency.as_deref(),
+            &mut last_callback,
+            expected_period,
+            AudioDirection::Capture,
+        );
+        sample_device_clock(
+            device_clock.as_ref(),
+            AudioDirection::Capture,
+            latency.as_deref(),
+            config.format.sample_rate,
+        );
+        if let Some(latency) = latency.as_ref()
+            && let Ok(padding) = unsafe { client.GetCurrentPadding() }
+        {
+            latency.record_endpoint_for(
+                AudioDirection::Capture,
+                padding as usize,
+                config.format.sample_rate,
+            );
+        }
         loop {
             let packet_frames = match unsafe { capture.GetNextPacketSize() } {
                 Ok(frames) => frames as usize,
@@ -615,7 +713,8 @@ fn run_capture(
                 }
                 if let Some(latency) = latency.as_ref() {
                     let stats = input.stats();
-                    latency.record_queue_state(
+                    latency.record_queue_state_for(
+                        AudioDirection::Capture,
                         stats.queued_blocks,
                         stats.high_water_blocks,
                         stats.dropped_full,
@@ -642,8 +741,15 @@ fn run_capture(
                 }
             }
             if let Some(latency) = latency.as_ref() {
+                latency.record_assembler_buffered(
+                    assembler
+                        .buffered_samples()
+                        .checked_div(config.format.channels as usize)
+                        .unwrap_or(0),
+                );
                 let stats = input.stats();
-                latency.record_queue_state(
+                latency.record_queue_state_for(
+                    AudioDirection::Capture,
                     stats.queued_blocks,
                     stats.high_water_blocks,
                     stats.dropped_full,
@@ -678,6 +784,7 @@ fn run_render(
     let RenderSetup {
         client,
         render,
+        clock: device_clock,
         event,
         block_align,
         endpoint_frames,
@@ -692,7 +799,11 @@ fn run_render(
         }
     };
     if let Some(latency) = latency.as_ref() {
-        latency.record_endpoint(endpoint_frames, config.format.sample_rate);
+        latency.record_endpoint_capacity_for(
+            AudioDirection::Render,
+            endpoint_frames,
+            config.format.sample_rate,
+        );
     }
     let mut drainer = match BlockDrainer::new(config) {
         Ok(drainer) => drainer,
@@ -730,7 +841,18 @@ fn run_render(
             record_error(&errors, "native WASAPI render event wait failed".into());
             break;
         }
-        record_callback_tick(latency.as_deref(), &mut last_callback, expected_period);
+        record_callback_tick(
+            latency.as_deref(),
+            &mut last_callback,
+            expected_period,
+            AudioDirection::Render,
+        );
+        sample_device_clock(
+            device_clock.as_ref(),
+            AudioDirection::Render,
+            latency.as_deref(),
+            config.format.sample_rate,
+        );
         let available = match unsafe { client.GetCurrentPadding() } {
             Ok(padding) => endpoint_frames.saturating_sub(padding as usize),
             Err(error) => {
@@ -780,14 +902,19 @@ fn run_render(
                 drainer.record_direct_block();
                 if let Some(latency) = latency.as_ref() {
                     let stats = output.stats();
-                    latency.record_queue_state(
+                    latency.record_queue_state_for(
+                        AudioDirection::Render,
                         stats.queued_blocks,
                         stats.high_water_blocks,
                         stats.dropped_full,
                         stats.dropped_stale,
                     );
                     if let Ok(padding) = unsafe { client.GetCurrentPadding() } {
-                        latency.record_endpoint(padding as usize, config.format.sample_rate);
+                        latency.record_endpoint_for(
+                            AudioDirection::Render,
+                            padding as usize,
+                            config.format.sample_rate,
+                        );
                     }
                     if let Some(clock) = clock.as_ref()
                         && let Some(age) = timestamp
@@ -808,6 +935,14 @@ fn run_render(
                 break;
             }
         };
+        if let Some(latency) = latency.as_ref() {
+            latency.record_drainer_pending(
+                drainer
+                    .pending_samples()
+                    .checked_div(config.format.channels as usize)
+                    .unwrap_or(0),
+            );
+        }
         let buffer = match unsafe { render.GetBuffer(frames as u32) } {
             Ok(buffer) => buffer,
             Err(error) => {
@@ -827,14 +962,19 @@ fn run_render(
         if let Some(latency) = latency.as_ref() {
             latency.record_underflow(report.underflow_samples);
             let stats = output.stats();
-            latency.record_queue_state(
+            latency.record_queue_state_for(
+                AudioDirection::Render,
                 stats.queued_blocks,
                 stats.high_water_blocks,
                 stats.dropped_full,
                 stats.dropped_stale,
             );
             if let Ok(padding) = unsafe { client.GetCurrentPadding() } {
-                latency.record_endpoint(padding as usize, config.format.sample_rate);
+                latency.record_endpoint_for(
+                    AudioDirection::Render,
+                    padding as usize,
+                    config.format.sample_rate,
+                );
             }
             if let Some(clock) = clock.as_ref()
                 && let Some(age) = report
@@ -849,6 +989,22 @@ fn run_render(
     }
     let _ = unsafe { client.Stop() };
     unsafe { CoUninitialize() };
+}
+
+fn sample_device_clock(
+    clock: Option<&IAudioClock>,
+    direction: AudioDirection,
+    latency: Option<&AudioLatencyStats>,
+    sample_rate: u32,
+) {
+    let (Some(clock), Some(latency)) = (clock, latency) else {
+        return;
+    };
+    let mut position = 0_u64;
+    let mut qpc = 0_u64;
+    if unsafe { clock.GetPosition(&mut position, Some(&mut qpc)) }.is_ok() {
+        latency.record_device_clock(direction, position, qpc, sample_rate);
+    }
 }
 
 fn packet_timestamp(
@@ -880,13 +1036,18 @@ fn record_callback_tick(
     latency: Option<&AudioLatencyStats>,
     last_callback: &mut Option<Instant>,
     expected: Duration,
+    direction: AudioDirection,
 ) {
     let Some(latency) = latency else {
         return;
     };
     let now = Instant::now();
     if let Some(previous) = last_callback.replace(now) {
-        latency.record_callback_period(now.saturating_duration_since(previous), expected);
+        latency.record_callback_period_for(
+            direction,
+            now.saturating_duration_since(previous),
+            expected,
+        );
     }
 }
 

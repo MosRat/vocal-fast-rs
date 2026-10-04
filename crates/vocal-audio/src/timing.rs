@@ -1,5 +1,32 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Which endpoint produced a profile sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioDirection {
+    Capture,
+    Render,
+}
+
+impl AudioDirection {
+    const fn index(self) -> usize {
+        match self {
+            Self::Capture => 0,
+            Self::Render => 1,
+        }
+    }
+}
+
+static PROFILE_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn profile_now_nanos() -> u64 {
+    PROFILE_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
 
 /// Monotonic timestamp used only when an adapter opts into latency profiling.
 /// Zero means that a slot is not timestamped, so the normal queue path keeps
@@ -122,15 +149,43 @@ pub struct AudioLatencyStats {
     stale_drops: AtomicU64,
     max_endpoint_frames: AtomicU64,
     max_endpoint_nanos: AtomicU64,
+    endpoint_samples: AtomicU64,
+    endpoint_buckets: [AtomicU64; 64],
     latency_buckets: [AtomicU64; 64],
     callback_periods: AtomicU64,
     callback_period_total_nanos: AtomicU64,
     callback_jitter_max_nanos: AtomicU64,
     callback_jitter_buckets: [AtomicU64; 64],
+    direction_callback_periods: [AtomicU64; 2],
+    direction_callback_total_nanos: [AtomicU64; 2],
+    direction_callback_jitter_max_nanos: [AtomicU64; 2],
+    direction_callback_jitter_buckets: [[AtomicU64; 64]; 2],
+    direction_max_queue_blocks: [AtomicU64; 2],
+    direction_queue_overflows: [AtomicU64; 2],
+    direction_stale_drops: [AtomicU64; 2],
+    direction_max_endpoint_frames: [AtomicU64; 2],
+    direction_max_endpoint_nanos: [AtomicU64; 2],
+    direction_endpoint_samples: [AtomicU64; 2],
+    direction_endpoint_buckets: [[AtomicU64; 64]; 2],
+    direction_max_assembler_frames: AtomicU64,
+    direction_max_drainer_frames: AtomicU64,
+    queue_last_nanos: [AtomicU64; 2],
+    queue_last_depth: [AtomicU64; 2],
+    direction_queue_slope_milli_per_sec: [AtomicI64; 2],
+    clock_samples: [AtomicU64; 2],
+    clock_position: [AtomicU64; 2],
+    clock_qpc: [AtomicU64; 2],
+    clock_anchor_position: [AtomicU64; 2],
+    clock_anchor_qpc: [AtomicU64; 2],
+    clock_drift_ppm: [AtomicI64; 2],
+    clock_drift_valid: [AtomicBool; 2],
 }
 
 impl Default for AudioLatencyStats {
     fn default() -> Self {
+        // Initialize the profiling epoch before callbacks are started so the
+        // first real-time queue sample never performs OnceLock initialization.
+        let _ = PROFILE_EPOCH.get_or_init(Instant::now);
         Self {
             samples: AtomicU64::new(0),
             total_nanos: AtomicU64::new(0),
@@ -145,13 +200,71 @@ impl Default for AudioLatencyStats {
             stale_drops: AtomicU64::new(0),
             max_endpoint_frames: AtomicU64::new(0),
             max_endpoint_nanos: AtomicU64::new(0),
+            endpoint_samples: AtomicU64::new(0),
+            endpoint_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             callback_periods: AtomicU64::new(0),
             callback_period_total_nanos: AtomicU64::new(0),
             callback_jitter_max_nanos: AtomicU64::new(0),
             callback_jitter_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_callback_periods: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_callback_total_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_callback_jitter_max_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_callback_jitter_buckets: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            direction_max_queue_blocks: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_queue_overflows: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_stale_drops: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_max_endpoint_frames: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_max_endpoint_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_endpoint_samples: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_endpoint_buckets: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            direction_max_assembler_frames: AtomicU64::new(0),
+            direction_max_drainer_frames: AtomicU64::new(0),
+            queue_last_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            queue_last_depth: std::array::from_fn(|_| AtomicU64::new(0)),
+            direction_queue_slope_milli_per_sec: std::array::from_fn(|_| AtomicI64::new(0)),
+            clock_samples: std::array::from_fn(|_| AtomicU64::new(0)),
+            clock_position: std::array::from_fn(|_| AtomicU64::new(0)),
+            clock_qpc: std::array::from_fn(|_| AtomicU64::new(0)),
+            clock_anchor_position: std::array::from_fn(|_| AtomicU64::new(0)),
+            clock_anchor_qpc: std::array::from_fn(|_| AtomicU64::new(0)),
+            clock_drift_ppm: std::array::from_fn(|_| AtomicI64::new(0)),
+            clock_drift_valid: std::array::from_fn(|_| AtomicBool::new(false)),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioLatencyDirectionSnapshot {
+    pub callback_periods: u64,
+    pub callback_period_mean: Option<Duration>,
+    pub callback_jitter_max: Option<Duration>,
+    pub callback_jitter_p50: Option<Duration>,
+    pub callback_jitter_p95: Option<Duration>,
+    pub callback_jitter_p99: Option<Duration>,
+    pub callback_jitter_p999: Option<Duration>,
+    pub max_queue_blocks: usize,
+    pub queue_overflows: u64,
+    pub stale_drops: u64,
+    /// Queue depth slope in milli-blocks/second; positive means growth.
+    pub queue_slope_milli_per_sec: i64,
+    pub max_endpoint_frames: usize,
+    pub max_endpoint_latency: Option<Duration>,
+    pub endpoint_p50: Option<Duration>,
+    pub endpoint_p95: Option<Duration>,
+    pub endpoint_p99: Option<Duration>,
+    pub endpoint_p999: Option<Duration>,
+    pub max_assembler_frames: usize,
+    pub max_drainer_frames: usize,
+    pub clock_samples: u64,
+    pub clock_position_frames: u64,
+    pub clock_qpc_100ns: u64,
+    /// Estimated endpoint clock error relative to QPC, in parts per million.
+    pub clock_drift_ppm: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -169,6 +282,10 @@ pub struct AudioLatencySnapshot {
     pub stale_drops: u64,
     pub max_endpoint_frames: usize,
     pub max_endpoint_latency: Option<Duration>,
+    pub endpoint_p50: Option<Duration>,
+    pub endpoint_p95: Option<Duration>,
+    pub endpoint_p99: Option<Duration>,
+    pub endpoint_p999: Option<Duration>,
     pub p50: Option<Duration>,
     pub p95: Option<Duration>,
     pub p99: Option<Duration>,
@@ -180,6 +297,8 @@ pub struct AudioLatencySnapshot {
     pub callback_jitter_p95: Option<Duration>,
     pub callback_jitter_p99: Option<Duration>,
     pub callback_jitter_p999: Option<Duration>,
+    pub capture: AudioLatencyDirectionSnapshot,
+    pub render: AudioLatencyDirectionSnapshot,
 }
 
 impl AudioLatencyStats {
@@ -238,6 +357,54 @@ impl AudioLatencyStats {
         update_max(&self.stale_drops, dropped_stale);
     }
 
+    /// Record queue telemetry for one endpoint while retaining the aggregate
+    /// counters used by the original profile API.
+    pub fn record_queue_state_for(
+        &self,
+        direction: AudioDirection,
+        queued_blocks: usize,
+        high_water_blocks: usize,
+        dropped_full: u64,
+        dropped_stale: u64,
+    ) {
+        self.record_queue_state(
+            queued_blocks,
+            high_water_blocks,
+            dropped_full,
+            dropped_stale,
+        );
+        let index = direction.index();
+        update_max(
+            &self.direction_max_queue_blocks[index],
+            queued_blocks.max(high_water_blocks).min(u64::MAX as usize) as u64,
+        );
+        update_max(&self.direction_queue_overflows[index], dropped_full);
+        update_max(&self.direction_stale_drops[index], dropped_stale);
+
+        let now = profile_now_nanos();
+        let previous_time = self.queue_last_nanos[index].swap(now, Ordering::Relaxed);
+        let previous_depth = self.queue_last_depth[index].swap(
+            queued_blocks.min(u64::MAX as usize) as u64,
+            Ordering::Relaxed,
+        );
+        if previous_time != 0 {
+            let elapsed = now.saturating_sub(previous_time);
+            // A short interval is dominated by callback jitter. A 50 ms
+            // minimum gives a useful trend while still reacting within a few
+            // audio periods.
+            if elapsed >= 50_000_000 {
+                let delta = queued_blocks as i128 - previous_depth as i128;
+                let slope = delta
+                    .saturating_mul(1_000_000_000_000_i128)
+                    .checked_div(elapsed as i128)
+                    .unwrap_or(0)
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                    as i64;
+                self.direction_queue_slope_milli_per_sec[index].store(slope, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn record_endpoint(&self, queued_frames: usize, sample_rate: u32) {
         update_max(
             &self.max_endpoint_frames,
@@ -249,6 +416,93 @@ impl AudioLatencyStats {
                 .min(u128::from(u64::MAX)) as u64;
             update_max(&self.max_endpoint_nanos, nanos);
         }
+        if sample_rate != 0 {
+            saturating_add(&self.endpoint_samples, 1);
+            self.endpoint_buckets[latency_bucket(
+                ((queued_frames as u128) * 1_000_000_000)
+                    .div_ceil(u128::from(sample_rate))
+                    .min(u128::from(u64::MAX)) as u64,
+            )]
+            .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record endpoint capacity without treating the static device buffer as
+    /// a runtime padding sample.
+    pub fn record_endpoint_capacity(&self, capacity_frames: usize, sample_rate: u32) {
+        update_max(
+            &self.max_endpoint_frames,
+            capacity_frames.min(u64::MAX as usize) as u64,
+        );
+        if sample_rate != 0 {
+            let nanos = ((capacity_frames as u128) * 1_000_000_000)
+                .div_ceil(u128::from(sample_rate))
+                .min(u128::from(u64::MAX)) as u64;
+            update_max(&self.max_endpoint_nanos, nanos);
+        }
+    }
+
+    pub fn record_endpoint_for(
+        &self,
+        direction: AudioDirection,
+        queued_frames: usize,
+        sample_rate: u32,
+    ) {
+        self.record_endpoint(queued_frames, sample_rate);
+        let index = direction.index();
+        update_max(
+            &self.direction_max_endpoint_frames[index],
+            queued_frames.min(u64::MAX as usize) as u64,
+        );
+        if sample_rate != 0 {
+            let nanos = ((queued_frames as u128) * 1_000_000_000)
+                .div_ceil(u128::from(sample_rate))
+                .min(u128::from(u64::MAX)) as u64;
+            update_max(&self.direction_max_endpoint_nanos[index], nanos);
+        }
+        if sample_rate != 0 {
+            saturating_add(&self.direction_endpoint_samples[index], 1);
+            self.direction_endpoint_buckets[index][latency_bucket(
+                ((queued_frames as u128) * 1_000_000_000)
+                    .div_ceil(u128::from(sample_rate))
+                    .min(u128::from(u64::MAX)) as u64,
+            )]
+            .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_endpoint_capacity_for(
+        &self,
+        direction: AudioDirection,
+        capacity_frames: usize,
+        sample_rate: u32,
+    ) {
+        self.record_endpoint_capacity(capacity_frames, sample_rate);
+        let index = direction.index();
+        update_max(
+            &self.direction_max_endpoint_frames[index],
+            capacity_frames.min(u64::MAX as usize) as u64,
+        );
+        if sample_rate != 0 {
+            let nanos = ((capacity_frames as u128) * 1_000_000_000)
+                .div_ceil(u128::from(sample_rate))
+                .min(u128::from(u64::MAX)) as u64;
+            update_max(&self.direction_max_endpoint_nanos[index], nanos);
+        }
+    }
+
+    pub fn record_assembler_buffered(&self, frames: usize) {
+        update_max(
+            &self.direction_max_assembler_frames,
+            frames.min(u64::MAX as usize) as u64,
+        );
+    }
+
+    pub fn record_drainer_pending(&self, frames: usize) {
+        update_max(
+            &self.direction_max_drainer_frames,
+            frames.min(u64::MAX as usize) as u64,
+        );
     }
 
     /// Record one event-to-event interval from a device callback thread.
@@ -256,6 +510,15 @@ impl AudioLatencyStats {
     /// histogram from capture-to-render age so scheduling jitter is not hidden
     /// by queue residency.
     pub fn record_callback_period(&self, actual: Duration, expected: Duration) {
+        self.record_callback_period_for(AudioDirection::Capture, actual, expected);
+    }
+
+    pub fn record_callback_period_for(
+        &self,
+        direction: AudioDirection,
+        actual: Duration,
+        expected: Duration,
+    ) {
         let actual_nanos = actual.as_nanos().min(u64::MAX as u128) as u64;
         let expected_nanos = expected.as_nanos().min(u64::MAX as u128) as u64;
         let jitter_nanos = actual_nanos.abs_diff(expected_nanos);
@@ -263,6 +526,66 @@ impl AudioLatencyStats {
         saturating_add(&self.callback_period_total_nanos, actual_nanos);
         update_max(&self.callback_jitter_max_nanos, jitter_nanos);
         self.callback_jitter_buckets[latency_bucket(jitter_nanos)].fetch_add(1, Ordering::Relaxed);
+        let index = direction.index();
+        saturating_add(&self.direction_callback_periods[index], 1);
+        saturating_add(&self.direction_callback_total_nanos[index], actual_nanos);
+        update_max(
+            &self.direction_callback_jitter_max_nanos[index],
+            jitter_nanos,
+        );
+        self.direction_callback_jitter_buckets[index][latency_bucket(jitter_nanos)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a device clock sample. `qpc_100ns` is the QPC value returned by
+    /// WASAPI in 100 ns units. The rate estimate is independent of callback
+    /// wakeups and exposes long-run capture/render drift.
+    pub fn record_device_clock(
+        &self,
+        direction: AudioDirection,
+        position_frames: u64,
+        qpc_100ns: u64,
+        sample_rate: u32,
+    ) {
+        if qpc_100ns == 0 || sample_rate == 0 {
+            return;
+        }
+        let index = direction.index();
+        self.clock_position[index].store(position_frames, Ordering::Relaxed);
+        self.clock_qpc[index].store(qpc_100ns, Ordering::Relaxed);
+        saturating_add(&self.clock_samples[index], 1);
+        let anchor_qpc = self.clock_anchor_qpc[index].load(Ordering::Relaxed);
+        if anchor_qpc == 0 {
+            self.clock_anchor_position[index].store(position_frames, Ordering::Relaxed);
+            self.clock_anchor_qpc[index].store(qpc_100ns, Ordering::Relaxed);
+            return;
+        }
+        let anchor_position = self.clock_anchor_position[index].load(Ordering::Relaxed);
+        // Estimate over at least one second. Per-period integer frame deltas
+        // are too quantized to be a useful ppm signal at a 10 ms period.
+        if qpc_100ns > anchor_qpc
+            && qpc_100ns - anchor_qpc >= 10_000_000
+            && position_frames >= anchor_position
+        {
+            let frames = u128::from(position_frames - anchor_position);
+            let elapsed_100ns = u128::from(qpc_100ns - anchor_qpc);
+            let expected_frames = elapsed_100ns
+                .saturating_mul(u128::from(sample_rate))
+                .checked_div(10_000_000)
+                .unwrap_or(0);
+            if expected_frames > 0 {
+                let ppm = (i128::try_from(frames).unwrap_or(i128::MAX)
+                    - i128::try_from(expected_frames).unwrap_or(i128::MAX))
+                .saturating_mul(1_000_000)
+                .checked_div(i128::try_from(expected_frames).unwrap_or(i128::MAX))
+                .unwrap_or(0)
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+                self.clock_drift_ppm[index].store(ppm, Ordering::Relaxed);
+                self.clock_drift_valid[index].store(true, Ordering::Relaxed);
+            }
+            self.clock_anchor_position[index].store(position_frames, Ordering::Relaxed);
+            self.clock_anchor_qpc[index].store(qpc_100ns, Ordering::Relaxed);
+        }
     }
 
     pub fn snapshot(&self) -> AudioLatencySnapshot {
@@ -291,6 +614,10 @@ impl AudioLatencyStats {
                 let nanos = self.max_endpoint_nanos.load(Ordering::Relaxed);
                 (nanos > 0).then(|| Duration::from_nanos(nanos))
             },
+            endpoint_p50: self.endpoint_percentile(50, 100),
+            endpoint_p95: self.endpoint_percentile(95, 100),
+            endpoint_p99: self.endpoint_percentile(99, 100),
+            endpoint_p999: self.endpoint_percentile(999, 1000),
             p50: self.percentile(samples, 50, 100),
             p95: self.percentile(samples, 95, 100),
             p99: self.percentile(samples, 99, 100),
@@ -314,7 +641,93 @@ impl AudioLatencyStats {
             callback_jitter_p95: self.callback_percentile(95, 100),
             callback_jitter_p99: self.callback_percentile(99, 100),
             callback_jitter_p999: self.callback_percentile(999, 1000),
+            capture: self.direction_snapshot(AudioDirection::Capture),
+            render: self.direction_snapshot(AudioDirection::Render),
         }
+    }
+
+    fn direction_snapshot(&self, direction: AudioDirection) -> AudioLatencyDirectionSnapshot {
+        let index = direction.index();
+        let periods = self.direction_callback_periods[index].load(Ordering::Relaxed);
+        AudioLatencyDirectionSnapshot {
+            callback_periods: periods,
+            callback_period_mean: (periods > 0).then(|| {
+                Duration::from_nanos(
+                    self.direction_callback_total_nanos[index]
+                        .load(Ordering::Relaxed)
+                        .saturating_div(periods),
+                )
+            }),
+            callback_jitter_max: nonzero_duration(
+                self.direction_callback_jitter_max_nanos[index].load(Ordering::Relaxed),
+            ),
+            callback_jitter_p50: self.direction_callback_percentile(index, 50, 100),
+            callback_jitter_p95: self.direction_callback_percentile(index, 95, 100),
+            callback_jitter_p99: self.direction_callback_percentile(index, 99, 100),
+            callback_jitter_p999: self.direction_callback_percentile(index, 999, 1000),
+            max_queue_blocks: self.direction_max_queue_blocks[index].load(Ordering::Relaxed)
+                as usize,
+            queue_overflows: self.direction_queue_overflows[index].load(Ordering::Relaxed),
+            stale_drops: self.direction_stale_drops[index].load(Ordering::Relaxed),
+            queue_slope_milli_per_sec: self.direction_queue_slope_milli_per_sec[index]
+                .load(Ordering::Relaxed),
+            max_endpoint_frames: self.direction_max_endpoint_frames[index].load(Ordering::Relaxed)
+                as usize,
+            max_endpoint_latency: nonzero_duration(
+                self.direction_max_endpoint_nanos[index].load(Ordering::Relaxed),
+            ),
+            endpoint_p50: self.direction_endpoint_percentile(index, 50, 100),
+            endpoint_p95: self.direction_endpoint_percentile(index, 95, 100),
+            endpoint_p99: self.direction_endpoint_percentile(index, 99, 100),
+            endpoint_p999: self.direction_endpoint_percentile(index, 999, 1000),
+            max_assembler_frames: (direction == AudioDirection::Capture)
+                .then(|| self.direction_max_assembler_frames.load(Ordering::Relaxed) as usize)
+                .unwrap_or(0),
+            max_drainer_frames: (direction == AudioDirection::Render)
+                .then(|| self.direction_max_drainer_frames.load(Ordering::Relaxed) as usize)
+                .unwrap_or(0),
+            clock_samples: self.clock_samples[index].load(Ordering::Relaxed),
+            clock_position_frames: self.clock_position[index].load(Ordering::Relaxed),
+            clock_qpc_100ns: self.clock_qpc[index].load(Ordering::Relaxed),
+            clock_drift_ppm: self.clock_drift_valid[index]
+                .load(Ordering::Relaxed)
+                .then(|| self.clock_drift_ppm[index].load(Ordering::Relaxed)),
+        }
+    }
+
+    fn direction_callback_percentile(
+        &self,
+        index: usize,
+        numerator: u64,
+        denominator: u64,
+    ) -> Option<Duration> {
+        let samples = self.direction_callback_periods[index].load(Ordering::Relaxed);
+        percentile_buckets(
+            &self.direction_callback_jitter_buckets[index],
+            samples,
+            numerator,
+            denominator,
+        )
+    }
+
+    fn endpoint_percentile(&self, numerator: u64, denominator: u64) -> Option<Duration> {
+        let samples = self.endpoint_samples.load(Ordering::Relaxed);
+        percentile_buckets(&self.endpoint_buckets, samples, numerator, denominator)
+    }
+
+    fn direction_endpoint_percentile(
+        &self,
+        index: usize,
+        numerator: u64,
+        denominator: u64,
+    ) -> Option<Duration> {
+        let samples = self.direction_endpoint_samples[index].load(Ordering::Relaxed);
+        percentile_buckets(
+            &self.direction_endpoint_buckets[index],
+            samples,
+            numerator,
+            denominator,
+        )
     }
 
     fn percentile(&self, samples: u64, numerator: u64, denominator: u64) -> Option<Duration> {
@@ -353,6 +766,33 @@ impl AudioLatencyStats {
         }
         Some(Duration::from_nanos(u64::MAX))
     }
+}
+
+fn nonzero_duration(nanos: u64) -> Option<Duration> {
+    (nanos > 0).then(|| Duration::from_nanos(nanos))
+}
+
+fn percentile_buckets(
+    buckets: &[AtomicU64; 64],
+    samples: u64,
+    numerator: u64,
+    denominator: u64,
+) -> Option<Duration> {
+    if samples == 0 {
+        return None;
+    }
+    let target = samples
+        .saturating_mul(numerator)
+        .saturating_add(denominator - 1)
+        / denominator;
+    let mut cumulative = 0_u64;
+    for (index, bucket) in buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(bucket.load(Ordering::Relaxed));
+        if cumulative >= target {
+            return Some(Duration::from_nanos(bucket_upper_nanos(index)));
+        }
+    }
+    Some(Duration::from_nanos(u64::MAX))
 }
 
 fn latency_bucket(nanos: u64) -> usize {

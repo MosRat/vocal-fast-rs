@@ -11,8 +11,8 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use thiserror::Error;
 
 use crate::{
-    AudioClock, AudioError, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp,
-    BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo,
+    AudioClock, AudioDirection, AudioError, AudioLatencySnapshot, AudioLatencyStats,
+    AudioTimestamp, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo,
 };
 
 #[derive(Debug, Error)]
@@ -200,6 +200,7 @@ fn build_duplex_inner(
                     input_latency.as_deref(),
                     &mut input_last_callback,
                     expected_period,
+                    AudioDirection::Capture,
                 );
                 // A full queue is a real-time overflow. Dropping the newest
                 // block bounds latency; the ring and assembler expose counters
@@ -210,8 +211,15 @@ fn build_duplex_inner(
                     .unwrap_or(AudioTimestamp::ZERO);
                 let _ = assembler.push_at(data, &mut input_producer, timestamp);
                 if let Some(latency) = input_latency.as_ref() {
+                    latency.record_assembler_buffered(
+                        assembler
+                            .buffered_samples()
+                            .checked_div(config.format.channels as usize)
+                            .unwrap_or(0),
+                    );
                     let stats = input_producer.stats();
-                    latency.record_queue_state(
+                    latency.record_queue_state_for(
+                        AudioDirection::Capture,
                         stats.queued_blocks,
                         stats.high_water_blocks,
                         stats.dropped_full,
@@ -237,15 +245,23 @@ fn build_duplex_inner(
                     output_latency.as_deref(),
                     &mut output_last_callback,
                     expected_period,
+                    AudioDirection::Render,
                 );
                 // Silence is written on underflow so the native callback never
                 // blocks behind inference.
                 match drainer.drain(data, &mut output_consumer) {
                     Ok(report) => {
                         if let Some(latency) = output_latency.as_ref() {
+                            latency.record_drainer_pending(
+                                drainer
+                                    .pending_samples()
+                                    .checked_div(config.format.channels as usize)
+                                    .unwrap_or(0),
+                            );
                             latency.record_underflow(report.underflow_samples);
                             let stats = output_consumer.stats();
-                            latency.record_queue_state(
+                            latency.record_queue_state_for(
+                                AudioDirection::Render,
                                 stats.queued_blocks,
                                 stats.high_water_blocks,
                                 stats.dropped_full,
@@ -288,13 +304,18 @@ fn record_callback_tick(
     latency: Option<&AudioLatencyStats>,
     last_callback: &mut Option<Instant>,
     expected: Duration,
+    direction: AudioDirection,
 ) {
     let Some(latency) = latency else {
         return;
     };
     let now = Instant::now();
     if let Some(previous) = last_callback.replace(now) {
-        latency.record_callback_period(now.saturating_duration_since(previous), expected);
+        latency.record_callback_period_for(
+            direction,
+            now.saturating_duration_since(previous),
+            expected,
+        );
     }
 }
 

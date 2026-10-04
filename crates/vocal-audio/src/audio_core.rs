@@ -337,4 +337,48 @@ mod tests {
         drop(input);
         assert_eq!(worker.stats().input.dropped_stale, 1);
     }
+
+    #[test]
+    fn worker_process_once_waits_and_commits_without_staging() {
+        let io = StreamIo::new(config()).unwrap();
+        let (mut device, mut worker) = io.split();
+        device.input.try_push(&[1.0, 2.0]).unwrap();
+        worker
+            .process_once(
+                WorkerSchedule {
+                    input_policy: WorkerInputPolicy::Fifo,
+                    timeout: Some(Duration::ZERO),
+                },
+                |input, output| {
+                    output.copy_from_slice(input);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let mut rendered = [0.0; 2];
+        device.output.try_copy_into(&mut rendered).unwrap();
+        assert_eq!(rendered, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn directional_profile_exposes_queue_and_clock_trends() {
+        let stats = AudioLatencyStats::default();
+        stats.record_callback_period_for(
+            AudioDirection::Render,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        stats.record_queue_state_for(AudioDirection::Render, 1, 2, 3, 4);
+        stats.record_endpoint_for(AudioDirection::Render, 480, 48_000);
+        stats.record_device_clock(AudioDirection::Render, 0, 1_000_000, 48_000);
+        stats.record_device_clock(AudioDirection::Render, 48_000, 11_000_000, 48_000);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.render.callback_periods, 1);
+        assert_eq!(snapshot.render.max_queue_blocks, 2);
+        assert_eq!(snapshot.render.queue_overflows, 3);
+        assert_eq!(snapshot.render.stale_drops, 4);
+        assert_eq!(snapshot.render.max_endpoint_frames, 480);
+        assert_eq!(snapshot.render.clock_samples, 2);
+        assert_eq!(snapshot.render.clock_drift_ppm, Some(0));
+    }
 }

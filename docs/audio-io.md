@@ -60,6 +60,20 @@ convert(input.samples(), output.samples_mut());
 output.commit();
 ```
 
+For a complete blocking step, use `WorkerIo::process_once` so input wait,
+output backpressure, latest/FIFO policy, timestamp propagation, and commit
+ordering stay in one place:
+
+```rust,ignore
+worker.process_once(
+    WorkerSchedule {
+        input_policy: WorkerInputPolicy::Fifo,
+        timeout: Some(Duration::from_millis(20)),
+    },
+    |input, output| model.process(input, output),
+)?;
+```
+
 When the render queue is intentionally shallow, a worker can use
 `WorkerIo::wait_output(timeout)` instead of retrying `try_output()`. The
 consumer only signals the space generation when it releases a slot from a
@@ -82,12 +96,20 @@ When using `BlockDrainer`, the same source timestamp is returned in
 and approximate p50/p95/p99/p99.9 ages in their `latency()` snapshots. The
 snapshot also reports underflow samples, packet timestamp validity,
 discontinuities, queue high-water, overflow/stale-drop counts, and maximum
-endpoint padding. Profiled device callbacks also expose callback period
+endpoint capacity/padding. Profiled device callbacks also expose callback period
 count/mean and callback jitter percentiles, so scheduling jitter can be
 distinguished from queue residency. Native WASAPI compares callback intervals
 with the actual period selected from `IAudioClient3`, rather than assuming the
 model block size. A zero sample count means the inference worker did not
 propagate timestamps, rather than that the device measured zero latency.
+The `capture` and `render` sub-snapshots separate callback jitter, queue
+high-water, endpoint padding, assembler/drainer residency, and queue-depth
+slope. Native WASAPI also samples `IAudioClock` position and its QPC pair;
+`clock_drift_ppm` exposes independent-device rate error, which is the signal
+needed to decide when a future asynchronous resampler should add or remove a
+frame. The current data path never changes sample count from telemetry alone.
+Endpoint capacity is kept separate from runtime current-padding samples, and
+the latter has p50/p95/p99/p99.9 fields for each direction.
 The default methods write `AudioTimestamp::ZERO`, so production streams do not
 pay for a clock read on every callback.
 
@@ -115,6 +137,10 @@ It intentionally does not enable format conversion; callers should use the
 device's native sample rate and channel count or handle conversion outside the
 callback. The older wrapper path is available only through
 `WasapiStream::open_legacy*`; `ExclusiveEvent` continues to use that path.
+Period selection scores legal fundamental-period multiples by exact model-block
+match, tiling in either direction, and least-common-multiple boundary length.
+This reduces partial assembler/drainer blocks while retaining the smallest
+available period when alignment is otherwise equal.
 
 The optional `cpal-backend` adapter is a portable first integration. It requests
 f32 and a fixed callback size, then still uses the assembler/drainer because a

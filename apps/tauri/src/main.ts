@@ -41,8 +41,13 @@ let windowMaximized = false;
 let activeSection = 'studio';
 let closeInFlight = false;
 let closeHookInstalled = false;
+let draftConfig: GuiConfig | null = null;
+let renderTimer: number | undefined;
+const lastActionAt = new Map<string, number>();
+const MIN_ACTION_GAP_MS = 240;
 const systemTheme = window.matchMedia?.('(prefers-color-scheme: dark)');
 const call = <T>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
+function runningInTauri(): boolean { return '__TAURI_INTERNALS__' in window; }
 
 function escapeHtml(value: string): string { return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character] ?? character); }
 
@@ -77,6 +82,7 @@ function button(id: string, label: string, iconName?: IconName, kind = 'secondar
 function panelHeader(kicker: string, title: string, action = ''): string { return `<div class="panel-header"><div><div class="kicker">${kicker}</div><h2>${title}</h2></div>${action}</div>`; }
 function metric(label: string, value: string, iconName: IconName, tone = ''): string { return `<div class="metric ${tone}"><div class="metric-icon">${icon(iconName, 16)}</div><div><dt>${label}</dt><dd>${value}</dd></div></div>`; }
 function slider(id: string, label: string, value: string, number: number, min: number, max: number, step: number): string { return `<label class="slider-field"><span><span>${label}</span><output id="${id}Value">${value}</output></span><input id="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${number}"/></label>`; }
+function scheduleRender(delay = 70): void { if (renderTimer !== undefined) return; renderTimer = window.setTimeout(() => { renderTimer = undefined; render(); }, delay); }
 
 function renderTitlebar(): string { return `<header class="titlebar" data-tauri-drag-region><div class="titlebar-brand"><div class="app-glyph">${icon('waveform', 17)}</div><span>vocal-fast</span><span class="titlebar-divider"></span><span class="titlebar-context">Studio</span></div><div class="titlebar-actions"><button id="minimizeWindow" class="window-button" title="Minimize">${icon('minimize', 15)}</button><button id="maximizeWindow" class="window-button" title="Maximize">${icon(windowMaximized ? 'restore' : 'maximize', 14)}</button><button id="closeWindow" class="window-button close" title="Close">${icon('close', 15)}</button></div></header>`; }
 
@@ -86,7 +92,7 @@ function renderSidebar(): string {
 }
 
 function render(): void {
-  const current = snapshot; const config = current?.config ?? defaultConfig(); const audio = current?.audio; const report = localError ?? current?.lastError; const running = current?.lifecycle === 'running'; const transitional = current?.lifecycle === 'loading' || current?.lifecycle === 'stopping'; const model = current?.model; const latency = audio?.latencyP95Micros ? `${(audio.latencyP95Micros / 1000).toFixed(2)} ms` : '—'; const status = current?.lifecycle ?? 'created';
+  const current = snapshot; const config = draftConfig ?? current?.config ?? defaultConfig(); const audio = current?.audio; const report = localError ?? current?.lastError; const running = current?.lifecycle === 'running'; const transitional = current?.lifecycle === 'loading' || current?.lifecycle === 'stopping'; const model = current?.model; const latency = audio?.latencyP95Micros ? `${(audio.latencyP95Micros / 1000).toFixed(2)} ms` : '—'; const status = current?.lifecycle ?? 'created';
   const inputName = audio?.active ? audio.inputDevice : (config.inputDevice ? devices?.devices.find((item) => item.id === config.inputDevice)?.name : null); const outputName = audio?.active ? audio.outputDevice : (config.outputDevice ? devices?.devices.find((item) => item.id === config.outputDevice)?.name : null);
   appRoot.innerHTML = `${renderTitlebar()}<div class="app-layout">${renderSidebar()}<main class="content"><div class="page-heading"><div><div class="kicker">REALTIME VOICE WORKSPACE</div><h1>Make every take sound like you.</h1><p>Configure your voice chain, start the stream, and keep an eye on the audio path.</p></div><div class="headline-status ${statusTone(status)}"><span class="status-dot"></span><div><strong>${lifecycleLabel(status)}</strong><small>${audio?.active ? 'Audio stream online' : channelConnected ? 'Runtime ready for control' : 'Waiting for runtime'}</small></div></div></div>
     <section class="hero-panel ${running ? 'is-running' : ''}"><div class="hero-glow"></div><div class="hero-grid"></div><div class="hero-content"><div class="eyebrow-row"><span class="eyebrow-chip">${running ? 'LIVE SESSION' : 'SESSION CONTROL'}</span><span class="revision">Revision ${current?.configRevision ?? 0}</span></div><h2>${model ? escapeHtml(model.displayName) : 'No model loaded'}</h2><p>${model ? `${escapeHtml(model.architecture)} · ${model.sampleRate.toLocaleString()} Hz · ${model.featureDims} feature dimensions${model.usesF0 ? ' · F0 enabled' : ''}` : 'Load a .vfr cache or model manifest to prepare your voice chain.'}</p><div class="hero-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><div class="hero-actions">${button('start', running ? 'Streaming' : 'Start stream', running ? 'check' : 'play', 'primary', busy || transitional || !model || running)}${button('stop', 'Stop', 'stop', 'secondary', busy || !running)}${button('demo', 'Test block', 'sparkle', 'ghost', busy || !running || !!audio?.active, 'Run one synthetic block through the engine')}</div></div><div class="hero-orb"><div class="orb-ring ring-one"></div><div class="orb-ring ring-two"></div><div class="orb-core">${icon('waveform', 42)}</div><span class="orb-caption">${running ? 'Listening' : 'Standby'}</span></div></section>
@@ -100,22 +106,30 @@ function render(): void {
 }
 
 function readConfigForm(): GuiConfig {
-  const current = snapshot?.config ?? defaultConfig(); const number = (id: string, fallback: number) => Number(document.querySelector<HTMLInputElement>(`#${id}`)?.value ?? fallback); const sampleRate = number('inputRate', current.inputFormat.sampleRate); const channels = number('channels', current.inputFormat.channels);
+  const current = draftConfig ?? snapshot?.config ?? defaultConfig(); const number = (id: string, fallback: number) => Number(document.querySelector<HTMLInputElement>(`#${id}`)?.value ?? fallback); const sampleRate = number('inputRate', current.inputFormat.sampleRate); const channels = number('channels', current.inputFormat.channels);
   return { ...current, backend: (document.querySelector<HTMLSelectElement>('#backend')?.value as Backend) ?? current.backend, inputFormat: { sampleRate, channels }, outputFormat: { sampleRate, channels }, inputDevice: document.querySelector<HTMLSelectElement>('#inputDevice')?.value || null, outputDevice: document.querySelector<HTMLSelectElement>('#outputDevice')?.value || null, blockFrames: number('blockFrames', current.blockFrames), queueBlocks: number('queueBlocks', current.queueBlocks), conversion: { ...current.conversion, pitchSemitones: number('pitch', current.conversion.pitchSemitones), indexRatio: number('index', current.conversion.indexRatio), protect: number('protect', current.conversion.protect), rmsMixRate: number('rms', current.conversion.rmsMixRate) } };
 }
 
-async function runAction(action: () => Promise<unknown>): Promise<void> { busy = true; localError = null; render(); try { const result = await action(); if (isSnapshot(result)) snapshot = result; } catch (error) { localError = normalizeError(error); } finally { busy = false; render(); } }
+async function runAction(action: () => Promise<unknown>, key = 'command'): Promise<void> {
+  const now = performance.now();
+  if (busy || now - (lastActionAt.get(key) ?? -Infinity) < MIN_ACTION_GAP_MS) return;
+  lastActionAt.set(key, now); busy = true; localError = null; render();
+  try { const result = await action(); if (isSnapshot(result)) { snapshot = result; draftConfig = null; } }
+  catch (error) { localError = normalizeError(error); }
+  finally { busy = false; render(); }
+}
 function isSnapshot(value: unknown): value is Snapshot { return typeof value === 'object' && value !== null && 'lifecycle' in value && 'configRevision' in value; }
 function normalizeError(error: unknown): ErrorReport { if (typeof error === 'object' && error !== null && 'kind' in error) { const typed = error as { kind: string; details?: unknown }; return { code: typed.kind, message: typeof typed.details === 'string' ? typed.details : JSON.stringify(typed.details ?? typed.kind), recoverable: true }; } return { code: 'command_error', message: String(error), recoverable: true }; }
 
 function wireHandlers(): void {
   const byId = <T extends HTMLElement>(id: string) => document.querySelector<T>(`#${id}`);
-  byId<HTMLButtonElement>('load')?.addEventListener('click', () => runAction(async () => { const path = byId<HTMLInputElement>('modelPath')?.value.trim(); if (!path) throw new Error('Model path is required'); return call<Snapshot>('load_model', { path }); }));
+  byId<HTMLButtonElement>('load')?.addEventListener('click', () => runAction(async () => { const path = byId<HTMLInputElement>('modelPath')?.value.trim(); if (!path) throw new Error('Model path is required'); return call<Snapshot>('load_model', { path }); }, 'load-model'));
   byId<HTMLInputElement>('modelPath')?.addEventListener('keydown', (event) => { if (event.key === 'Enter') byId<HTMLButtonElement>('load')?.click(); });
-  byId<HTMLButtonElement>('unload')?.addEventListener('click', () => runAction(() => call<Snapshot>('unload_model'))); byId<HTMLButtonElement>('start')?.addEventListener('click', () => runAction(() => call<Snapshot>('start_session'))); byId<HTMLButtonElement>('stop')?.addEventListener('click', () => runAction(() => call<Snapshot>('stop_session'))); byId<HTMLButtonElement>('clearError')?.addEventListener('click', () => runAction(() => call<Snapshot>('clear_error')));
-  byId<HTMLButtonElement>('refreshDevices')?.addEventListener('click', () => runAction(async () => { devices = await call<AudioDeviceCatalog>('list_audio_devices'); return devices; })); byId<HTMLButtonElement>('save')?.addEventListener('click', () => runAction(() => call<Snapshot>('update_config', { config: readConfigForm(), expectedRevision: snapshot?.configRevision ?? 0 })));
-  byId<HTMLButtonElement>('demo')?.addEventListener('click', () => runAction(async () => { const rate = snapshot?.config.inputFormat.sampleRate ?? 48000; const samples = Array.from({ length: snapshot?.config.blockFrames ?? 480 }, (_, index) => Math.sin(index * 2 * Math.PI * 440 / rate) * 0.05); return call<Snapshot>('process_block', { samples, sampleRate: rate, channels: 1, sequence: Date.now() }); }));
-  const sliderFields: ReadonlyArray<readonly [string, string, number]> = [['pitch', 'pitchValue', 1], ['index', 'indexValue', 2], ['protect', 'protectValue', 2], ['rms', 'rmsValue', 2]]; for (const [id, outputId, digits] of sliderFields) byId<HTMLInputElement>(id)?.addEventListener('input', (event) => { const value = Number((event.target as HTMLInputElement).value); const output = byId<HTMLOutputElement>(outputId); if (output) output.value = value.toFixed(digits) + (id === 'pitch' ? ' st' : ''); });
+  byId<HTMLButtonElement>('unload')?.addEventListener('click', () => runAction(() => call<Snapshot>('unload_model'), 'unload-model')); byId<HTMLButtonElement>('start')?.addEventListener('click', () => runAction(() => call<Snapshot>('start_session'), 'start-session')); byId<HTMLButtonElement>('stop')?.addEventListener('click', () => runAction(() => call<Snapshot>('stop_session'), 'stop-session')); byId<HTMLButtonElement>('clearError')?.addEventListener('click', () => runAction(() => call<Snapshot>('clear_error'), 'clear-error'));
+  byId<HTMLButtonElement>('refreshDevices')?.addEventListener('click', () => runAction(async () => { devices = await call<AudioDeviceCatalog>('list_audio_devices'); return devices; }, 'refresh-devices')); byId<HTMLButtonElement>('save')?.addEventListener('click', () => runAction(() => call<Snapshot>('update_config', { config: readConfigForm(), expectedRevision: snapshot?.configRevision ?? 0 }), 'save-config'));
+  byId<HTMLButtonElement>('demo')?.addEventListener('click', () => runAction(async () => { const rate = snapshot?.config.inputFormat.sampleRate ?? 48000; const samples = Array.from({ length: snapshot?.config.blockFrames ?? 480 }, (_, index) => Math.sin(index * 2 * Math.PI * 440 / rate) * 0.05); return call<Snapshot>('process_block', { samples, sampleRate: rate, channels: 1, sequence: Date.now() }); }, 'test-block'));
+  const sliderFields: ReadonlyArray<readonly [string, string, number]> = [['pitch', 'pitchValue', 1], ['index', 'indexValue', 2], ['protect', 'protectValue', 2], ['rms', 'rmsValue', 2]]; for (const [id, outputId, digits] of sliderFields) byId<HTMLInputElement>(id)?.addEventListener('input', (event) => { const value = Number((event.target as HTMLInputElement).value); const output = byId<HTMLOutputElement>(outputId); if (output) output.value = value.toFixed(digits) + (id === 'pitch' ? ' st' : ''); draftConfig = readConfigForm(); });
+  ['backend', 'inputRate', 'channels', 'blockFrames', 'queueBlocks', 'inputDevice', 'outputDevice'].forEach((id) => byId<HTMLInputElement | HTMLSelectElement>(id)?.addEventListener('change', () => { draftConfig = readConfigForm(); }));
   document.querySelectorAll<HTMLButtonElement>('[data-section]').forEach((item) => item.addEventListener('click', () => { activeSection = item.dataset.section ?? 'studio'; render(); requestAnimationFrame(() => document.querySelector(`[data-section-target="${activeSection}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })); }));
   byId<HTMLButtonElement>('themeButton')?.addEventListener('click', () => { themePreference = themePreference === 'system' ? 'dark' : themePreference === 'dark' ? 'light' : 'system'; applyTheme(); void setNativeTheme(themePreference === 'system' ? null : themePreference).catch(() => undefined); render(); }); byId<HTMLButtonElement>('minimizeWindow')?.addEventListener('click', () => void windowCommand('minimize')); byId<HTMLButtonElement>('maximizeWindow')?.addEventListener('click', () => void windowCommand('maximize')); byId<HTMLButtonElement>('closeWindow')?.addEventListener('click', () => void windowCommand('close'));
 }
@@ -128,11 +142,11 @@ async function syncWindowState(): Promise<void> {
     if (!closeHookInstalled) {
       closeHookInstalled = true;
       await current.onCloseRequested(async (event) => {
-        if (snapshot?.lifecycle !== 'running' || closeInFlight) return;
+        if (snapshot?.lifecycle !== 'running' || closeInFlight || busy) return;
         event.preventDefault();
         closeInFlight = true;
         try {
-          await runAction(() => call<Snapshot>('stop_session'));
+          await runAction(() => call<Snapshot>('stop_session'), 'close-stop');
           if (snapshot?.lifecycle !== 'running') await current.close();
         } finally { closeInFlight = false; }
       });
@@ -143,12 +157,21 @@ async function syncWindowState(): Promise<void> {
 function applyTheme(): void { const dark = themePreference === 'dark' || (themePreference === 'system' && (systemTheme?.matches ?? true)); document.documentElement.dataset.theme = dark ? 'dark' : 'light'; document.documentElement.style.colorScheme = dark ? 'dark' : 'light'; }
 
 async function connect(): Promise<void> {
-  const events = new Channel<BackendEvent>(); events.onmessage = (event) => { if (event.sequence <= lastEventSequence) return; if (lastEventSequence !== 0 && event.sequence > lastEventSequence + 1) void resyncSnapshot(); lastEventSequence = event.sequence; if (event.type === 'snapshot') { snapshot = event.payload as Snapshot; if (!snapshot.lastError) localError = null; } if (event.type === 'metrics' && snapshot) snapshot.metrics = event.payload as Snapshot['metrics']; if (event.type === 'error') localError = event.payload as ErrorReport; render(); };
-  try { snapshot = await call<Snapshot>('subscribe', { channel: events }); channelConnected = true; devices = await call<AudioDeviceCatalog>('list_audio_devices'); } catch (error) { localError = normalizeError(error); } render();
+  if (!runningInTauri()) {
+    // Keep the Vite/Playwright preview useful without a native IPC bridge.
+    render();
+    return;
+  }
+  try {
+    const events = new Channel<BackendEvent>();
+    events.onmessage = (event) => { if (event.sequence <= lastEventSequence) return; if (lastEventSequence !== 0 && event.sequence > lastEventSequence + 1) void resyncSnapshot(); lastEventSequence = event.sequence; if (event.type === 'snapshot') { snapshot = event.payload as Snapshot; if (!snapshot.lastError) localError = null; } if (event.type === 'metrics' && snapshot) snapshot.metrics = event.payload as Snapshot['metrics']; if (event.type === 'error') localError = event.payload as ErrorReport; scheduleRender(); };
+    snapshot = await call<Snapshot>('subscribe', { channel: events }); channelConnected = true; devices = await call<AudioDeviceCatalog>('list_audio_devices');
+  } catch (error) { localError = normalizeError(error); }
+  render();
 }
 async function resyncSnapshot(): Promise<void> { if (resyncInFlight) return; resyncInFlight = true; try { snapshot = await call<Snapshot>('get_snapshot'); render(); } catch { /* Periodic refresh will retry. */ } finally { resyncInFlight = false; } }
 
-window.addEventListener('keydown', (event) => { const target = event.target as HTMLElement | null; const editing = target?.matches('input, select, textarea'); if (event.key === 'Escape' && localError) { localError = null; render(); return; } if (editing) return; if (event.code === 'Space') { event.preventDefault(); if (!busy) void runAction(() => call<Snapshot>(snapshot?.lifecycle === 'running' ? 'stop_session' : 'start_session')); } if (event.ctrlKey && event.key.toLowerCase() === 'r') { event.preventDefault(); void resyncSnapshot(); } });
+window.addEventListener('keydown', (event) => { const target = event.target as HTMLElement | null; const editing = target?.matches('input, select, textarea'); if (event.key === 'Escape' && localError) { localError = null; render(); return; } if (editing) return; if (event.code === 'Space') { event.preventDefault(); void runAction(() => call<Snapshot>(snapshot?.lifecycle === 'running' ? 'stop_session' : 'start_session'), 'space-session'); } if (event.ctrlKey && event.key.toLowerCase() === 'r') { event.preventDefault(); void resyncSnapshot(); } });
 systemTheme?.addEventListener('change', () => { if (themePreference === 'system') { applyTheme(); render(); } });
 window.setInterval(async () => { if (!channelConnected || busy || refreshInFlight) return; refreshInFlight = true; try { snapshot = await call<Snapshot>('get_snapshot'); render(); } catch { /* Keep the last usable snapshot. */ } finally { refreshInFlight = false; } }, 1000);
 applyTheme(); render(); void syncWindowState(); void connect();

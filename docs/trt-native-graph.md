@@ -312,8 +312,11 @@ regions.
 The pipeline uses CUDA events around every enqueue, so reports distinguish GPU
 graph time from host upload and final download time. Each enqueue is annotated
 with an NVTX range (`rvc.hubert`, `rvc.rmvpe`, `rvc.frontend`, `rvc.synth`), and
-host copies are marked `rvc.h2d`/`rvc.d2h`. Use the profile command for a
-warmup plus repeated, device-resident run:
+host copies are marked `rvc.h2d`/`rvc.d2h`. The NVTX ranges surround the host
+`enqueueV3` calls and therefore show enqueue overhead; use the CUDA-event stage
+section of `scripts/summarize_nsys.py` for device duration of native graph
+replay. Use the profile command for a warmup plus repeated, device-resident
+run:
 
 ```powershell
 rtk powershell -NoProfile -File scripts/profile-trt-nsight.ps1 `

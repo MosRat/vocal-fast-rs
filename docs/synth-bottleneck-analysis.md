@@ -140,3 +140,39 @@ residual sum 和 tanh 保持 FP32/FP16。任何 INT8 方案都必须同时检查
 - 把 NSF source 或 pitch 量化：会直接放大相位漂移。
 - 用 generic attention 替换 RVC relative flow：改变模型语义。
 - 继续优化 cuFFT：它已经远低于 Synth residual/convolution 成本。
+
+## Fresh Nsight Systems replay and host binding cache
+
+A new 100-replay capture of the stage-2 plan (`nsys-op16-s2-c2-cached`) used
+CUDA Graph node tracing with no intermediate downloads. NVTX ranges measure the
+CPU enqueue envelope; the CUDA-event section added to `summarize_nsys.py` reads
+device durations from the pipeline's reusable start/end event pairs:
+
+| stage | device mean (ms) | device p95 (ms) |
+| --- | ---: | ---: |
+| HuBERT | 4.90 | 5.83 |
+| RMVPE + cuFFT | 9.06 | 10.06 |
+| frontend | 0.016 | 0.016 |
+| Synth | 29.50 | 30.14 |
+
+Synth therefore uses about two thirds of steady device time, with RMVPE second.
+The largest repeated kernels are TensorRT-RTX cuDNN pointwise convolution
+tactics for Synth residual/upsample blocks, followed by grouped matmul and
+Myelin fused add/multiply/max kernels. cuFFT R2C and magnitude kernels remain
+below the stage noise floor.
+
+The runtime now caches TensorRT binding addresses and resolved HuBERT/RMVPE
+frame counts. A shape transition clears the address cache; fixed-profile
+replays keep the same device allocations and skip those FFI calls. A debug
+replay before and after this change matched audio, features, pitch and coarse
+pitch bit-for-bit. This is a host-side reduction and does not change CUDA-event
+stage time or numerical output.
+
+The same capture with stage-1 FP16 residual accumulation measured HuBERT
+`4.76 ms`, RMVPE `8.78 ms`, frontend `0.016 ms`, and Synth `29.13 ms` over the
+last ten CUDA-event samples. The application profile reported `45.94 ms` event
+total and `47.59 ms` host mean over 100 replays. Its deterministic sine gate
+against the FP32 Applio reference remained final cosine `0.99888755`, Synth-only
+cosine `0.99999917`, F0 RMSE `0.00681 Hz`, and coarse F0 agreement `99.644%`.
+This is the current throughput candidate; the FP32-accumulation stage-2 plan
+remains the safer default until real voices pass the same gate.

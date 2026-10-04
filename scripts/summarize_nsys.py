@@ -13,6 +13,16 @@ def ns(tx: int | float) -> float:
     return float(tx) / 1.0e6
 
 
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
 parser = argparse.ArgumentParser(description="Summarize an Nsight Systems SQLite export")
 parser.add_argument("database")
 parser.add_argument(
@@ -42,15 +52,6 @@ if "NVTX_EVENTS" in tables:
         "where text like 'rvc.%' and end is not null order by start"
     ).fetchall()
     graph_names = ("rvc.hubert", "rvc.rmvpe", "rvc.rmvpe.full", "rvc.frontend", "rvc.synth")
-    def percentile(values: list[float], q: float) -> float:
-        if not values:
-            return 0.0
-        ordered = sorted(values)
-        position = (len(ordered) - 1) * q
-        lower = int(position)
-        upper = min(lower + 1, len(ordered) - 1)
-        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
     def steady_values(values: list[float]) -> tuple[list[float], float]:
         """Reject capture/JIT outliers without hiding the raw range count."""
         if len(values) < 4:
@@ -129,6 +130,57 @@ def show_activity(table: str, title: str, limit: int = 12) -> None:
     print(f"-- {title} (steady replay)")
     for row in rows:
         print(row)
+
+
+def show_cuda_event_stage_pairs() -> None:
+    """Report GPU stage durations from the pipeline's CUDA event pairs.
+
+    NVTX ranges are host ranges around enqueueV3 and therefore do not measure
+    the work executed by TensorRT's native CUDA graph.  RvcTrtPipeline records
+    eight reusable CUDA events in creation order (start/end for HuBERT, RMVPE,
+    frontend, and Synth).  Nsight exports their timestamps in
+    CUPTI_ACTIVITY_KIND_CUDA_EVENT; pairing the recurring event streams gives
+    a device-side stage view without downloading intermediate tensors.
+    """
+    if "CUPTI_ACTIVITY_KIND_CUDA_EVENT" not in tables:
+        return
+    groups = []
+    for event_id, count, first in c.execute(
+        "select eventId, count(*), min(timestamp) "
+        "from CUPTI_ACTIVITY_KIND_CUDA_EVENT group by eventId order by min(timestamp)"
+    ):
+        if count < 4:
+            continue
+        timestamps = [
+            row[0]
+            for row in c.execute(
+                "select timestamp from CUPTI_ACTIVITY_KIND_CUDA_EVENT "
+                "where eventId = ? order by timestamp",
+                [event_id],
+            )
+        ]
+        groups.append(timestamps)
+    if len(groups) < 8:
+        return
+    labels = ("hubert", "rmvpe", "frontend", "synth")
+    print("-- CUDA event stage summary (device time, last steady ranges, ms)")
+    for index, label in enumerate(labels):
+        starts = groups[index * 2]
+        ends = groups[index * 2 + 1]
+        values = [ns(end - start) for start, end in zip(starts, ends)]
+        values = values[-args.steady :]
+        if values:
+            print(label, {
+                "count": len(values),
+                "mean_ms": sum(values) / len(values),
+                "median_ms": statistics.median(values),
+                "p95_ms": percentile(values, 0.95),
+                "min_ms": min(values),
+                "max_ms": max(values),
+            })
+
+
+show_cuda_event_stage_pairs()
 
 
 show_activity("CUPTI_ACTIVITY_KIND_MEMCPY", "memcpy")

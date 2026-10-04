@@ -14,8 +14,55 @@ use crate::{
     pipeline::RvcTrtProfile,
 };
 
+/// CUDA Graph ownership strategy for the realtime pipeline.
+///
+/// `NativeSubgraphs` delegates capture/replay to TensorRT-RTX for each
+/// execution context. `WholePipeline` uses one Rust/CUDA graph for the serial
+/// device-resident pipeline. `HybridSubgraphs` captures an acoustic graph and
+/// a decode graph separately, preserving a smaller failure and shape scope.
+/// `Disabled` is the explicit eager baseline used for comparisons.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphReplayMode {
+    NativeSubgraphs,
+    WholePipeline,
+    HybridSubgraphs,
+    Disabled,
+}
+
+impl Default for GraphReplayMode {
+    fn default() -> Self {
+        Self::NativeSubgraphs
+    }
+}
+
+impl GraphReplayMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeSubgraphs => "native_subgraphs",
+            Self::WholePipeline => "whole_pipeline",
+            Self::HybridSubgraphs => "hybrid_subgraphs",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "native" | "native_subgraphs" | "per_stage" | "subgraphs" => {
+                Some(Self::NativeSubgraphs)
+            }
+            "whole" | "whole_pipeline" | "pipeline" | "external" => Some(Self::WholePipeline),
+            "hybrid" | "hybrid_subgraphs" | "split" => Some(Self::HybridSubgraphs),
+            "disabled" | "eager" | "off" | "none" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PipelineRuntimeConfig {
+    #[serde(default)]
+    pub graph_mode: GraphReplayMode,
     pub cuda_graph: bool,
     pub native_cuda_graph: bool,
     /// Number of application-level CUDA Graph executables retained for
@@ -34,11 +81,35 @@ const fn default_graph_cache_size() -> usize {
 impl Default for PipelineRuntimeConfig {
     fn default() -> Self {
         Self {
+            graph_mode: GraphReplayMode::NativeSubgraphs,
             cuda_graph: true,
             native_cuda_graph: true,
             graph_cache_size: default_graph_cache_size(),
             parallel_acoustic: false,
             async_audio_d2h: true,
+        }
+    }
+}
+
+impl PipelineRuntimeConfig {
+    /// Resolve the explicit mode while preserving the two boolean variables
+    /// used by older callers. A non-native legacy configuration maps to the
+    /// whole-pipeline external graph; disabling graph replay always selects
+    /// the eager baseline.
+    pub fn resolved_graph_mode(&self) -> GraphReplayMode {
+        // Non-default enum values are explicit selections and therefore do
+        // not inherit either legacy boolean. The default NativeSubgraphs value
+        // remains compatible with callers that only set the old flags.
+        if self.graph_mode != GraphReplayMode::NativeSubgraphs {
+            return self.graph_mode;
+        }
+        if !self.cuda_graph {
+            return GraphReplayMode::Disabled;
+        }
+        if !self.native_cuda_graph {
+            GraphReplayMode::WholePipeline
+        } else {
+            GraphReplayMode::NativeSubgraphs
         }
     }
 }
@@ -207,6 +278,20 @@ impl TensorRtConfig {
         };
         config.runtime.cuda_graph = bool_value("VOCAL_TRT_CUDA_GRAPH", true)?;
         config.runtime.native_cuda_graph = bool_value("VOCAL_TRT_NATIVE_CUDA_GRAPH", true)?;
+        if let Some(value) = env::var("VOCAL_TRT_GRAPH_MODE").ok() {
+            let graph_mode =
+                GraphReplayMode::parse(&value).ok_or_else(|| ConfigError::InvalidValue {
+                    name: "VOCAL_TRT_GRAPH_MODE".into(),
+                    value,
+                    expected: "native_subgraphs, whole_pipeline, hybrid_subgraphs, or disabled"
+                        .into(),
+                })?;
+            // An explicit mode is the authoritative setting. Align the legacy
+            // flags so old callers cannot remap the selected mode.
+            config.runtime.cuda_graph = graph_mode != GraphReplayMode::Disabled;
+            config.runtime.native_cuda_graph = graph_mode == GraphReplayMode::NativeSubgraphs;
+            config.runtime.graph_mode = graph_mode;
+        }
         config.runtime.graph_cache_size = positive_usize(
             "VOCAL_TRT_GRAPH_CACHE_SIZE",
             config.runtime.graph_cache_size,
@@ -262,6 +347,11 @@ impl TensorRtConfig {
         self.profile
             .validate()
             .map_err(|error| ConfigError::InvalidCombination(error.to_string()))
+    }
+
+    /// Resolve the graph mode from the complete configuration.
+    pub fn resolved_graph_mode(&self) -> GraphReplayMode {
+        self.runtime.resolved_graph_mode()
     }
 }
 
@@ -384,6 +474,9 @@ mod tests {
         for name in [
             "VOCAL_TRT_PROFILE",
             "VOCAL_TRT_GRAPH_CACHE_SIZE",
+            "VOCAL_TRT_GRAPH_MODE",
+            "VOCAL_TRT_CUDA_GRAPH",
+            "VOCAL_TRT_NATIVE_CUDA_GRAPH",
             "VOCAL_TRT_PRECISION",
             "VOCAL_TRT_TACTIC_SOURCES",
             "VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK",
@@ -401,6 +494,10 @@ mod tests {
         assert_eq!(config.build.tactic_sources, 3);
         assert!(config.runtime.cuda_graph);
         assert_eq!(config.runtime.graph_cache_size, 2);
+        assert_eq!(
+            config.runtime.resolved_graph_mode(),
+            GraphReplayMode::NativeSubgraphs
+        );
     }
 
     #[test]
@@ -413,6 +510,7 @@ mod tests {
             env::set_var("VOCAL_TRT_TACTIC_SOURCES", "0x2");
             env::set_var("VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK", "0xc");
             env::set_var("VOCAL_TRT_GRAPH_CACHE_SIZE", "4");
+            env::set_var("VOCAL_TRT_GRAPH_MODE", "hybrid");
         }
         let config = TensorRtConfig::from_env().expect("aliased config");
         assert_eq!(config.build.precision, PrecisionMode::Fp16);
@@ -420,6 +518,10 @@ mod tests {
         assert_eq!(config.build.synth_resblock_stage_mask, 12);
         assert_eq!(config.profile.min_samples, 44_960);
         assert_eq!(config.runtime.graph_cache_size, 4);
+        assert_eq!(
+            config.runtime.resolved_graph_mode(),
+            GraphReplayMode::HybridSubgraphs
+        );
         clear();
     }
 
@@ -433,5 +535,74 @@ mod tests {
             Err(ConfigError::InvalidValue { .. })
         ));
         clear();
+    }
+
+    #[test]
+    fn legacy_graph_flags_resolve_to_whole_pipeline() {
+        let mut runtime = PipelineRuntimeConfig::default();
+        runtime.native_cuda_graph = false;
+        assert_eq!(
+            runtime.resolved_graph_mode(),
+            GraphReplayMode::WholePipeline
+        );
+        runtime.cuda_graph = false;
+        assert_eq!(runtime.resolved_graph_mode(), GraphReplayMode::Disabled);
+    }
+
+    #[test]
+    fn explicit_graph_mode_wins_over_legacy_native_flag() {
+        let mut runtime = PipelineRuntimeConfig::default();
+        runtime.graph_mode = GraphReplayMode::HybridSubgraphs;
+        assert_eq!(
+            runtime.resolved_graph_mode(),
+            GraphReplayMode::HybridSubgraphs
+        );
+
+        runtime.graph_mode = GraphReplayMode::WholePipeline;
+        runtime.native_cuda_graph = true;
+        assert_eq!(
+            runtime.resolved_graph_mode(),
+            GraphReplayMode::WholePipeline
+        );
+        runtime.cuda_graph = false;
+        assert_eq!(
+            runtime.resolved_graph_mode(),
+            GraphReplayMode::WholePipeline
+        );
+
+        let _guard = env_lock();
+        clear();
+        unsafe {
+            env::set_var("VOCAL_TRT_GRAPH_MODE", "native_subgraphs");
+            env::set_var("VOCAL_TRT_CUDA_GRAPH", "0");
+            env::set_var("VOCAL_TRT_NATIVE_CUDA_GRAPH", "0");
+        }
+        let config = TensorRtConfig::from_env().expect("explicit native mode");
+        assert_eq!(
+            config.runtime.resolved_graph_mode(),
+            GraphReplayMode::NativeSubgraphs
+        );
+        clear();
+    }
+
+    #[test]
+    fn graph_mode_parser_accepts_stable_names_and_aliases() {
+        for (value, expected) in [
+            ("native_subgraphs", GraphReplayMode::NativeSubgraphs),
+            ("PER_STAGE", GraphReplayMode::NativeSubgraphs),
+            ("whole_pipeline", GraphReplayMode::WholePipeline),
+            ("external", GraphReplayMode::WholePipeline),
+            ("hybrid", GraphReplayMode::HybridSubgraphs),
+            ("split", GraphReplayMode::HybridSubgraphs),
+            ("disabled", GraphReplayMode::Disabled),
+            ("eager", GraphReplayMode::Disabled),
+        ] {
+            assert_eq!(GraphReplayMode::parse(value), Some(expected));
+            assert_eq!(
+                GraphReplayMode::parse(value).unwrap().as_str(),
+                expected.as_str()
+            );
+        }
+        assert_eq!(GraphReplayMode::parse("unknown"), None);
     }
 }

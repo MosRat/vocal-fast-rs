@@ -26,7 +26,9 @@ pub mod graph;
 pub mod pipeline;
 
 pub use builder::NativeTensorRtBuilder;
-pub use config::{DiagnosticsConfig, PipelineRunConfig, PipelineRuntimeConfig, TensorRtConfig};
+pub use config::{
+    DiagnosticsConfig, GraphReplayMode, PipelineRunConfig, PipelineRuntimeConfig, TensorRtConfig,
+};
 pub use error::{ConfigError, NativeBuildError};
 pub use options::{
     DEFAULT_TRT_ROOT, DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode,

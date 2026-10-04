@@ -185,6 +185,18 @@ application windows ready when a worker alternates them. The graph cache,
 host-copy boundary, and model/plan loading cache are described in
 [`trt-graph-replay-cache.md`](trt-graph-replay-cache.md).
 
+For an apples-to-apples measurement of native subgraphs, the whole-pipeline
+graph, and the hybrid acoustic/decode graphs, run:
+
+```powershell
+rtk cargo run -p vocal-fast --features tensorrt-rtx -- model compare-trt-pipeline `
+  target/trt-pipeline/pipeline.json target/tsukuyomi-canonical.vfr target/input.f32 20
+```
+
+The command uses the same input and warmups for all three modes, reports mean
+stage/total latency, graph cache statistics, and max-absolute/RMSE/cosine
+differences against the native-subgraph output.
+
 ## Mixed precision and dispatch tuning
 
 The builder carries independent precision fields for HuBERT, RMVPE, and

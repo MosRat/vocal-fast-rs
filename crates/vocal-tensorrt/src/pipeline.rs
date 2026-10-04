@@ -17,7 +17,7 @@ use crate::timing::CudaEvent;
 use crate::{
     CudaBuffer, CudaGraphExec, CudaStream, OwnedContext, PinnedHostRing, Runtime,
     builder::NativeTensorRtBuilder,
-    config::{DiagnosticsConfig, PipelineRuntimeConfig, TensorRtConfig},
+    config::{DiagnosticsConfig, GraphReplayMode, PipelineRuntimeConfig, TensorRtConfig},
     cufft::{CufftFrontend, unique_shapes},
     error::ConfigError,
     error::NativeBuildError,
@@ -688,6 +688,8 @@ struct StageEvents {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RvcCudaGraphStats {
+    #[serde(default)]
+    pub mode: GraphReplayMode,
     pub enabled: bool,
     /// Opt-in two-stream HuBERT/RMVPE execution. It is reported so benchmark
     /// JSON cannot be mistaken for the serial graph path.
@@ -736,6 +738,13 @@ pub struct RvcCudaGraphStats {
 struct ExternalGraphEntry {
     key: PipelineShapeKey,
     exec: CudaGraphExec,
+    last_used: u64,
+}
+
+struct HybridGraphEntry {
+    key: PipelineShapeKey,
+    acoustic: Option<CudaGraphExec>,
+    decode: Option<CudaGraphExec>,
     last_used: u64,
 }
 
@@ -794,6 +803,7 @@ pub struct RvcTrtPipeline {
     pitch_frame_shape: Option<(usize, bool, usize)>,
     shape_key: Option<PipelineShapeKey>,
     native_cuda_graphs: bool,
+    graph_mode: GraphReplayMode,
     native_graph_shape: Option<PipelineShapeKey>,
     native_graph_captures: u64,
     native_graph_replays: u64,
@@ -809,6 +819,11 @@ pub struct RvcTrtPipeline {
     graph_cache_hits: u64,
     graph_cache_misses: u64,
     graph_evictions: u64,
+    hybrid_cuda_graphs: bool,
+    hybrid_graph_capability_checked: bool,
+    hybrid_acoustic_capturable: bool,
+    hybrid_decode_capturable: bool,
+    hybrid_graph_cache: Vec<HybridGraphEntry>,
 }
 
 impl RvcTrtPipeline {
@@ -909,12 +924,12 @@ impl RvcTrtPipeline {
         let synth_runtime = Runtime::shared(&artifacts.synth_plan)
             .map_err(|error| error.with_stage("load.synth"))?;
         let p = &artifacts.profile;
+        let graph_mode = runtime_config.resolved_graph_mode();
         // TensorRT-RTX's whole-graph strategy performs capture after JIT
         // specialization and owns replay inside enqueueV3. It must be chosen
         // while creating each execution context; changing it after the first
         // enqueue is not supported by the SDK.
-        let graph_requested = runtime_config.cuda_graph;
-        let native_cuda_graphs = graph_requested && runtime_config.native_cuda_graph;
+        let native_cuda_graphs = graph_mode == GraphReplayMode::NativeSubgraphs;
         let hubert = OwnedContext::create_with_cuda_graphs(hubert_runtime, native_cuda_graphs)?;
         let rmvpe_realtime =
             OwnedContext::create_with_cuda_graphs(rmvpe_realtime_runtime, native_cuda_graphs)?;
@@ -930,7 +945,8 @@ impl RvcTrtPipeline {
         // deliberately restricted to TensorRT-RTX's native graph strategy;
         // a host-side CUDA stream capture cannot contain the synchronization
         // between the two acoustic streams.
-        let external_cuda_graphs = graph_requested && !native_cuda_graphs;
+        let external_cuda_graphs = graph_mode == GraphReplayMode::WholePipeline;
+        let hybrid_cuda_graphs = graph_mode == GraphReplayMode::HybridSubgraphs;
         let parallel_acoustic =
             native_cuda_graphs && !external_cuda_graphs && runtime_config.parallel_acoustic;
         let rmvpe_external_stft = artifacts.rmvpe_external_stft;
@@ -1033,6 +1049,7 @@ impl RvcTrtPipeline {
             pitch_frame_shape: None,
             shape_key: None,
             native_cuda_graphs,
+            graph_mode,
             native_graph_shape: None,
             native_graph_captures: 0,
             native_graph_replays: 0,
@@ -1048,6 +1065,11 @@ impl RvcTrtPipeline {
             graph_cache_hits: 0,
             graph_cache_misses: 0,
             graph_evictions: 0,
+            hybrid_cuda_graphs,
+            hybrid_graph_capability_checked: false,
+            hybrid_acoustic_capturable: false,
+            hybrid_decode_capturable: false,
+            hybrid_graph_cache: Vec::with_capacity(graph_cache_capacity),
         };
         pipeline.seed_static_inputs(latent, up)?;
         pipeline.threshold.upload_f32(&[0.03_f32])?;
@@ -1085,31 +1107,39 @@ impl RvcTrtPipeline {
     /// setting invalidates the current executable and leaves the TensorRT
     /// eager path available for the next call.
     pub fn enable_cuda_graphs(&mut self, enabled: bool) {
-        if self.cuda_graphs != enabled {
+        let external_enabled = enabled && self.graph_mode == GraphReplayMode::WholePipeline;
+        let hybrid_enabled = enabled && self.graph_mode == GraphReplayMode::HybridSubgraphs;
+        if self.cuda_graphs != external_enabled || self.hybrid_cuda_graphs != hybrid_enabled {
             self.external_graph_cache.clear();
+            self.hybrid_graph_cache.clear();
             self.graph_invalidations = self.graph_invalidations.saturating_add(1);
             self.external_graph_capability_checked = false;
+            self.hybrid_graph_capability_checked = false;
+            self.hybrid_acoustic_capturable = false;
+            self.hybrid_decode_capturable = false;
         }
         // Native TensorRT graph mode is selected at context creation and is
-        // intentionally immutable. This setter controls only the explicit
-        // application-level fallback; callers can disable both paths before
-        // loading through `PipelineRuntimeConfig::cuda_graph`.
-        self.cuda_graphs = enabled && !self.native_cuda_graphs;
+        // intentionally immutable. This setter controls only application-level
+        // whole/hybrid replay; callers choose the mode before loading through
+        // `PipelineRuntimeConfig::graph_mode`.
+        self.cuda_graphs = external_enabled;
+        self.hybrid_cuda_graphs = hybrid_enabled;
     }
 
     pub fn cuda_graph_stats(&self) -> RvcCudaGraphStats {
         RvcCudaGraphStats {
-            enabled: self.native_cuda_graphs || self.cuda_graphs,
+            mode: self.graph_mode,
+            enabled: self.native_cuda_graphs || self.cuda_graphs || self.hybrid_cuda_graphs,
             parallel_acoustic: self.parallel_acoustic,
             native_strategy: self.native_cuda_graphs,
-            external_strategy: self.cuda_graphs,
+            external_strategy: self.cuda_graphs || self.hybrid_cuda_graphs,
             native_captures: self.native_graph_captures,
             native_replays: self.native_graph_replays,
             native_invalidations: self.native_graph_invalidations,
             captures: self.graph_captures,
             replays: self.graph_replays,
             invalidations: self.graph_invalidations,
-            graph_cache_entries: self.external_graph_cache.len(),
+            graph_cache_entries: self.external_graph_cache.len() + self.hybrid_graph_cache.len(),
             graph_cache_capacity: self.external_graph_cache_capacity,
             graph_cache_hits: self.graph_cache_hits,
             graph_cache_misses: self.graph_cache_misses,
@@ -1129,7 +1159,11 @@ impl RvcTrtPipeline {
         self.native_graph_shape = None;
         self.native_graph_invalidations = self.native_graph_invalidations.saturating_add(1);
         self.external_graph_cache.clear();
+        self.hybrid_graph_cache.clear();
         self.external_graph_capability_checked = false;
+        self.hybrid_graph_capability_checked = false;
+        self.hybrid_acoustic_capturable = false;
+        self.hybrid_decode_capturable = false;
         self.graph_invalidations = self.graph_invalidations.saturating_add(1);
         Ok(())
     }
@@ -1182,6 +1216,24 @@ impl RvcTrtPipeline {
                 rmvpe_waveform,
             );
         }
+        self.enqueue_acoustic_sequence(
+            streaming_f0,
+            pitch_frames,
+            advance_frames,
+            rmvpe_samples,
+            rmvpe_waveform,
+        )?;
+        self.enqueue_decode_sequence()
+    }
+
+    fn enqueue_acoustic_sequence(
+        &mut self,
+        streaming_f0: bool,
+        pitch_frames: usize,
+        advance_frames: usize,
+        rmvpe_samples: usize,
+        rmvpe_waveform: *const std::ffi::c_void,
+    ) -> Result<(), NativeBuildError> {
         let trace = self.diagnostics.trace;
         self.stage_events.hubert_start.record(&self.stream)?;
         if trace {
@@ -1255,6 +1307,11 @@ impl RvcTrtPipeline {
                 &self.stream,
             )?;
         }
+        Ok(())
+    }
+
+    fn enqueue_decode_sequence(&mut self) -> Result<(), NativeBuildError> {
+        let trace = self.diagnostics.trace;
         self.stage_events.frontend_start.record(&self.stream)?;
         if trace {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue frontend");
@@ -1387,6 +1444,127 @@ impl RvcTrtPipeline {
         self.synth.enqueue_named(&self.stream, Some("rvc.synth"))?;
         self.stage_events.synth_end.record(&self.stream)?;
         Ok(())
+    }
+
+    /// Capture one serial sequence and return its executable when supported.
+    /// Capture itself does not execute device work. The RAII guard aborts an
+    /// unfinished capture, leaving the stream safe for an eager fallback.
+    fn capture_sequence<F>(&mut self, enqueue: F) -> Result<Option<CudaGraphExec>, NativeBuildError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), NativeBuildError>,
+    {
+        let capture = match self.stream.begin_capture() {
+            Ok(capture) => capture,
+            Err(_) => return Ok(None),
+        };
+        match enqueue(self) {
+            Ok(()) => match capture.finish() {
+                Ok(graph) => Ok(Some(graph)),
+                Err(_) => Ok(None),
+            },
+            Err(_) => {
+                // The RAII guard aborts the active capture. No device work has
+                // executed, so the caller can safely enqueue the same sequence
+                // eagerly or capture the other hybrid subgraph.
+                drop(capture);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Capture and launch the two serial hybrid subgraphs. A failed optional
+    /// capture leaves the other subgraph available, so HybridSubgraphs can
+    /// still replay one graph and enqueue the other eagerly.
+    fn capture_hybrid_graph(
+        &mut self,
+        graph_key: PipelineShapeKey,
+        acoustic_capturable: bool,
+        decode_capturable: bool,
+        streaming_f0: bool,
+        pitch_frames: usize,
+        advance_frames: usize,
+        rmvpe_samples: usize,
+        rmvpe_waveform: *const std::ffi::c_void,
+    ) -> Result<bool, NativeBuildError> {
+        let acoustic = if acoustic_capturable {
+            self.capture_sequence(|pipeline| {
+                pipeline.enqueue_acoustic_sequence(
+                    streaming_f0,
+                    pitch_frames,
+                    advance_frames,
+                    rmvpe_samples,
+                    rmvpe_waveform,
+                )
+            })?
+        } else {
+            None
+        };
+        let decode = if decode_capturable {
+            self.capture_sequence(|pipeline| pipeline.enqueue_decode_sequence())?
+        } else {
+            None
+        };
+        if acoustic.is_none() && decode.is_none() {
+            return Ok(false);
+        }
+        let captured_count = u64::from(acoustic.is_some()) + u64::from(decode.is_some());
+
+        if self.hybrid_graph_cache.len() >= self.external_graph_cache_capacity {
+            let oldest = self
+                .hybrid_graph_cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .expect("non-empty hybrid graph cache at capacity");
+            self.hybrid_graph_cache.remove(oldest);
+            self.graph_evictions = self.graph_evictions.saturating_add(1);
+        }
+        self.hybrid_graph_cache.push(HybridGraphEntry {
+            key: graph_key,
+            acoustic,
+            decode,
+            last_used: self.external_graph_tick,
+        });
+        self.graph_captures = self.graph_captures.saturating_add(captured_count);
+        let acoustic_cached = self
+            .hybrid_graph_cache
+            .last()
+            .and_then(|entry| entry.acoustic.as_ref())
+            .is_some();
+        if acoustic_cached {
+            self.hybrid_graph_cache
+                .last()
+                .and_then(|entry| entry.acoustic.as_ref())
+                .expect("hybrid acoustic graph is present")
+                .launch(&self.stream)?;
+        } else {
+            self.enqueue_acoustic_sequence(
+                streaming_f0,
+                pitch_frames,
+                advance_frames,
+                rmvpe_samples,
+                rmvpe_waveform,
+            )?;
+        }
+        let decode_cached = self
+            .hybrid_graph_cache
+            .last()
+            .and_then(|entry| entry.decode.as_ref())
+            .is_some();
+        if decode_cached {
+            self.hybrid_graph_cache
+                .last()
+                .and_then(|entry| entry.decode.as_ref())
+                .expect("hybrid decode graph is present")
+                .launch(&self.stream)?;
+        } else {
+            self.enqueue_decode_sequence()?;
+        }
+        self.graph_replays = self
+            .graph_replays
+            .saturating_add(u64::from(acoustic_cached) + u64::from(decode_cached));
+        Ok(true)
     }
 
     fn process_inner(
@@ -1659,38 +1837,73 @@ impl RvcTrtPipeline {
             f0_advance_frames: advance_frames,
             streaming_f0,
         };
-        if self.cuda_graphs && !self.external_graph_capability_checked {
+        if (self.cuda_graphs && !self.external_graph_capability_checked)
+            || (self.hybrid_cuda_graphs && !self.hybrid_graph_capability_checked)
+        {
             // TensorRT may reject external capture for Myelin kernels,
-            // blocking allocation, or data-dependent control flow. Query all
-            // stages after dynamic shapes are concrete and disable only the
-            // optional fallback when any stage reports false.
-            let capability = self
-                .hubert
-                .is_stream_capturable(&self.stream)
-                .and_then(|hubert| {
+            // blocking allocation, or data-dependent control flow. Query
+            // after dynamic shapes are concrete. Hybrid mode keeps acoustic
+            // and decode capability independent so one unsupported subgraph
+            // can remain eager while the other still replays.
+            if self.cuda_graphs {
+                let capability = self
+                    .hubert
+                    .is_stream_capturable(&self.stream)
+                    .and_then(|hubert| {
+                        self.rmvpe_realtime
+                            .is_stream_capturable(&self.stream)
+                            .and_then(|realtime| {
+                                self.rmvpe_full
+                                    .is_stream_capturable(&self.stream)
+                                    .map(|full| hubert && realtime && full)
+                            })
+                    })
+                    .and_then(|both| {
+                        self.frontend
+                            .is_stream_capturable(&self.stream)
+                            .map(|frontend| both && frontend)
+                    })
+                    .and_then(|both| {
+                        self.synth
+                            .is_stream_capturable(&self.stream)
+                            .map(|synth| both && synth)
+                    })
+                    .unwrap_or(false);
+                self.external_graph_capability_checked = true;
+                if !capability {
+                    self.cuda_graphs = false;
+                    self.graph_invalidations = self.graph_invalidations.saturating_add(1);
+                }
+            }
+            if self.hybrid_cuda_graphs {
+                let hubert = self
+                    .hubert
+                    .is_stream_capturable(&self.stream)
+                    .unwrap_or(false);
+                let rmvpe = if streaming_f0 {
                     self.rmvpe_realtime
                         .is_stream_capturable(&self.stream)
-                        .and_then(|realtime| {
-                            self.rmvpe_full
-                                .is_stream_capturable(&self.stream)
-                                .map(|full| hubert && realtime && full)
-                        })
-                })
-                .and_then(|both| {
-                    self.frontend
+                        .unwrap_or(false)
+                } else {
+                    self.rmvpe_full
                         .is_stream_capturable(&self.stream)
-                        .map(|frontend| both && frontend)
-                })
-                .and_then(|both| {
-                    self.synth
-                        .is_stream_capturable(&self.stream)
-                        .map(|synth| both && synth)
-                })
-                .unwrap_or(false);
-            self.external_graph_capability_checked = true;
-            if !capability {
-                self.cuda_graphs = false;
-                self.graph_invalidations = self.graph_invalidations.saturating_add(1);
+                        .unwrap_or(false)
+                };
+                let frontend = self
+                    .frontend
+                    .is_stream_capturable(&self.stream)
+                    .unwrap_or(false);
+                let synth = self
+                    .synth
+                    .is_stream_capturable(&self.stream)
+                    .unwrap_or(false);
+                self.hybrid_graph_capability_checked = true;
+                self.hybrid_acoustic_capturable = hubert && rmvpe;
+                self.hybrid_decode_capturable = frontend && synth;
+                if !self.hybrid_acoustic_capturable && !self.hybrid_decode_capturable {
+                    self.hybrid_cuda_graphs = false;
+                    self.graph_invalidations = self.graph_invalidations.saturating_add(1);
+                }
             }
         }
         if self.native_cuda_graphs {
@@ -1707,8 +1920,9 @@ impl RvcTrtPipeline {
         }
         if trace {
             tracing::trace!(target: "vocal_tensorrt",
-                "trt trace: enqueue sequence native={} external={}",
-                self.native_cuda_graphs, self.cuda_graphs
+                "trt trace: enqueue sequence mode={} native={} whole={} hybrid={}",
+                self.graph_mode.as_str(), self.native_cuda_graphs, self.cuda_graphs,
+                self.hybrid_cuda_graphs
             );
         }
         // The external graph path uses a bounded LRU. A graph contains only
@@ -1732,6 +1946,49 @@ impl RvcTrtPipeline {
                 self.graph_cache_misses = self.graph_cache_misses.saturating_add(1);
                 false
             }
+        } else if self.hybrid_cuda_graphs {
+            self.external_graph_tick = self.external_graph_tick.wrapping_add(1);
+            if let Some(index) = self
+                .hybrid_graph_cache
+                .iter()
+                .position(|entry| entry.key == graph_key)
+            {
+                let acoustic_cached = self.hybrid_graph_cache[index].acoustic.is_some();
+                if acoustic_cached {
+                    self.hybrid_graph_cache[index]
+                        .acoustic
+                        .as_ref()
+                        .expect("hybrid acoustic graph is present")
+                        .launch(&self.stream)?;
+                } else {
+                    self.enqueue_acoustic_sequence(
+                        streaming_f0,
+                        pitch_frames,
+                        advance_frames,
+                        rmvpe_samples,
+                        rmvpe_waveform,
+                    )?;
+                }
+                let decode_cached = self.hybrid_graph_cache[index].decode.is_some();
+                if decode_cached {
+                    self.hybrid_graph_cache[index]
+                        .decode
+                        .as_ref()
+                        .expect("hybrid decode graph is present")
+                        .launch(&self.stream)?;
+                } else {
+                    self.enqueue_decode_sequence()?;
+                }
+                self.hybrid_graph_cache[index].last_used = self.external_graph_tick;
+                self.graph_cache_hits = self.graph_cache_hits.saturating_add(1);
+                self.graph_replays = self
+                    .graph_replays
+                    .saturating_add(u64::from(acoustic_cached) + u64::from(decode_cached));
+                true
+            } else {
+                self.graph_cache_misses = self.graph_cache_misses.saturating_add(1);
+                false
+            }
         } else {
             false
         };
@@ -1741,6 +1998,7 @@ impl RvcTrtPipeline {
                     Ok(capture) => Some(capture),
                     Err(_) => {
                         self.cuda_graphs = false;
+                        self.graph_invalidations = self.graph_invalidations.saturating_add(1);
                         None
                     }
                 }
@@ -1775,6 +2033,12 @@ impl RvcTrtPipeline {
                                 last_used: self.external_graph_tick,
                             });
                             self.graph_captures = self.graph_captures.saturating_add(1);
+                            self.external_graph_cache
+                                .last()
+                                .expect("graph cache insertion succeeded")
+                                .exec
+                                .launch(&self.stream)?;
+                            self.graph_replays = self.graph_replays.saturating_add(1);
                         }
                         Err(_) => {
                             self.cuda_graphs = false;
@@ -1805,6 +2069,30 @@ impl RvcTrtPipeline {
                             rmvpe_waveform,
                         )?;
                     }
+                }
+            } else if self.hybrid_cuda_graphs {
+                let acoustic_capturable = self.hybrid_acoustic_capturable;
+                let decode_capturable = self.hybrid_decode_capturable;
+                let captured = self.capture_hybrid_graph(
+                    graph_key,
+                    acoustic_capturable,
+                    decode_capturable,
+                    streaming_f0,
+                    pitch_frames,
+                    advance_frames,
+                    rmvpe_samples,
+                    rmvpe_waveform,
+                )?;
+                if !captured {
+                    self.hybrid_cuda_graphs = false;
+                    self.graph_invalidations = self.graph_invalidations.saturating_add(1);
+                    self.enqueue_stage_sequence(
+                        streaming_f0,
+                        pitch_frames,
+                        advance_frames,
+                        rmvpe_samples,
+                        rmvpe_waveform,
+                    )?;
                 }
             } else {
                 self.enqueue_stage_sequence(
@@ -2049,7 +2337,9 @@ fn pitch_frames_for_samples(samples: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{RvcRealtimeConfig, RvcTrtProfile, frame_shape};
+    use super::{
+        GraphReplayMode, RvcCudaGraphStats, RvcRealtimeConfig, RvcTrtProfile, frame_shape,
+    };
 
     #[test]
     fn reference_profile_matches_real_application_windows() {
@@ -2125,6 +2415,23 @@ mod tests {
             35_520
         );
         assert_eq!(RvcRealtimeConfig::applio(), RvcRealtimeConfig::rvc_webui());
+    }
+
+    #[test]
+    fn graph_stats_keep_mode_in_json_reports() {
+        let stats = RvcCudaGraphStats {
+            mode: GraphReplayMode::HybridSubgraphs,
+            enabled: true,
+            captures: 2,
+            replays: 4,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(stats).expect("stats serialize");
+        assert_eq!(encoded["mode"], "hybrid_subgraphs");
+        assert_eq!(encoded["captures"], 2);
+        let decoded: RvcCudaGraphStats = serde_json::from_value(encoded).expect("stats decode");
+        assert_eq!(decoded.mode, GraphReplayMode::HybridSubgraphs);
+        assert_eq!(decoded.replays, 4);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use cli_state::CliStatus;
 
 fn usage() {
     eprintln!(
-        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
+        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
     );
     eprintln!("  model benchmark-trt <output.plan> <input.vin> <output.bin> [iterations]");
 }
@@ -136,6 +136,21 @@ fn run(args: Vec<String>) -> CliResult<()> {
             if command == "model" && subcommand == "profile-trt-pipeline" =>
         {
             test_trt_pipeline(artifacts.into(), cache.into(), input.into(), true)
+        }
+        [command, subcommand, artifacts, cache, input]
+            if command == "model" && subcommand == "compare-trt-pipeline" =>
+        {
+            compare_trt_pipeline(artifacts.into(), cache.into(), input.into(), None)
+        }
+        [command, subcommand, artifacts, cache, input, iterations]
+            if command == "model" && subcommand == "compare-trt-pipeline" =>
+        {
+            compare_trt_pipeline(
+                artifacts.into(),
+                cache.into(),
+                input.into(),
+                Some(iterations.parse()?),
+            )
         }
         [command, subcommand, plan] if command == "model" && subcommand == "test-trt" => {
             test_trt(plan.into(), None)
@@ -328,12 +343,172 @@ fn test_trt_pipeline(
     Ok(())
 }
 
+#[cfg(feature = "tensorrt-rtx")]
+fn compare_trt_pipeline(
+    artifacts_path: PathBuf,
+    cache: PathBuf,
+    input: PathBuf,
+    requested_iterations: Option<usize>,
+) -> CliResult<()> {
+    let artifacts: vocal_tensorrt::RvcTrtPipelineArtifacts =
+        serde_json::from_slice(&fs::read(&artifacts_path)?)?;
+    let package = load_cache(cache)?;
+    let synth_config = package
+        .rvc_synth_config()?
+        .ok_or("cache has no rvc_synth config")?;
+    let samples = read_f32_audio(&input)?;
+    let base_config = vocal_tensorrt::TensorRtConfig::from_env()?;
+    let warmups = base_config.run.warmup.max(3);
+    let iterations = requested_iterations
+        .unwrap_or(base_config.run.iterations.max(20))
+        .max(1);
+    let realtime_f0 = base_config.run.realtime_f0;
+    let realtime_advance = base_config
+        .run
+        .realtime_advance_frames
+        .unwrap_or((samples.len() / 160).min(25).max(1));
+    let modes = [
+        vocal_tensorrt::GraphReplayMode::NativeSubgraphs,
+        vocal_tensorrt::GraphReplayMode::WholePipeline,
+        vocal_tensorrt::GraphReplayMode::HybridSubgraphs,
+    ];
+    let mut baseline_audio: Option<Vec<f32>> = None;
+    let mut reports = Vec::with_capacity(modes.len());
+
+    for mode in modes {
+        let mut config = base_config.clone();
+        config.runtime.graph_mode = mode;
+        // Keep the legacy fields explicit so this command also exercises the
+        // compatibility resolver used by older embedding callers.
+        config.runtime.cuda_graph = true;
+        config.runtime.native_cuda_graph = mode == vocal_tensorrt::GraphReplayMode::NativeSubgraphs;
+        config.diagnostics.debug_intermediates = false;
+        config.diagnostics.layer_profile = false;
+        let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config(
+            &artifacts,
+            synth_config.clone(),
+            config.runtime,
+            config.diagnostics,
+        )?;
+        let run_once = |pipeline: &mut vocal_tensorrt::RvcTrtPipeline| {
+            if realtime_f0 {
+                pipeline.process_realtime(&samples, 0, realtime_advance)
+            } else {
+                pipeline.process(&samples, 0)
+            }
+        };
+        for _ in 0..warmups {
+            let _ = run_once(&mut pipeline)?;
+        }
+        let mut outputs = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            outputs.push(run_once(&mut pipeline)?);
+        }
+        let result = outputs.pop().ok_or("graph comparison produced no result")?;
+        let audio = result.audio.clone();
+        let delta = baseline_audio
+            .as_deref()
+            .map(|reference| audio_delta(reference, &audio))
+            .unwrap_or(serde_json::Value::Null);
+        if baseline_audio.is_none() {
+            baseline_audio = Some(audio.clone());
+        }
+        let mean = |select: fn(&vocal_tensorrt::RvcTrtOutput) -> f64| {
+            outputs
+                .iter()
+                .map(select)
+                .chain(std::iter::once(select(&result)))
+                .sum::<f64>()
+                / iterations as f64
+        };
+        reports.push(serde_json::json!({
+            "mode": mode,
+            "iterations": iterations,
+            "warmups": warmups,
+            "mean_total_ms": mean(|r| r.timings.total_ms),
+            "mean_stage_ms": {
+                "upload": mean(|r| r.timings.upload_ms),
+                "hubert": mean(|r| r.timings.hubert_enqueue_ms),
+                "rmvpe": mean(|r| r.timings.rmvpe_enqueue_ms),
+                "frontend": mean(|r| r.timings.frontend_enqueue_ms),
+                "synth": mean(|r| r.timings.synth_enqueue_ms),
+            },
+            "output_samples": audio.len(),
+            "output_delta_vs_native": delta,
+            "cuda_graph": pipeline.cuda_graph_stats(),
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "input_samples": samples.len(),
+            "realtime_f0": realtime_f0,
+            "realtime_advance_frames": realtime_advance,
+            "comparison": reports,
+        })
+    );
+    Ok(())
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn audio_delta(reference: &[f32], candidate: &[f32]) -> serde_json::Value {
+    let count = reference.len().min(candidate.len());
+    if count == 0 {
+        return serde_json::json!({
+            "reference_samples": reference.len(),
+            "candidate_samples": candidate.len(),
+            "max_abs": null,
+            "rmse": null,
+            "cosine": null,
+        });
+    }
+    let mut max_abs = 0.0_f64;
+    let mut squared = 0.0_f64;
+    let mut dot = 0.0_f64;
+    let mut reference_norm = 0.0_f64;
+    let mut candidate_norm = 0.0_f64;
+    for (&lhs, &rhs) in reference.iter().zip(candidate).take(count) {
+        let lhs = lhs as f64;
+        let rhs = rhs as f64;
+        let difference = (lhs - rhs).abs();
+        max_abs = max_abs.max(difference);
+        squared += difference * difference;
+        dot += lhs * rhs;
+        reference_norm += lhs * lhs;
+        candidate_norm += rhs * rhs;
+    }
+    let cosine = if reference_norm > 0.0 && candidate_norm > 0.0 {
+        dot / (reference_norm.sqrt() * candidate_norm.sqrt())
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "reference_samples": reference.len(),
+        "candidate_samples": candidate.len(),
+        "compared_samples": count,
+        "max_abs": max_abs,
+        "rmse": (squared / count as f64).sqrt(),
+        "cosine": cosine,
+    })
+}
+
 #[cfg(not(feature = "tensorrt-rtx"))]
 fn test_trt_pipeline(
     _artifacts: PathBuf,
     _cache: PathBuf,
     _input: PathBuf,
     _nsight_profile: bool,
+) -> CliResult<()> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn compare_trt_pipeline(
+    _artifacts: PathBuf,
+    _cache: PathBuf,
+    _input: PathBuf,
+    _iterations: Option<usize>,
 ) -> CliResult<()> {
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }

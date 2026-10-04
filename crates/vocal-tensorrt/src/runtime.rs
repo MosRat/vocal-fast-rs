@@ -18,6 +18,7 @@ impl Runtime {
         Ok(Arc::new(Self::load(path)?))
     }
     pub fn load(path: impl AsRef<Path>) -> Result<Self, NativeBuildError> {
+        ffi::install_log_bridge();
         let bytes = fs::read(path)?;
         let (mut raw, mut error) = (ptr::null_mut(), ptr::null_mut());
         let code = unsafe {

@@ -57,4 +57,11 @@ impl From<vocal_tensorrt::NativeBuildError> for CliError {
     }
 }
 
+#[cfg(feature = "tensorrt-rtx")]
+impl From<vocal_tensorrt::ConfigError> for CliError {
+    fn from(error: vocal_tensorrt::ConfigError) -> Self {
+        Self::External(error.to_string())
+    }
+}
+
 pub type CliResult<T> = Result<T, CliError>;

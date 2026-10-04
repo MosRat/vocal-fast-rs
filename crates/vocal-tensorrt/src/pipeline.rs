@@ -17,7 +17,9 @@ use crate::timing::CudaEvent;
 use crate::{
     CudaBuffer, CudaGraphExec, CudaStream, OwnedContext, PinnedHostRing, Runtime,
     builder::NativeTensorRtBuilder,
+    config::{DiagnosticsConfig, PipelineRuntimeConfig, TensorRtConfig},
     cufft::{CufftFrontend, unique_shapes},
+    error::ConfigError,
     error::NativeBuildError,
     options::{
         DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode, default_tactic_sources,
@@ -240,24 +242,23 @@ impl RvcTrtProfile {
     /// `voice_changer`, `rvc_webui_legacy`, `rvc_webui`, `applio`,
     /// `reference` (the default), and `legacy` (the old synthetic range).
     pub fn from_env() -> Self {
-        Self::from_name(
-            std::env::var("VOCAL_TRT_PROFILE")
-                .ok()
-                .as_deref()
-                .unwrap_or("reference"),
-        )
+        crate::config::TensorRtConfig::from_env()
+            .map(|config| config.profile)
+            .unwrap_or_else(|_| Self::reference())
     }
 
-    fn from_name(value: &str) -> Self {
-        if value.eq_ignore_ascii_case("legacy") {
-            Self::legacy()
+    pub fn from_name(value: &str) -> Result<Self, ConfigError> {
+        if value.eq_ignore_ascii_case("reference") {
+            Ok(Self::reference())
+        } else if value.eq_ignore_ascii_case("legacy") {
+            Ok(Self::legacy())
         } else if value.eq_ignore_ascii_case("voice_changer")
             || value.eq_ignore_ascii_case("voice-changer")
             || value.eq_ignore_ascii_case("vc")
         {
-            Self::voice_changer()
+            Ok(Self::voice_changer())
         } else if value.eq_ignore_ascii_case("rvc_webui_legacy") {
-            Self::rvc_webui_legacy()
+            Ok(Self::rvc_webui_legacy())
         } else if value.eq_ignore_ascii_case("rvc_webui")
             || value.eq_ignore_ascii_case("rvc_webui_current")
             || value.eq_ignore_ascii_case("webui")
@@ -266,11 +267,11 @@ impl RvcTrtProfile {
             || value.eq_ignore_ascii_case("realtime_44960")
             || value.eq_ignore_ascii_case("fixed_44960")
         {
-            Self::realtime_44960()
+            Ok(Self::realtime_44960())
         } else if value.eq_ignore_ascii_case("applio") {
-            Self::applio()
+            Ok(Self::applio())
         } else {
-            Self::reference()
+            Err(ConfigError::InvalidProfile(value.to_owned()))
         }
     }
 
@@ -404,6 +405,31 @@ pub struct RvcTrtPipelineArtifacts {
 }
 
 impl RvcTrtPipelineArtifacts {
+    /// Compile all four plans using one semantic configuration object.
+    pub fn compile_with_config(
+        config: &TensorRtConfig,
+        package: &ModelPackage,
+        hubert_onnx: impl AsRef<Path>,
+        rmvpe_onnx: impl AsRef<Path>,
+        output_dir: impl AsRef<Path>,
+    ) -> Result<Self, NativeBuildError> {
+        let mut build = config.build.clone();
+        // Diagnostics are a separate public group, but these three switches
+        // are materialized in the native plan and therefore need to reach the
+        // builder when a Rust caller sets them directly.
+        build.debug_outputs |= config.diagnostics.debug_graph_outputs;
+        build.rmvpe_debug_outputs |= config.diagnostics.rmvpe_debug_outputs;
+        build.log_build_options |= config.diagnostics.log_build_options;
+        Self::compile(
+            build,
+            package,
+            hubert_onnx,
+            rmvpe_onnx,
+            output_dir,
+            config.profile.clone(),
+        )
+    }
+
     pub fn compile(
         builder_options: NativeBuildOptions,
         package: &ModelPackage,
@@ -419,7 +445,7 @@ impl RvcTrtPipelineArtifacts {
                        options: NativeBuildOptions|
          -> Result<PathBuf, NativeBuildError> {
             let builder = NativeTensorRtBuilder::new(options);
-            match name {
+            let result = match name {
                 "hubert" if hubert_onnx.as_ref().extension().is_some_and(|x| x == "vfr") => {
                     let package = vocal_model::load_cache(hubert_onnx.as_ref())
                         .map_err(|e| NativeBuildError::Api(e.to_string()))?;
@@ -448,7 +474,15 @@ impl RvcTrtPipelineArtifacts {
                 _ => Err(NativeBuildError::Argument(
                     "unknown RVC TensorRT graph".into(),
                 )),
-            }
+            };
+            let stage = match name {
+                "hubert" => "build.hubert",
+                "rmvpe" => "build.rmvpe",
+                "frontend" => "build.frontend",
+                "synth" => "build.synth",
+                _ => "build.unknown",
+            };
+            result.map_err(|error| error.with_stage(stage))
         };
         let precision = builder_options.precision;
         let hubert_precision = builder_options.hubert_precision;
@@ -694,6 +728,8 @@ pub struct RvcTrtPipeline {
     acoustic_hubert_stream: CudaStream,
     acoustic_rmvpe_stream: CudaStream,
     parallel_acoustic: bool,
+    runtime_config: PipelineRuntimeConfig,
+    diagnostics: DiagnosticsConfig,
     rmvpe_external_stft: bool,
     cufft_frontends: Vec<(usize, CufftFrontend)>,
     stage_events: StageEvents,
@@ -769,9 +805,52 @@ impl RvcTrtPipeline {
         ])
     }
 
+    /// Load using the complete semantic configuration. This is the preferred
+    /// embedding API because build, runtime, and diagnostics choices stay
+    /// together at the call site.
+    pub fn load_with_config(
+        artifacts: &RvcTrtPipelineArtifacts,
+        model_config: RvcSynthConfig,
+        config: &TensorRtConfig,
+    ) -> Result<Self, NativeBuildError> {
+        Self::load_with_runtime_config(
+            artifacts,
+            model_config,
+            config.runtime.clone(),
+            config.diagnostics.clone(),
+        )
+    }
+
+    /// Compatibility environment adapter for applications that have not yet
+    /// migrated to [`TensorRtConfig`].
+    pub fn load_from_env(
+        artifacts: &RvcTrtPipelineArtifacts,
+        model_config: RvcSynthConfig,
+    ) -> Result<Self, NativeBuildError> {
+        let config = TensorRtConfig::from_env()?;
+        Self::load_with_config(artifacts, model_config, &config)
+    }
+
     pub fn load(
         artifacts: &RvcTrtPipelineArtifacts,
         config: RvcSynthConfig,
+    ) -> Result<Self, NativeBuildError> {
+        Self::load_with_runtime_config(
+            artifacts,
+            config,
+            PipelineRuntimeConfig::default(),
+            DiagnosticsConfig::default(),
+        )
+    }
+
+    /// Load a pipeline with typed runtime and diagnostic policy. Build-time
+    /// options remain recorded in the artifact manifest; these values control
+    /// only execution and host-side observability.
+    pub fn load_with_runtime_config(
+        artifacts: &RvcTrtPipelineArtifacts,
+        config: RvcSynthConfig,
+        runtime_config: PipelineRuntimeConfig,
+        diagnostics: DiagnosticsConfig,
     ) -> Result<Self, NativeBuildError> {
         artifacts.profile.validate()?;
         if config.feature_width != 768 {
@@ -779,7 +858,8 @@ impl RvcTrtPipeline {
                 "waveform HuBERT TensorRT pipeline requires a 768-wide RVC v2 model".into(),
             ));
         }
-        let hubert_runtime = Runtime::shared(&artifacts.hubert_plan)?;
+        let hubert_runtime = Runtime::shared(&artifacts.hubert_plan)
+            .map_err(|error| error.with_stage("load.hubert"))?;
         let rmvpe_realtime_path = artifacts
             .rmvpe_realtime_plan
             .as_ref()
@@ -788,22 +868,21 @@ impl RvcTrtPipeline {
             .rmvpe_full_plan
             .as_ref()
             .unwrap_or(&artifacts.rmvpe_plan);
-        let rmvpe_realtime_runtime = Runtime::shared(rmvpe_realtime_path)?;
-        let rmvpe_full_runtime = Runtime::shared(rmvpe_full_path)?;
-        let frontend_runtime = Runtime::shared(&artifacts.frontend_plan)?;
-        let synth_runtime = Runtime::shared(&artifacts.synth_plan)?;
+        let rmvpe_realtime_runtime = Runtime::shared(rmvpe_realtime_path)
+            .map_err(|error| error.with_stage("load.rmvpe_realtime"))?;
+        let rmvpe_full_runtime = Runtime::shared(rmvpe_full_path)
+            .map_err(|error| error.with_stage("load.rmvpe_full"))?;
+        let frontend_runtime = Runtime::shared(&artifacts.frontend_plan)
+            .map_err(|error| error.with_stage("load.frontend"))?;
+        let synth_runtime = Runtime::shared(&artifacts.synth_plan)
+            .map_err(|error| error.with_stage("load.synth"))?;
         let p = &artifacts.profile;
         // TensorRT-RTX's whole-graph strategy performs capture after JIT
         // specialization and owns replay inside enqueueV3. It must be chosen
         // while creating each execution context; changing it after the first
         // enqueue is not supported by the SDK.
-        let graph_requested = std::env::var("VOCAL_TRT_CUDA_GRAPH")
-            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-        let native_cuda_graphs = graph_requested
-            && std::env::var("VOCAL_TRT_NATIVE_CUDA_GRAPH")
-                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-                .unwrap_or(true);
+        let graph_requested = runtime_config.cuda_graph;
+        let native_cuda_graphs = graph_requested && runtime_config.native_cuda_graph;
         let hubert = OwnedContext::create_with_cuda_graphs(hubert_runtime, native_cuda_graphs)?;
         let rmvpe_realtime =
             OwnedContext::create_with_cuda_graphs(rmvpe_realtime_runtime, native_cuda_graphs)?;
@@ -820,11 +899,8 @@ impl RvcTrtPipeline {
         // a host-side CUDA stream capture cannot contain the synchronization
         // between the two acoustic streams.
         let external_cuda_graphs = graph_requested && !native_cuda_graphs;
-        let parallel_acoustic = native_cuda_graphs
-            && !external_cuda_graphs
-            && std::env::var("VOCAL_TRT_PARALLEL_ACOUSTIC")
-                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-                .unwrap_or(false);
+        let parallel_acoustic =
+            native_cuda_graphs && !external_cuda_graphs && runtime_config.parallel_acoustic;
         let rmvpe_external_stft = artifacts.rmvpe_external_stft;
         let mut cufft_frontends = Vec::new();
         if rmvpe_external_stft {
@@ -868,10 +944,8 @@ impl RvcTrtPipeline {
         // though public pitch is cropped to 282 frames. Buffers are allocated
         // once so parity diagnostics never introduce an undersized output
         // binding or a per-call device allocation.
-        let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs
-            || std::env::var("VOCAL_TRT_RMVPE_DEBUG_OUTPUTS")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs;
+        let debug_intermediates = diagnostics.debug_intermediates;
         let rmvpe_max_padded_frames = ((p.max_pitch_frames as usize + 31) / 32) * 32;
         let pitch_cache = alloc(RVC_F0_CACHE_FRAMES * 4)?;
         let pitch_cache_scratch = alloc(RVC_F0_CACHE_FRAMES * 4)?;
@@ -889,6 +963,8 @@ impl RvcTrtPipeline {
             acoustic_hubert_stream,
             acoustic_rmvpe_stream,
             parallel_acoustic,
+            runtime_config,
+            diagnostics,
             rmvpe_external_stft,
             cufft_frontends,
             stage_events,
@@ -918,7 +994,7 @@ impl RvcTrtPipeline {
             host_noise: Vec::with_capacity(p.max_rvc_frames as usize * up),
             last_sid: None,
             last_p_len: None,
-            debug_intermediates: false,
+            debug_intermediates,
             rmvpe_debug_outputs,
             hubert_frame_shape: None,
             pitch_frame_shape: None,
@@ -981,7 +1057,7 @@ impl RvcTrtPipeline {
         // Native TensorRT graph mode is selected at context creation and is
         // intentionally immutable. This setter controls only the explicit
         // application-level fallback; callers can disable both paths before
-        // loading by setting VOCAL_TRT_CUDA_GRAPH=0.
+        // loading through `PipelineRuntimeConfig::cuda_graph`.
         self.cuda_graphs = enabled && !self.native_cuda_graphs;
     }
 
@@ -1066,10 +1142,10 @@ impl RvcTrtPipeline {
                 rmvpe_waveform,
             );
         }
-        let trace = std::env::var("VOCAL_TRT_TRACE").ok().as_deref() == Some("1");
+        let trace = self.diagnostics.trace;
         self.stage_events.hubert_start.record(&self.stream)?;
         if trace {
-            eprintln!("trt trace: enqueue hubert");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue hubert");
         }
         self.hubert
             .enqueue_named(&self.stream, Some("rvc.hubert"))?;
@@ -1094,7 +1170,7 @@ impl RvcTrtPipeline {
             )?;
         }
         if trace {
-            eprintln!("trt trace: enqueue rmvpe streaming={streaming_f0}");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue rmvpe streaming={streaming_f0}");
         }
         if streaming_f0 {
             self.rmvpe_realtime
@@ -1105,7 +1181,7 @@ impl RvcTrtPipeline {
         }
         self.stage_events.rmvpe_end.record(&self.stream)?;
         if trace {
-            eprintln!("trt trace: rmvpe enqueued");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: rmvpe enqueued");
         }
         if streaming_f0 {
             let append_frames = pitch_frames
@@ -1141,19 +1217,19 @@ impl RvcTrtPipeline {
         }
         self.stage_events.frontend_start.record(&self.stream)?;
         if trace {
-            eprintln!("trt trace: enqueue frontend");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue frontend");
         }
         self.frontend
             .enqueue_named(&self.stream, Some("rvc.frontend"))?;
         self.stage_events.frontend_end.record(&self.stream)?;
         self.stage_events.synth_start.record(&self.stream)?;
         if trace {
-            eprintln!("trt trace: enqueue synth");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue synth");
         }
         self.synth.enqueue_named(&self.stream, Some("rvc.synth"))?;
         self.stage_events.synth_end.record(&self.stream)?;
         if trace {
-            eprintln!("trt trace: all enqueued");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: all enqueued");
         }
         Ok(())
     }
@@ -1171,7 +1247,7 @@ impl RvcTrtPipeline {
         rmvpe_samples: usize,
         rmvpe_waveform: *const std::ffi::c_void,
     ) -> Result<(), NativeBuildError> {
-        let trace = std::env::var("VOCAL_TRT_TRACE").ok().as_deref() == Some("1");
+        let trace = self.diagnostics.trace;
         // The waveform upload is queued on the owner stream.  A host-side
         // synchronization is enough here: it occurs once per callback and
         // avoids introducing a cross-stream event into the native graph path.
@@ -1180,7 +1256,7 @@ impl RvcTrtPipeline {
             .hubert_start
             .record(&self.acoustic_hubert_stream)?;
         if trace {
-            eprintln!("trt trace: enqueue hubert parallel");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue hubert parallel");
         }
         self.hubert
             .enqueue_named(&self.acoustic_hubert_stream, Some("rvc.hubert"))?;
@@ -1210,7 +1286,7 @@ impl RvcTrtPipeline {
             )?;
         }
         if trace {
-            eprintln!("trt trace: enqueue rmvpe parallel streaming={streaming_f0}");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue rmvpe parallel streaming={streaming_f0}");
         }
         if streaming_f0 {
             self.rmvpe_realtime
@@ -1259,14 +1335,14 @@ impl RvcTrtPipeline {
 
         self.stage_events.frontend_start.record(&self.stream)?;
         if trace {
-            eprintln!("trt trace: enqueue frontend after parallel acoustic");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue frontend after parallel acoustic");
         }
         self.frontend
             .enqueue_named(&self.stream, Some("rvc.frontend"))?;
         self.stage_events.frontend_end.record(&self.stream)?;
         self.stage_events.synth_start.record(&self.stream)?;
         if trace {
-            eprintln!("trt trace: enqueue synth after parallel acoustic");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue synth after parallel acoustic");
         }
         self.synth.enqueue_named(&self.stream, Some("rvc.synth"))?;
         self.stage_events.synth_end.record(&self.stream)?;
@@ -1279,7 +1355,7 @@ impl RvcTrtPipeline {
         sid: i32,
         realtime_advance_frames: Option<usize>,
     ) -> Result<RvcTrtOutput, NativeBuildError> {
-        let trace = std::env::var("VOCAL_TRT_TRACE").ok().as_deref() == Some("1");
+        let trace = self.diagnostics.trace;
         let start = Instant::now();
         let p = &self.profile;
         if waveform.len() < p.min_samples as usize || waveform.len() > p.max_samples as usize {
@@ -1293,7 +1369,7 @@ impl RvcTrtPipeline {
         self.waveform_host_ring
             .upload_f32(&self.waveform, waveform, &self.stream)?;
         if trace {
-            eprintln!("trt trace: waveform uploaded samples={}", waveform.len());
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: waveform uploaded samples={}", waveform.len());
         }
         let upload_ms = start.elapsed().as_secs_f64() * 1000.0;
         let streaming_f0 = realtime_advance_frames.is_some() && self.config.uses_f0;
@@ -1344,7 +1420,7 @@ impl RvcTrtPipeline {
             frames
         };
         if trace {
-            eprintln!("trt trace: hubert frames={hubert_frames}");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: hubert frames={hubert_frames}");
         }
 
         let rmvpe = if streaming_f0 {
@@ -1387,7 +1463,7 @@ impl RvcTrtPipeline {
                 self.rmvpe_debug_logits.device_ptr(),
             )?;
             if trace {
-                eprintln!(
+                tracing::trace!(target: "vocal_tensorrt",
                     "trt trace: rmvpe debug shapes mel={:?} bottleneck={:?} unet={:?} gru={:?} logits={:?}",
                     rmvpe.tensor_shape("rmvpe_debug_mel")?,
                     rmvpe.tensor_shape("rmvpe_debug_bottleneck")?,
@@ -1413,7 +1489,7 @@ impl RvcTrtPipeline {
             frames
         };
         if trace {
-            eprintln!("trt trace: rmvpe frames={pitch_frames}");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: rmvpe frames={pitch_frames}");
         }
 
         let p_len_frames = waveform.len() / RVC_HOP_SAMPLES;
@@ -1433,7 +1509,7 @@ impl RvcTrtPipeline {
         // the execution shape and avoids an extra dynamic shape input.
         let frontend_pitch_frames = rvc_frames;
         if trace {
-            eprintln!("trt trace: frontend rvc_frames={rvc_frames}");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: frontend rvc_frames={rvc_frames}");
         }
         let same_shape = self.shape_key.is_some_and(|key| {
             key.samples == waveform.len()
@@ -1452,7 +1528,7 @@ impl RvcTrtPipeline {
                 .set_input_shape("pitchf_in", &[1, frontend_pitch_frames as i64])?;
         }
         if trace {
-            eprintln!("trt trace: frontend input shapes set");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: frontend input shapes set");
         }
         for (name, buffer) in [
             ("hubert_features", &self.hubert_features),
@@ -1465,7 +1541,7 @@ impl RvcTrtPipeline {
                 .set_tensor_address_cached(name, buffer.device_ptr())?;
         }
         if trace {
-            eprintln!("trt trace: frontend addresses set");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: frontend addresses set");
         }
         let pitchf_input = if streaming_f0 {
             self.pitch_cache
@@ -1503,7 +1579,7 @@ impl RvcTrtPipeline {
             }
         }
         if trace {
-            eprintln!("trt trace: synth shapes set");
+            tracing::trace!(target: "vocal_tensorrt", "trt trace: synth shapes set");
         }
         let p_len_value = i32::try_from(p_len_frames)
             .map_err(|_| NativeBuildError::Argument("RVC frame length exceeds i32".into()))?;
@@ -1590,7 +1666,7 @@ impl RvcTrtPipeline {
             }
         }
         if trace {
-            eprintln!(
+            tracing::trace!(target: "vocal_tensorrt",
                 "trt trace: enqueue sequence native={} external={}",
                 self.native_cuda_graphs, self.cuda_graphs
             );
@@ -1683,9 +1759,7 @@ impl RvcTrtPipeline {
             .checked_mul(up)
             .and_then(|samples| samples.checked_mul(4))
             .ok_or_else(|| NativeBuildError::Argument("audio byte length overflow".into()))?;
-        let async_audio_d2h = std::env::var("VOCAL_TRT_ASYNC_AUDIO_D2H")
-            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+        let async_audio_d2h = self.runtime_config.async_audio_d2h;
         let audio_host_slot = if self.debug_intermediates || !async_audio_d2h {
             None
         } else {
@@ -1838,7 +1912,7 @@ impl RvcTrtPipeline {
             || pitchf
                 .as_ref()
                 .is_some_and(|v| v.iter().any(|x| !x.is_finite()));
-        if non_finite && std::env::var("VOCAL_TRT_ALLOW_NONFINITE").ok().as_deref() != Some("1") {
+        if non_finite && !self.diagnostics.allow_nonfinite {
             return Err(NativeBuildError::Api(
                 "TensorRT pipeline produced non-finite output".into(),
             ));
@@ -1990,16 +2064,26 @@ mod tests {
 
     #[test]
     fn env_profile_names_are_explicit() {
-        assert_eq!(RvcTrtProfile::from_name("applio").min_samples, 44_960);
         assert_eq!(
-            RvcTrtProfile::from_name("realtime_44960").max_samples,
+            RvcTrtProfile::from_name("applio").unwrap().min_samples,
             44_960
         );
         assert_eq!(
-            RvcTrtProfile::from_name("voice_changer").min_samples,
+            RvcTrtProfile::from_name("realtime_44960")
+                .unwrap()
+                .max_samples,
+            44_960
+        );
+        assert_eq!(
+            RvcTrtProfile::from_name("voice_changer")
+                .unwrap()
+                .min_samples,
             11_200
         );
-        assert_eq!(RvcTrtProfile::from_name("reference").max_samples, 44_960);
+        assert_eq!(
+            RvcTrtProfile::from_name("reference").unwrap().max_samples,
+            44_960
+        );
     }
 
     #[test]

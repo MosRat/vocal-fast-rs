@@ -2,6 +2,8 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     let r = env::var_os("TENSORRT_RTX_ROOT")
         .or_else(|| env::var_os("TRT_RTX_ROOT"))
+        .or_else(|| env::var_os("TENSORRT_ROOT"))
+        .or_else(|| env::var_os("TRT_ROOT"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(r"C:\Program Files\NVIDIA Corporation\TensorRT-RTX\1.6.1.120")

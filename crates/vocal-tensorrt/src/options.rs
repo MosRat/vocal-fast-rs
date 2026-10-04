@@ -1,7 +1,7 @@
 //! User-facing builder and TensorRT profile options.
 
 use serde::{Deserialize, Serialize};
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 pub const DEFAULT_TRT_ROOT: &str = "C:/Program Files/NVIDIA Corporation/TensorRT-RTX/1.6.1.120";
 
@@ -34,22 +34,12 @@ impl PrecisionMode {
         true
     }
 
-    pub fn from_env() -> Self {
-        Self::from_name(&env::var("VOCAL_TRT_PRECISION").unwrap_or_else(|_| "fp32".into()))
-    }
-
     pub fn from_name(value: &str) -> Self {
         match value.to_ascii_lowercase().as_str() {
             "fp16" | "half" => Self::Fp16,
             "bf16" | "bfloat16" => Self::Bf16,
             _ => Self::Fp32,
         }
-    }
-
-    fn from_env_or(name: &str, fallback: Self) -> Self {
-        env::var(name)
-            .map(|value| Self::from_name(&value))
-            .unwrap_or(fallback)
     }
 }
 
@@ -80,12 +70,8 @@ impl DispatchTune {
         }
     }
 
-    pub fn from_env() -> Self {
-        match env::var("VOCAL_TRT_DISPATCH_TUNE")
-            .unwrap_or_else(|_| "auto".into())
-            .to_ascii_lowercase()
-            .as_str()
-        {
+    pub fn from_name(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
             "11200" | "realtime_11200" | "voice_changer" => Self::Realtime11200,
             "44960" | "realtime_44960" | "rvc_webui" | "applio" => Self::Realtime44960,
             _ => Self::Auto,
@@ -97,6 +83,9 @@ impl DispatchTune {
 pub struct NativeBuildOptions {
     pub sdk_root: PathBuf,
     pub output: PathBuf,
+    /// Optional TensorRT timing-cache file used by native VFRM builds.
+    #[serde(default)]
+    pub timing_cache: Option<PathBuf>,
     pub workspace_bytes: u64,
     pub fp16: bool,
     #[serde(default)]
@@ -209,6 +198,9 @@ pub struct NativeBuildOptions {
     /// contracts are rejected at build time.
     #[serde(default)]
     pub synth_polyphase_upsample: bool,
+    /// Emit one structured build summary through `tracing`.
+    #[serde(default)]
+    pub log_build_options: bool,
     #[serde(default)]
     pub dispatch_tune: DispatchTune,
     /// Bitset of TensorRT tactic sources. Bit 0 enables edge-mask
@@ -229,167 +221,64 @@ pub(crate) fn default_tactic_sources() -> u32 {
 
 impl Default for NativeBuildOptions {
     fn default() -> Self {
-        let precision = PrecisionMode::from_env();
-        // Keep RMVPE conservative by default.  Its U-Net can be lowered to
-        // FP16 independently, but the native full-chain F0 gate must pass
-        // before that is selected for a deployment.  An explicit RMVPE
-        // precision request remains unambiguous and selects both U-Net
-        // regions unless a region override is provided.
-        let rmvpe_precision_env = env::var("VOCAL_TRT_RMVPE_PRECISION").ok();
-        let rmvpe_precision = rmvpe_precision_env
-            .as_deref()
-            .map(PrecisionMode::from_name)
-            .unwrap_or(PrecisionMode::Fp32);
-        let rmvpe_unet_default = rmvpe_precision_env
-            .as_deref()
-            .map(PrecisionMode::from_name)
-            .unwrap_or(PrecisionMode::Fp32);
-        let hubert_precision = PrecisionMode::from_env_or("VOCAL_TRT_HUBERT_PRECISION", precision);
-        let hubert_feature_precision =
-            PrecisionMode::from_env_or("VOCAL_TRT_HUBERT_FEATURE_PRECISION", hubert_precision);
-        let fft_mode = env::var("VOCAL_TRT_RMVPE_FFT")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
         Self {
-            sdk_root: env::var_os("TENSORRT_RTX_ROOT")
-                .or_else(|| env::var_os("TRT_RTX_ROOT"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_TRT_ROOT)),
+            sdk_root: PathBuf::from(DEFAULT_TRT_ROOT),
             output: "rvc.plan".into(),
+            timing_cache: None,
             workspace_bytes: 1 << 30,
             fp16: false,
-            precision,
-            min_frames: env_i32("VOCAL_TRT_MIN_FRAMES", 8),
-            opt_frames: env_i32("VOCAL_TRT_OPT_FRAMES", 192),
-            max_frames: env_i32("VOCAL_TRT_MAX_FRAMES", 2048),
+            precision: PrecisionMode::Fp32,
+            min_frames: 8,
+            opt_frames: 192,
+            max_frames: 2048,
             // Conservative all-reference profile points at 16 kHz.  The
             // pipeline compiler replaces these with the selected
             // RvcTrtProfile; these defaults are for direct ONNX builds.
             min_samples: 11200,
             opt_samples: 35520,
             max_samples: 44960,
-            fused_attention: env::var("VOCAL_TRT_FUSED_ATTENTION")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            debug_outputs: env::var("VOCAL_TRT_DEBUG_GRAPH_OUTPUTS")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            rmvpe_debug_outputs: env::var("VOCAL_TRT_RMVPE_DEBUG_OUTPUTS")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            rmvpe_fft_radix2: matches!(fft_mode.as_str(), "1" | "true" | "radix2"),
-            rmvpe_fft_cufft: matches!(fft_mode.as_str(), "cufft" | "cuda" | "cu_fft"),
-            quantize_weights: env::var("VOCAL_TRT_WEIGHT_INT8")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            fused_qkv: env::var("VOCAL_TRT_FUSED_QKV")
-                .ok()
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
-            fused_rvc_qkv: env::var("VOCAL_TRT_FUSED_RVC_QKV")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            hubert_precision,
-            hubert_feature_precision,
-            rmvpe_precision,
-            rmvpe_encoder_precision: PrecisionMode::from_env_or(
-                "VOCAL_TRT_RMVPE_ENCODER_PRECISION",
-                rmvpe_unet_default,
-            ),
-            rmvpe_decoder_precision: PrecisionMode::from_env_or(
-                "VOCAL_TRT_RMVPE_DECODER_PRECISION",
-                rmvpe_unet_default,
-            ),
+            fused_attention: false,
+            debug_outputs: false,
+            rmvpe_debug_outputs: false,
+            rmvpe_fft_radix2: false,
+            rmvpe_fft_cufft: false,
+            quantize_weights: false,
+            fused_qkv: true,
+            fused_rvc_qkv: false,
+            hubert_precision: PrecisionMode::Fp32,
+            hubert_feature_precision: PrecisionMode::Fp32,
+            rmvpe_precision: PrecisionMode::Fp32,
+            rmvpe_encoder_precision: PrecisionMode::Fp32,
+            rmvpe_decoder_precision: PrecisionMode::Fp32,
             // These regions are intentionally fixed at FP32. Their fields are
             // serialized for an explicit ABI contract, but are not user
             // tunables because F0 decode and recurrent state are sensitive.
             rmvpe_stft_precision: PrecisionMode::Fp32,
             rmvpe_gru_precision: PrecisionMode::Fp32,
             rmvpe_logits_precision: PrecisionMode::Fp32,
-            synth_precision: PrecisionMode::from_env_or(
-                "VOCAL_TRT_SYNTH_PRECISION",
-                PrecisionMode::Fp32,
-            ),
-            synth_resblock_precision: PrecisionMode::from_env_or(
-                "VOCAL_TRT_SYNTH_RESBLOCK_PRECISION",
-                PrecisionMode::Fp32,
-            ),
-            synth_resblock_stage_mask: env::var("VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK")
-                .ok()
-                .and_then(|v| {
-                    let value = v.trim();
-                    if let Some(hex) = value
-                        .strip_prefix("0x")
-                        .or_else(|| value.strip_prefix("0X"))
-                    {
-                        u32::from_str_radix(hex, 16).ok()
-                    } else {
-                        value.parse::<u32>().ok()
-                    }
-                })
-                .unwrap_or(0),
-            synth_resblock_conv1_precision: PrecisionMode::from_env_or(
-                "VOCAL_TRT_SYNTH_RESBLOCK_CONV1_PRECISION",
-                PrecisionMode::Fp32,
-            ),
-            synth_resblock_conv1_stage_mask: stage_mask_from_env(
-                "VOCAL_TRT_SYNTH_RESBLOCK_CONV1_STAGE_MASK",
-            ),
-            synth_resblock_conv2_precision: PrecisionMode::from_env_or(
-                "VOCAL_TRT_SYNTH_RESBLOCK_CONV2_PRECISION",
-                PrecisionMode::Fp32,
-            ),
-            synth_resblock_conv2_stage_mask: stage_mask_from_env(
-                "VOCAL_TRT_SYNTH_RESBLOCK_CONV2_STAGE_MASK",
-            ),
-            synth_fuse_resblock_scale: env::var("VOCAL_TRT_SYNTH_FUSE_RESBLOCK_SCALE")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            synth_polyphase_upsample: env::var("VOCAL_TRT_SYNTH_UPSAMPLE_IMPL")
-                .ok()
-                .is_some_and(|v| v.eq_ignore_ascii_case("polyphase")),
-            dispatch_tune: DispatchTune::from_env(),
-            tactic_sources: env::var("VOCAL_TRT_TACTIC_SOURCES")
-                .ok()
-                .and_then(|value| {
-                    let value = value.trim();
-                    if let Some(hex) = value
-                        .strip_prefix("0x")
-                        .or_else(|| value.strip_prefix("0X"))
-                    {
-                        u32::from_str_radix(hex, 16).ok()
-                    } else {
-                        value.parse::<u32>().ok()
-                    }
-                })
-                .unwrap_or_else(default_tactic_sources),
+            synth_precision: PrecisionMode::Fp32,
+            synth_resblock_precision: PrecisionMode::Fp32,
+            synth_resblock_stage_mask: 0,
+            synth_resblock_conv1_precision: PrecisionMode::Fp32,
+            synth_resblock_conv1_stage_mask: 0,
+            synth_resblock_conv2_precision: PrecisionMode::Fp32,
+            synth_resblock_conv2_stage_mask: 0,
+            synth_fuse_resblock_scale: false,
+            synth_polyphase_upsample: false,
+            log_build_options: false,
+            dispatch_tune: DispatchTune::Auto,
+            tactic_sources: default_tactic_sources(),
         }
     }
 }
 
-fn env_i32(name: &str, fallback: i32) -> i32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(fallback)
-}
-
-fn stage_mask_from_env(name: &str) -> u32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| {
-            let value = value.trim();
-            if let Some(hex) = value
-                .strip_prefix("0x")
-                .or_else(|| value.strip_prefix("0X"))
-            {
-                u32::from_str_radix(hex, 16).ok()
-            } else {
-                value.parse::<u32>().ok()
-            }
-        })
-        .unwrap_or(0)
+impl NativeBuildOptions {
+    /// Strict environment adapter retained for callers that only need a
+    /// builder. Applications that also run a pipeline should prefer the full
+    /// [`crate::TensorRtConfig`] so all groups are parsed together.
+    pub fn from_env() -> Result<Self, crate::ConfigError> {
+        Ok(crate::TensorRtConfig::from_env()?.build)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

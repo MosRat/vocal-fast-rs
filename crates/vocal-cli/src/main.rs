@@ -31,6 +31,7 @@ fn usage() {
 }
 
 fn main() -> ExitCode {
+    cli_logging::init();
     let args: Vec<String> = env::args().skip(1).collect();
     let command = args
         .first()
@@ -181,15 +182,14 @@ fn compile_trt_pipeline(
     output: PathBuf,
 ) -> CliResult<()> {
     let package = load_cache(cache)?;
-    let profile = vocal_tensorrt::RvcTrtProfile::from_env();
-    let options = vocal_tensorrt::NativeBuildOptions::default();
-    let artifacts = vocal_tensorrt::RvcTrtPipelineArtifacts::compile(
-        options,
+    let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
+    let profile = trt_config.profile.clone();
+    let artifacts = vocal_tensorrt::RvcTrtPipelineArtifacts::compile_with_config(
+        &trt_config,
         &package,
         hubert,
         rmvpe,
         &output,
-        profile.clone(),
     )?;
     let manifest = output.join("pipeline.json");
     fs::write(&manifest, serde_json::to_vec_pretty(&artifacts)?)?;
@@ -236,32 +236,41 @@ fn test_trt_pipeline(
         .rvc_synth_config()?
         .ok_or("cache has no rvc_synth config")?;
     let samples = read_f32_audio(&input)?;
-    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load(&artifacts, config)?;
+    let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
+    let runtime_config = trt_config.runtime.clone();
+    let mut diagnostics = trt_config.diagnostics.clone();
+    // Nsight runs intentionally measure the production path without host
+    // debug copies, while retaining the typed runtime graph policy.
+    diagnostics.debug_intermediates &= !nsight_profile;
+    diagnostics.layer_profile &= !nsight_profile;
+    let mut run_config = trt_config.run.clone();
+    if nsight_profile {
+        if run_config.iterations == 1 {
+            run_config.iterations = 100;
+        }
+        if run_config.warmup == 0 {
+            run_config.warmup = 10;
+        }
+    }
+    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config(
+        &artifacts,
+        config,
+        runtime_config.clone(),
+        diagnostics.clone(),
+    )?;
     // Intermediate D2H copies are opt-in for parity diagnostics. Nsight mode
     // keeps all activations device-resident and measures the production path.
-    let debug_intermediates =
-        !nsight_profile && env::var("VOCAL_TRT_DEBUG_INTERMEDIATES").ok().as_deref() == Some("1");
+    let debug_intermediates = diagnostics.debug_intermediates;
     pipeline.enable_debug_intermediates(debug_intermediates);
-    let profile_layers =
-        !nsight_profile && env::var("VOCAL_TRT_LAYER_PROFILE").ok().as_deref() == Some("1");
+    let profile_layers = diagnostics.layer_profile;
     if profile_layers {
         pipeline.enable_layer_profiling(true);
     }
-    let iterations = env::var("VOCAL_TRT_PIPELINE_ITERATIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(if nsight_profile { 100 } else { 1 });
-    let warmups = env::var("VOCAL_TRT_WARMUP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(if nsight_profile { 10 } else { 0 });
-    let realtime_f0 = env::var("VOCAL_TRT_REALTIME_F0")
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    let realtime_advance = env::var("VOCAL_TRT_REALTIME_ADVANCE_FRAMES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+    let iterations = run_config.iterations;
+    let warmups = run_config.warmup;
+    let realtime_f0 = run_config.realtime_f0;
+    let realtime_advance = run_config
+        .realtime_advance_frames
         .unwrap_or((samples.len() / 160).min(25).max(1));
     let run_once = |pipeline: &mut vocal_tensorrt::RvcTrtPipeline|
                    -> Result<vocal_tensorrt::RvcTrtOutput, vocal_tensorrt::NativeBuildError> {
@@ -564,7 +573,7 @@ fn compile_trt(cache: PathBuf, output: PathBuf, onnx: Option<PathBuf>) -> CliRes
     #[cfg(feature = "tensorrt-rtx")]
     {
         let package = load_cache(cache)?;
-        let mut options = vocal_tensorrt::NativeBuildOptions::default();
+        let mut options = vocal_tensorrt::TensorRtConfig::from_env()?.build;
         options.output = output;
         let builder = vocal_tensorrt::NativeTensorRtBuilder::new(options);
         let path = match onnx {
@@ -603,7 +612,7 @@ fn compile_trt(cache: PathBuf, output: PathBuf, onnx: Option<PathBuf>) -> CliRes
 #[cfg(feature = "tensorrt-rtx")]
 fn compile_hubert_trt(cache: PathBuf, output: PathBuf) -> CliResult<()> {
     let package = load_cache(cache)?;
-    let mut options = vocal_tensorrt::NativeBuildOptions::default();
+    let mut options = vocal_tensorrt::TensorRtConfig::from_env()?.build;
     options.output = output;
     let path = vocal_tensorrt::NativeTensorRtBuilder::new(options).compile_hubert_vfrm(&package)?;
     println!("compiled native HuBERT plan {}", path.display());
@@ -617,6 +626,7 @@ fn compile_hubert_trt(_cache: PathBuf, _output: PathBuf) -> CliResult<()> {
 
 #[cfg(feature = "tensorrt-rtx")]
 fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> CliResult<()> {
+    let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
     let samples = read_f32_audio(&input)?;
     let runtime = vocal_tensorrt::Runtime::load(&plan)?;
     let mut context = runtime.context()?;
@@ -647,7 +657,7 @@ fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> CliResult<()> {
         .chunks_exact(4)
         .map(|x| <[u8; 4]>::try_from(x).map(f32::from_le_bytes))
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(path) = env::var_os("VOCAL_TRT_DUMP_HUBERT") {
+    if let Some(path) = trt_config.diagnostics.dump_hubert {
         fs::write(path, &raw)?;
     }
     let finite = values.iter().all(|v| v.is_finite());
@@ -668,6 +678,7 @@ fn test_hubert_trt(_plan: PathBuf, _input: PathBuf) -> CliResult<()> {
 
 #[cfg(feature = "tensorrt-rtx")]
 fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
+    let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
     let runtime = vocal_tensorrt::Runtime::load(&plan)?;
     let mut context = runtime.context()?;
     let stream = vocal_tensorrt::CudaStream::new()?;
@@ -684,11 +695,7 @@ fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
     let config = package
         .rvc_synth_config()?
         .ok_or("cache has no rvc_synth config")?;
-    let frames = env::var("VOCAL_TRT_TEST_FRAMES")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8_i64);
+    let frames = i64::try_from(trt_config.run.test_frames)?;
     let up = config
         .upsample_rates
         .iter()
@@ -736,7 +743,7 @@ fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
             .collect::<Vec<_>>();
         noise.upload_f32(&noise_values)?;
     }
-    eprintln!("test: buffers allocated up={up}");
+    tracing::debug!(target: cli_logging::LOG_TARGET, up, "test buffers allocated");
     context.set_input_shape("feats", &[1, frames, config.feature_width as i64])?;
     context.set_input_shape("rnd", &[1, config.latent_channels as i64, frames])?;
     if config.uses_f0 {
@@ -744,7 +751,7 @@ fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
         context.set_input_shape("pitchf", &[1, frames])?;
         context.set_input_shape("nsf_noise", &[1, 1, frames * up])?;
     }
-    eprintln!("test: input shapes set");
+    tracing::debug!(target: cli_logging::LOG_TARGET, "test input shapes set");
     let mut addresses = vec![
         ("feats", &feats),
         ("p_len", &p_len),
@@ -758,10 +765,10 @@ fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
     for (name, buffer) in addresses {
         context.set_tensor_address(name, buffer.device_ptr())?;
     }
-    eprintln!("test: tensor addresses set");
+    tracing::debug!(target: cli_logging::LOG_TARGET, "test tensor addresses set");
     let start = Instant::now();
     context.enqueue(&stream)?;
-    eprintln!("test: enqueue returned");
+    tracing::debug!(target: cli_logging::LOG_TARGET, "test enqueue returned");
     stream.synchronize()?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut audio_bytes = vec![0_u8; audio.bytes];
@@ -771,7 +778,7 @@ fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
         .iter()
         .map(|bytes| f32::from_le_bytes(*bytes))
         .collect::<Vec<_>>();
-    if let Some(path) = env::var_os("VOCAL_TRT_DUMP_AUDIO") {
+    if let Some(path) = trt_config.diagnostics.dump_audio {
         fs::write(path, &audio_bytes)?;
     }
     if !audio_remainder.is_empty() || values.iter().any(|sample| !sample.is_finite()) {
@@ -884,6 +891,7 @@ fn benchmark_trt(
     output: PathBuf,
     iterations: usize,
 ) -> CliResult<()> {
+    let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
     if iterations == 0 {
         return Err("benchmark iterations must be positive".into());
     }
@@ -901,9 +909,7 @@ fn benchmark_trt(
     let pitch = alloc(input.pitch.len())?;
     let pitchf = alloc(input.pitchf.len())?;
     let noise = alloc(input.noise.len())?;
-    let debug_outputs = env::var("VOCAL_TRT_DEBUG_GRAPH_OUTPUTS")
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let debug_outputs = trt_config.diagnostics.debug_graph_outputs;
     let mut debug_buffers: Vec<(String, vocal_tensorrt::CudaBuffer, usize)> = Vec::new();
     let output_bytes = usize::try_from(
         input

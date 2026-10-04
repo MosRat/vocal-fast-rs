@@ -11,10 +11,13 @@
 #include <cstdint>
 
 namespace vocal {
+using LogCallback = void (*)(int severity, char const* message);
 struct Logger final : nvinfer1::ILogger {
     void log(Severity severity, char const* message) noexcept override;
 };
 Logger& logger();
+void log_message(nvinfer1::ILogger::Severity severity, std::string const& message) noexcept;
+void set_log_callback(LogCallback callback) noexcept;
 char* make_error(char const* message) noexcept;
 extern "C" void vocal_trt_free_error(char* message);
 inline void require(bool ok, std::string const& message) { if (!ok) throw std::runtime_error(message); }
@@ -124,6 +127,8 @@ struct Options {
     // TensorRT tactic-source bitset: bit 0 edge-mask convolutions, bit 1 JIT
     // convolutions. The Rust manifest records this for reproducible builds.
     int32_t tactic_sources;
+    // Optional UTF-8 timing-cache path owned by the Rust build call.
+    char const* timing_cache_path;
 };
 
 inline uint16_t float_to_half_bits(float value) noexcept {

@@ -44,7 +44,7 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         // safely reports an empty cache and continues with normal selection.
         std::unique_ptr<ITimingCache> timing_cache;
         std::string timing_cache_path;
-        if(auto const* path=std::getenv("VOCAL_TRT_TIMING_CACHE");path && path[0]!='\0') {
+        if(auto const* path=options->timing_cache_path;path && path[0]!='\0') {
             timing_cache_path=path;
             std::vector<unsigned char> blob;
             std::ifstream input(timing_cache_path,std::ios::binary);
@@ -103,9 +103,13 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         g.mark(audio,"audio");
         require(g.used.size()==count,"not every canonical weight was consumed");
         require(bc->addOptimizationProfile(profile)>=0,"addOptimizationProfile");
-        std::fprintf(stderr,"[RVC] %d native layers, %zu weights, F0=%d, fused_hubert_qkv=%d, fused_rvc_qkv=%d, dispatch=%d\n",
-                     n->getNbLayers(),g.used.size(),c->uses_f0,options->fused_qkv,
-                     options->fused_rvc_qkv,options->dispatch_tune);
+        log_message(nvinfer1::ILogger::Severity::kINFO,
+                    std::string("[RVC] ") + std::to_string(n->getNbLayers()) +
+                    " native layers, " + std::to_string(g.used.size()) +
+                    " weights, F0=" + std::to_string(c->uses_f0) +
+                    ", fused_hubert_qkv=" + std::to_string(options->fused_qkv) +
+                    ", fused_rvc_qkv=" + std::to_string(options->fused_rvc_qkv) +
+                    ", dispatch=" + std::to_string(options->dispatch_tune));
         auto result=new Build();
         result->mem=b->buildSerializedNetwork(*n,*bc);
         require(result->mem,"buildSerializedNetwork RVC failed");
@@ -120,9 +124,13 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 output.close();
                 std::remove(timing_cache_path.c_str());
                 require(std::rename(temporary.c_str(),timing_cache_path.c_str())==0,"replace timing cache failed");
-                std::fprintf(stderr,"[RVC] timing cache updated path=%s bytes=%zu\n",timing_cache_path.c_str(),serialized->size());
+                log_message(nvinfer1::ILogger::Severity::kINFO,
+                            std::string("[RVC] timing cache updated path=") +
+                            timing_cache_path + " bytes=" + std::to_string(serialized->size()));
             } else if(!timing_cache_path.empty()) {
-                std::fprintf(stderr,"[RVC] timing cache API returned no serialized data path=%s\n",timing_cache_path.c_str());
+                log_message(nvinfer1::ILogger::Severity::kWARNING,
+                            std::string("[RVC] timing cache API returned no serialized data path=") +
+                            timing_cache_path);
             }
         }
         *out=result;

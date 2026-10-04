@@ -81,6 +81,7 @@ pub(crate) struct NativeOptions {
     pub hubert_feature_precision: i32,
     pub rmvpe_external_stft: i32,
     pub tactic_sources: i32,
+    pub timing_cache_path: *const std::os::raw::c_char,
 }
 
 pub(crate) fn native_config(c: &RvcSynthConfig) -> Result<NativeConfig, NativeBuildError> {

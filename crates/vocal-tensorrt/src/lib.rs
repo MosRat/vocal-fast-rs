@@ -12,6 +12,7 @@
 mod abi;
 pub mod acoustic;
 mod builder;
+mod config;
 mod cufft;
 mod error;
 mod options;
@@ -25,7 +26,8 @@ pub mod graph;
 pub mod pipeline;
 
 pub use builder::NativeTensorRtBuilder;
-pub use error::NativeBuildError;
+pub use config::{DiagnosticsConfig, PipelineRunConfig, PipelineRuntimeConfig, TensorRtConfig};
+pub use error::{ConfigError, NativeBuildError};
 pub use options::{
     DEFAULT_TRT_ROOT, DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode,
 };

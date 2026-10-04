@@ -6,6 +6,7 @@
 use std::{
     ffi::CStr,
     os::raw::{c_char, c_void},
+    sync::Once,
 };
 
 use crate::abi::{NativeConfig, NativeOptions, NativeWeight};
@@ -54,6 +55,9 @@ pub(crate) struct CufftFrontend {
 }
 
 unsafe extern "C" {
+    pub(crate) fn vocal_trt_set_log_callback(
+        callback: Option<unsafe extern "C" fn(i32, *const c_char)>,
+    );
     pub(crate) fn vocal_cuda_event_create(out: *mut *mut c_void, error: *mut *mut c_char) -> i32;
     pub(crate) fn vocal_cuda_event_free(event: *mut c_void);
     pub(crate) fn vocal_cuda_event_record(
@@ -291,6 +295,31 @@ unsafe extern "C" {
         stream: *mut Stream,
         error: *mut *mut c_char,
     ) -> i32;
+}
+
+static LOG_BRIDGE: Once = Once::new();
+
+/// Install the process-wide native logger bridge once. TensorRT invokes the
+/// callback from its build/runtime threads, so the callback does no allocation
+/// and only forwards a borrowed message into the host tracing subscriber.
+pub(crate) fn install_log_bridge() {
+    LOG_BRIDGE.call_once(|| unsafe {
+        vocal_trt_set_log_callback(Some(native_log_callback));
+    });
+}
+
+unsafe extern "C" fn native_log_callback(severity: i32, message: *const c_char) {
+    let message = if message.is_null() {
+        "<null>".into()
+    } else {
+        unsafe { CStr::from_ptr(message) }.to_string_lossy()
+    };
+    match severity {
+        0..=1 => tracing::error!(target: "vocal_tensorrt::native", "{message}"),
+        2 => tracing::warn!(target: "vocal_tensorrt::native", "{message}"),
+        3 => tracing::info!(target: "vocal_tensorrt::native", "{message}"),
+        _ => tracing::debug!(target: "vocal_tensorrt::native", "{message}"),
+    }
 }
 
 pub(crate) fn native_message(error: *mut c_char, fallback: &str) -> String {

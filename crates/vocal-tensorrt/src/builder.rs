@@ -29,6 +29,7 @@ pub struct NativeTensorRtBuilder {
 
 impl NativeTensorRtBuilder {
     pub fn new(options: NativeBuildOptions) -> Self {
+        ffi::install_log_bridge();
         Self { options }
     }
 
@@ -94,29 +95,23 @@ impl NativeTensorRtBuilder {
     }
 
     pub fn compile_vfrm(&self, package: &ModelPackage) -> Result<PathBuf, NativeBuildError> {
-        if std::env::var("VOCAL_TRT_LOG_BUILD_OPTIONS").ok().as_deref() == Some("1") {
-            eprintln!(
-                "[RVC-RUST] synth output={} frames={}/{}/{} precision={:?} fp16={} debug={} fused_hubert_qkv={} fused_rvc_qkv={} dispatch={} tactics=0x{:x} resblock={:?} mask=0x{:x} conv1={:?}/0x{:x} conv2={:?}/0x{:x} fuse_scale={} polyphase={} workspace={}",
-                self.options.output.display(),
-                self.options.min_frames,
-                self.options.opt_frames,
-                self.options.max_frames,
-                self.options.precision,
-                self.options.fp16,
-                self.options.debug_outputs,
-                self.options.fused_qkv,
-                self.options.fused_rvc_qkv,
-                self.options.dispatch_tune.code(),
-                self.options.tactic_sources,
-                self.options.synth_resblock_precision,
-                self.options.synth_resblock_stage_mask,
-                self.options.synth_resblock_conv1_precision,
-                self.options.synth_resblock_conv1_stage_mask,
-                self.options.synth_resblock_conv2_precision,
-                self.options.synth_resblock_conv2_stage_mask,
-                self.options.synth_fuse_resblock_scale,
-                self.options.synth_polyphase_upsample,
-                self.options.workspace_bytes
+        if self.options.log_build_options {
+            tracing::info!(
+                target: "vocal_tensorrt::builder",
+                output = %self.options.output.display(),
+                min_frames = self.options.min_frames,
+                opt_frames = self.options.opt_frames,
+                max_frames = self.options.max_frames,
+                precision = ?self.options.precision,
+                fp16 = self.options.fp16,
+                debug = self.options.debug_outputs,
+                fused_hubert_qkv = self.options.fused_qkv,
+                fused_rvc_qkv = self.options.fused_rvc_qkv,
+                dispatch = self.options.dispatch_tune.code(),
+                tactic_sources = format_args!("0x{:x}", self.options.tactic_sources),
+                resblock_precision = ?self.options.synth_resblock_precision,
+                resblock_mask = format_args!("0x{:x}", self.options.synth_resblock_stage_mask),
+                "building native RVC Synth plan"
             );
         }
         let plan = NativeGraphPlan::from_package(package)?;
@@ -126,6 +121,7 @@ impl NativeTensorRtBuilder {
             .map_err(|e| NativeBuildError::Api(e.to_string()))?
             .ok_or_else(|| NativeBuildError::Argument("missing rvc_config".into()))?;
         let native_config = abi::native_config(&config)?;
+        let timing_cache = self.timing_cache_cstring()?;
         let options = NativeOptions {
             workspace: self.options.workspace_bytes,
             min_frames: self.options.min_frames,
@@ -157,6 +153,9 @@ impl NativeTensorRtBuilder {
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
             rmvpe_external_stft: 0,
             tactic_sources: self.options.tactic_sources as i32,
+            timing_cache_path: timing_cache
+                .as_ref()
+                .map_or(ptr::null(), |path| path.as_ptr()),
         };
 
         let canonical = package
@@ -244,6 +243,7 @@ impl NativeTensorRtBuilder {
         }
         let _plan =
             crate::acoustic::AcousticGraphPlan::from_package(package, AcousticKind::Hubert)?;
+        let timing_cache = self.timing_cache_cstring()?;
         let mut options = abi::NativeOptions {
             workspace: self.options.workspace_bytes,
             min_frames: self.options.min_frames,
@@ -275,6 +275,9 @@ impl NativeTensorRtBuilder {
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
             rmvpe_external_stft: 0,
             tactic_sources: self.options.tactic_sources as i32,
+            timing_cache_path: timing_cache
+                .as_ref()
+                .map_or(ptr::null(), |path| path.as_ptr()),
         };
         options.min_frames = self.options.min_samples;
         options.opt_frames = self.options.opt_samples;
@@ -476,6 +479,7 @@ impl NativeTensorRtBuilder {
                 })
             })
             .collect::<Result<Vec<_>, NativeBuildError>>()?;
+        let timing_cache = self.timing_cache_cstring()?;
         let mut options = abi::NativeOptions {
             workspace: self.options.workspace_bytes,
             min_frames: self.options.min_frames,
@@ -507,6 +511,9 @@ impl NativeTensorRtBuilder {
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
             rmvpe_external_stft: self.options.rmvpe_fft_cufft as i32,
             tactic_sources: self.options.tactic_sources as i32,
+            timing_cache_path: timing_cache
+                .as_ref()
+                .map_or(ptr::null(), |path| path.as_ptr()),
         };
         // RMVPE's waveform binding is profiled in complete 160-sample hops.
         // Keep the measured application sample points exact; the graph itself
@@ -554,6 +561,18 @@ impl NativeTensorRtBuilder {
             }
         }
         Ok(())
+    }
+
+    fn timing_cache_cstring(&self) -> Result<Option<CString>, NativeBuildError> {
+        self.options
+            .timing_cache
+            .as_ref()
+            .map(|path| {
+                CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+                    NativeBuildError::Argument("timing cache path contains NUL".into())
+                })
+            })
+            .transpose()
     }
 
     fn write_build(&self, handle: *mut ffi::Build) -> Result<PathBuf, NativeBuildError> {

@@ -167,6 +167,10 @@ reverted on exit. A model worker can call `WorkerIo::register_mmcss("Audio")`
 on its own inference thread when it must share the same scheduling policy; the
 guard must be retained until that loop exits.
 
+Backend errors are kept off the audio data path. The backend stores the first
+error with a one-time cell and increments an atomic count; `take_errors()`
+returns the first message plus a summary when repeated failures occurred.
+
 ## Initial tuning
 
 Start with the device's native sample rate (commonly 48 kHz), 10 ms callback

@@ -492,10 +492,7 @@ fn run_capture(
         endpoint_frames,
         period_frames,
     } = match setup {
-        Ok(setup) => {
-            let _ = ready.send(Ok(()));
-            setup
-        }
+        Ok(setup) => setup,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
             record_error(&errors, error);
@@ -509,12 +506,15 @@ fn run_capture(
     let mut assembler = match BlockAssembler::new(config) {
         Ok(assembler) => assembler,
         Err(error) => {
-            record_error(&errors, error.to_string());
+            let message = error.to_string();
+            let _ = ready.send(Err(message.clone()));
+            record_error(&errors, message);
             let _ = unsafe { client.Stop() };
             unsafe { CoUninitialize() };
             return;
         }
     };
+    let _ = ready.send(Ok(()));
     let mut silence = vec![0.0; endpoint_frames * config.format.channels as usize];
     let mut last_callback = None;
     let expected_period = period_duration(period_frames, config.format.sample_rate);
@@ -665,10 +665,7 @@ fn run_render(
         endpoint_frames,
         period_frames,
     } = match setup {
-        Ok(setup) => {
-            let _ = ready.send(Ok(()));
-            setup
-        }
+        Ok(setup) => setup,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
             record_error(&errors, error);
@@ -682,12 +679,15 @@ fn run_render(
     let mut drainer = match BlockDrainer::new(config) {
         Ok(drainer) => drainer,
         Err(error) => {
-            record_error(&errors, error.to_string());
+            let message = error.to_string();
+            let _ = ready.send(Err(message.clone()));
+            record_error(&errors, message);
             let _ = unsafe { client.Stop() };
             unsafe { CoUninitialize() };
             return;
         }
     };
+    let _ = ready.send(Ok(()));
     let mut samples = vec![0.0; endpoint_frames * config.format.channels as usize];
     let mut last_callback = None;
     let expected_period = period_duration(period_frames, config.format.sample_rate);

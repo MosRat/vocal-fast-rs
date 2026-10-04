@@ -23,9 +23,10 @@ pub fn get_snapshot(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
 #[tauri::command]
 pub fn subscribe(
     state: State<'_, AppState>,
+    window_label: String,
     channel: Channel<BackendEvent>,
 ) -> GuiResult<UiSnapshot> {
-    report(state.inner(), state.attach_channel(channel))
+    report(state.inner(), state.attach_channel(window_label, channel))
 }
 
 #[tauri::command]

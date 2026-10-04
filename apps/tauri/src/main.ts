@@ -2,6 +2,7 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import { setTheme as setNativeTheme } from '@tauri-apps/api/app';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { emit, listen } from '@tauri-apps/api/event';
 import './style.css';
 import './effects.css';
 import { icon, type IconName } from './icons';
@@ -19,6 +20,7 @@ import {
   type WorkspaceRoute,
   isWorkspaceRoute,
 } from './types';
+import { navigate as commitRoute, routeCopy, routeFromLocation, type ViewRoute } from './router';
 
 const root = document.querySelector<HTMLDivElement>('#app');
 if (!root) throw new Error('missing #app');
@@ -31,9 +33,10 @@ let localError: ErrorReport | null = null;
 let refreshInFlight = false;
 let lastEventSequence = 0;
 let resyncInFlight = false;
-let themePreference: ThemePreference = 'system';
+const THEME_EVENT = 'vocal-fast://theme-changed';
+const THEME_STORAGE_KEY = 'vocal-fast.theme';
+let themePreference: ThemePreference = readStoredTheme();
 let windowMaximized = false;
-type ViewRoute = WorkspaceRoute | 'settings';
 let activeSection: ViewRoute = routeFromLocation();
 let closeInFlight = false;
 let closeHookInstalled = false;
@@ -48,21 +51,43 @@ function runningInTauri(): boolean {
   return '__TAURI_INTERNALS__' in window;
 }
 
-function routeFromLocation(): ViewRoute {
-  const route = window.location.hash.replace(/^#\/?/, '');
-  return route === 'settings' || isWorkspaceRoute(route) ? route : 'studio';
+function readStoredTheme(): ThemePreference {
+  try {
+    const value = localStorage.getItem(THEME_STORAGE_KEY);
+    return value === 'dark' || value === 'light' || value === 'system' ? value : 'system';
+  } catch {
+    return 'system';
+  }
+}
+
+function setThemePreference(next: ThemePreference, broadcast = true): void {
+  themePreference = next;
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, next);
+  } catch {
+    // The native theme still applies when browser storage is unavailable.
+  }
+  applyTheme();
+  void setNativeTheme(next === 'system' ? null : next).catch(() => undefined);
+  if (broadcast && runningInTauri()) void emit<ThemePreference>(THEME_EVENT, next).catch(() => undefined);
+  render();
+}
+
+if (runningInTauri()) {
+  try {
+    windowLabel = getCurrentWindow().label;
+  } catch {
+    // Tauri may still be initializing during a hot reload; syncWindowState retries below.
+  }
 }
 
 function isPrimaryWindow(): boolean {
   return !runningInTauri() || windowLabel === 'main';
 }
 
-function navigate(route: ViewRoute): void {
+function navigateTo(route: ViewRoute): void {
   activeSection = route;
-  const nextHash = `#/${route}`;
-  if (window.location.hash !== nextHash) window.history.pushState({ route }, '', nextHash);
-  render();
-  requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+  commitRoute(route, render);
 }
 
 type AuxiliaryWindow = 'settings' | 'diagnostics';
@@ -93,7 +118,11 @@ async function openAuxiliaryWindow(kind: AuxiliaryWindow): Promise<void> {
       center: true,
     });
     await child.once('tauri://error', (event) => {
-      localError = { code: 'window_error', message: String(event.payload ?? 'Unable to open window'), recoverable: true };
+      localError = {
+        code: 'window_error',
+        message: String(event.payload ?? 'Unable to open window'),
+        recoverable: true,
+      };
       render();
     });
   } catch (error) {
@@ -174,16 +203,6 @@ function renderTabs(): string {
 
 function renderSettingsPanel(config: GuiConfig): string {
   return `<section class="settings-panel panel ${activeSection === 'settings' ? 'is-active' : ''}" aria-labelledby="settings-title"><div class="settings-heading"><div class="kicker">APPLICATION SETTINGS</div><h2 id="settings-title">Personalize your workspace</h2><p>These controls apply to the current desktop session. Audio state remains shared with the Studio window.</p></div><div class="settings-grid"><article class="settings-card"><div class="settings-card-icon">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 18)}</div><div><h3>Appearance</h3><p>${themeLabel(themePreference)} with Fluent surfaces and motion-aware effects.</p></div><button id="settingsTheme" class="button secondary">Change theme</button></article><article class="settings-card"><div class="settings-card-icon">${icon('waveform', 18)}</div><div><h3>Audio defaults</h3><p>${config.inputFormat.sampleRate.toLocaleString()} Hz · ${config.inputFormat.channels} channel · ${config.blockFrames} frame blocks</p></div><button id="settingsStudio" class="button secondary">Back to Studio</button></article><article class="settings-card"><div class="settings-card-icon">${icon('keyboard', 18)}</div><div><h3>Keyboard</h3><p><kbd>Space</kbd> starts or stops a session. <kbd>Ctrl R</kbd> refreshes the snapshot.</p></div></article></div></section>`;
-}
-
-function routeCopy(route: ViewRoute): { title: string; description: string } {
-  return {
-    studio: { title: 'Make every take sound like you.', description: 'Configure your voice chain, start the stream, and keep an eye on the audio path.' },
-    audio: { title: 'Route sound with confidence.', description: 'Choose the capture and render endpoints that keep your live path stable.' },
-    tuning: { title: 'Shape the voice in real time.', description: 'Tune the conversion controls while keeping the stream safe to adjust.' },
-    diagnostics: { title: 'See every edge of the audio path.', description: 'Track processing age, queue health, and device activity as the session runs.' },
-    settings: { title: 'Make the workspace yours.', description: 'Manage appearance, defaults, and the windows that stay close to your session.' },
-  }[route];
 }
 
 function renderSidebar(): string {
@@ -384,24 +403,21 @@ function wireHandlers(): void {
   document.querySelectorAll<HTMLButtonElement>('[data-section]').forEach((item) =>
     item.addEventListener('click', () => {
       const route = item.dataset.section;
-      if (route && isWorkspaceRoute(route)) navigate(route);
+      if (route && isWorkspaceRoute(route)) navigateTo(route);
     }),
   );
   document.querySelectorAll<HTMLButtonElement>('[data-route]').forEach((item) =>
     item.addEventListener('click', () => {
       const route = item.dataset.route;
-      if (route && isWorkspaceRoute(route)) navigate(route);
+      if (route && isWorkspaceRoute(route)) navigateTo(route);
     }),
   );
   const cycleTheme = () => {
-    themePreference = themePreference === 'system' ? 'dark' : themePreference === 'dark' ? 'light' : 'system';
-    applyTheme();
-    void setNativeTheme(themePreference === 'system' ? null : themePreference).catch(() => undefined);
-    render();
+    setThemePreference(themePreference === 'system' ? 'dark' : themePreference === 'dark' ? 'light' : 'system');
   };
   byId<HTMLButtonElement>('themeButton')?.addEventListener('click', cycleTheme);
   byId<HTMLButtonElement>('settingsTheme')?.addEventListener('click', cycleTheme);
-  byId<HTMLButtonElement>('settingsStudio')?.addEventListener('click', () => navigate('studio'));
+  byId<HTMLButtonElement>('settingsStudio')?.addEventListener('click', () => navigateTo('studio'));
   byId<HTMLButtonElement>('openDiagnostics')?.addEventListener('click', () => void openAuxiliaryWindow('diagnostics'));
   byId<HTMLButtonElement>('openSettings')?.addEventListener('click', () => void openAuxiliaryWindow('settings'));
   byId<HTMLButtonElement>('minimizeWindow')?.addEventListener('click', () => void windowCommand('minimize'));
@@ -434,7 +450,11 @@ async function syncWindowState(): Promise<void> {
     if (!closeHookInstalled) {
       closeHookInstalled = true;
       await current.onCloseRequested(async (event) => {
-        if (snapshot?.lifecycle !== 'running' || closeInFlight || busy) return;
+        if (closeInFlight || busy) {
+          event.preventDefault();
+          return;
+        }
+        if (snapshot?.lifecycle !== 'running') return;
         event.preventDefault();
         closeInFlight = true;
         try {
@@ -476,7 +496,7 @@ async function connect(): Promise<void> {
       if (event.type === 'error') localError = event.payload as ErrorReport;
       scheduleRender();
     };
-    snapshot = await call<Snapshot>('subscribe', { channel: events });
+    snapshot = await call<Snapshot>('subscribe', { windowLabel, channel: events });
     channelConnected = true;
     devices = await call<AudioDeviceCatalog>('list_audio_devices');
   } catch (error) {
@@ -533,6 +553,12 @@ systemTheme?.addEventListener('change', () => {
     render();
   }
 });
+if (runningInTauri()) {
+  void listen<ThemePreference>(THEME_EVENT, (event) => {
+    if (event.payload === 'dark' || event.payload === 'light' || event.payload === 'system')
+      setThemePreference(event.payload, false);
+  });
+}
 window.setInterval(async () => {
   if (!channelConnected || busy || refreshInFlight) return;
   refreshInFlight = true;

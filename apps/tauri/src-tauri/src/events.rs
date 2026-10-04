@@ -71,19 +71,20 @@ impl ErrorReport {
 
 #[derive(Default)]
 pub struct EventSink {
-    channels: std::sync::Mutex<Vec<(u64, Channel<BackendEvent>)>>,
+    channels: std::sync::Mutex<Vec<(String, u64, Channel<BackendEvent>)>>,
     subscriber_id: AtomicU64,
     sequence: AtomicU64,
 }
 
 impl EventSink {
-    pub fn attach(&self, channel: Channel<BackendEvent>) -> GuiResult<()> {
+    pub fn attach(&self, label: String, channel: Channel<BackendEvent>) -> GuiResult<()> {
         let mut channels = self
             .channels
             .lock()
             .map_err(|_| GuiError::Internal("event channel lock poisoned".into()))?;
+        channels.retain(|(current, _, _)| current != &label);
         let id = self.subscriber_id.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        channels.push((id, channel));
+        channels.push((label, id, channel));
         Ok(())
     }
 
@@ -100,10 +101,10 @@ impl EventSink {
         let sequence = self.next_sequence();
         let event = event.with_sequence(sequence);
         let mut failed = Vec::new();
-        for (id, channel) in channels {
+        for (label, id, channel) in channels {
             if let Err(error) = channel.send(event.clone()) {
-                tracing::debug!(target: "vocal.gui", subscriber = id, error = %error, "removing closed event channel");
-                failed.push(id);
+                tracing::debug!(target: "vocal.gui", subscriber = %label, error = %error, "removing closed event channel");
+                failed.push((label, id));
             }
         }
 
@@ -112,7 +113,7 @@ impl EventSink {
                 .channels
                 .lock()
                 .map_err(|_| GuiError::Internal("event channel lock poisoned".into()))?;
-            current.retain(|(id, _)| !failed.contains(id));
+            current.retain(|(label, id, _)| !failed.iter().any(|(failed_label, failed_id)| failed_label == label && failed_id == id));
         }
         Ok(())
     }

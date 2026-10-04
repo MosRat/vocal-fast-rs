@@ -61,10 +61,11 @@ impl AppState {
 
     pub fn attach_channel(
         &self,
+        label: String,
         channel: tauri::ipc::Channel<BackendEvent>,
     ) -> GuiResult<UiSnapshot> {
         let _operation = self.operation()?;
-        self.events.attach(channel)?;
+        self.events.attach(label, channel)?;
         let snapshot = self.snapshot()?;
         self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)

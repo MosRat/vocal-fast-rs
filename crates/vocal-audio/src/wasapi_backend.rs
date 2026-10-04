@@ -8,7 +8,7 @@
 
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,7 @@ use wasapi::{
     SampleType, StreamMode, WaveFormat, initialize_mta,
 };
 
+use crate::backend_error::BackendErrorState;
 use crate::{AudioClock, AudioDirection, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp};
 use crate::{
     AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, StreamQueueConfig, WorkerIo,
@@ -191,7 +192,7 @@ impl Drop for WasapiStream {
 /// owning threads.
 pub struct LegacyWasapiStream {
     stop: Arc<AtomicBool>,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     latency: Option<Arc<AudioLatencyStats>>,
     joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
 }
@@ -209,7 +210,7 @@ impl LegacyWasapiStream {
         let io = crate::StreamIo::new_with_queue_config(config, queues)?;
         let (device_io, worker_io) = io.split();
         let stop = Arc::new(AtomicBool::new(false));
-        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(BackendErrorState::default());
         let (capture_ready_tx, capture_ready_rx) = mpsc::sync_channel(1);
         let (render_ready_tx, render_ready_rx) = mpsc::sync_channel(1);
         let latency = clock
@@ -299,10 +300,7 @@ impl LegacyWasapiStream {
     }
 
     pub fn take_errors(&self) -> Vec<String> {
-        self.errors
-            .lock()
-            .map(|mut errors| std::mem::take(&mut *errors))
-            .unwrap_or_default()
+        self.errors.take()
     }
 
     pub fn latency(&self) -> Option<AudioLatencySnapshot> {
@@ -478,10 +476,8 @@ fn packet_timestamp(
     }
 }
 
-fn record_error(errors: &Mutex<Vec<String>>, error: String) {
-    if let Ok(mut errors) = errors.lock() {
-        errors.push(error);
-    }
+fn record_error(errors: &BackendErrorState, error: String) {
+    errors.record(error);
 }
 
 fn record_callback_tick(
@@ -508,7 +504,7 @@ fn capture_loop(
     mode: WasapiMode,
     mut input: crate::AudioProducer,
     stop: Arc<AtomicBool>,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
@@ -712,7 +708,7 @@ fn render_loop(
     mode: WasapiMode,
     mut output: crate::AudioConsumer,
     stop: Arc<AtomicBool>,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     ready: mpsc::SyncSender<Result<(), String>>,
     profile: LatencyProfile,
 ) {

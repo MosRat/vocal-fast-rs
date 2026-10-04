@@ -18,4 +18,7 @@ pub mod wasapi_backend;
 mod threading;
 
 #[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
+mod backend_error;
+
+#[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
 mod wasapi_native;

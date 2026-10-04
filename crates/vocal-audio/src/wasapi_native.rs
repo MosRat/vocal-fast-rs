@@ -8,7 +8,7 @@
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows::core::Interface;
 
+use crate::backend_error::BackendErrorState;
 use crate::threading::MmcssGuard;
 use crate::{
     AudioClock, AudioDirection, AudioError, AudioLatencySnapshot, AudioLatencyStats,
@@ -49,7 +50,7 @@ pub enum NativeWasapiError {
 pub struct NativeWasapiStream {
     stop: Arc<AtomicBool>,
     stop_event: EventHandle,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     latency: Option<Arc<AudioLatencyStats>>,
     joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
 }
@@ -94,7 +95,7 @@ impl NativeWasapiStream {
             unsafe { CreateEventW(None, true, false, None) }
                 .map_err(|error| NativeWasapiError::Startup(error.to_string()))?,
         );
-        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(BackendErrorState::default());
         let latency = clock
             .as_ref()
             .map(|_| Arc::new(AudioLatencyStats::default()));
@@ -166,10 +167,7 @@ impl NativeWasapiStream {
     }
 
     pub fn take_errors(&self) -> Vec<String> {
-        self.errors
-            .lock()
-            .map(|mut errors| std::mem::take(&mut *errors))
-            .unwrap_or_default()
+        self.errors.take()
     }
 
     pub fn latency(&self) -> Option<AudioLatencySnapshot> {
@@ -200,7 +198,7 @@ fn spawn_capture(
     input: crate::AudioProducer,
     stop: Arc<AtomicBool>,
     stop_event: usize,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
@@ -227,7 +225,7 @@ fn spawn_render(
     output: crate::AudioConsumer,
     stop: Arc<AtomicBool>,
     stop_event: usize,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
@@ -544,7 +542,7 @@ fn run_capture(
     mut input: crate::AudioProducer,
     stop: Arc<AtomicBool>,
     stop_event: HANDLE,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
@@ -767,7 +765,7 @@ fn run_render(
     mut output: crate::AudioConsumer,
     stop: Arc<AtomicBool>,
     stop_event: HANDLE,
-    errors: Arc<Mutex<Vec<String>>>,
+    errors: Arc<BackendErrorState>,
     ready: mpsc::SyncSender<Result<(), String>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
@@ -1061,8 +1059,6 @@ fn period_duration(frames: usize, sample_rate: u32) -> Duration {
     Duration::from_nanos(nanos)
 }
 
-fn record_error(errors: &Mutex<Vec<String>>, error: String) {
-    if let Ok(mut errors) = errors.lock() {
-        errors.push(error);
-    }
+fn record_error(errors: &BackendErrorState, error: String) {
+    errors.record(error);
 }

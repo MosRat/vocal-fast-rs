@@ -26,6 +26,8 @@ impl LifecycleState {
                 | (Self::Ready, Self::Running | Self::Stopping | Self::Failed)
                 | (Self::Running, Self::Stopping | Self::Failed)
                 | (Self::Stopping, Self::Stopped | Self::Failed)
+                | (Self::Stopped, Self::Loading)
+                | (Self::Failed, Self::Loading | Self::Stopping)
         ) || self == next
     }
 }

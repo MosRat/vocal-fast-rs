@@ -4,6 +4,7 @@ use crate::{AudioFormat, TypesError};
 
 /// Conversion controls shared by the audio, engine and CLI layers.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConversionConfig {
     /// Pitch shift applied before coarse/continuous F0 generation.
     pub pitch_semitones: f32,
@@ -52,6 +53,7 @@ impl ConversionConfig {
 
 /// Application-level audio format and conversion defaults.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioProcessingConfig {
     pub input: AudioFormat,
     pub output: AudioFormat,

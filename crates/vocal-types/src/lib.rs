@@ -11,6 +11,7 @@ pub use error::TypesError;
 pub use state::{LifecycleState, ProcessingStatus};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioFormat {
     pub sample_rate: u32,
     pub channels: u16,
@@ -54,6 +55,7 @@ impl AudioFormat {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioChunk {
     pub format: AudioFormat,
     /// Interleaved f32 PCM normalized to [-1, 1].
@@ -88,6 +90,7 @@ impl AudioChunk {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelDescriptor {
     pub id: String,
     pub display_name: String,
@@ -112,6 +115,7 @@ impl ModelDescriptor {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LatencyMetrics {
     pub input_frames: u64,
     pub processing_micros: u64,

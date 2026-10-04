@@ -15,11 +15,11 @@ use vocal_model::{ModelPackage, RvcSynthConfig};
 
 use crate::timing::CudaEvent;
 use crate::{
-    CudaBuffer, CudaGraphExec, CudaStream, OwnedContext, PinnedHostRing, Runtime,
     builder::NativeTensorRtBuilder,
-    cufft::{CufftFrontend, unique_shapes},
+    cufft::{unique_shapes, CufftFrontend},
     error::NativeBuildError,
     options::{DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode},
+    CudaBuffer, CudaGraphExec, CudaStream, OwnedContext, PinnedHostRing, Runtime,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -715,6 +715,11 @@ pub struct RvcTrtPipeline {
     last_p_len: Option<i32>,
     debug_intermediates: bool,
     rmvpe_debug_outputs: bool,
+    // Resolved output lengths are deterministic for a given profile shape.
+    // Keep them on the host so steady callbacks do not query TensorRT's shape
+    // machine through FFI on every invocation.
+    hubert_frame_shape: Option<(usize, usize)>,
+    pitch_frame_shape: Option<(usize, bool, usize)>,
     shape_key: Option<PipelineShapeKey>,
     native_cuda_graphs: bool,
     native_graph_shape: Option<PipelineShapeKey>,
@@ -883,6 +888,8 @@ impl RvcTrtPipeline {
             last_p_len: None,
             debug_intermediates: false,
             rmvpe_debug_outputs,
+            hubert_frame_shape: None,
+            pitch_frame_shape: None,
             shape_key: None,
             native_cuda_graphs,
             native_graph_shape: None,
@@ -1160,14 +1167,27 @@ impl RvcTrtPipeline {
                 .set_input_shape("waveform", &[1, waveform.len() as i64])?;
         }
         self.hubert
-            .set_tensor_address("waveform", self.waveform.device_ptr())?;
+            .set_tensor_address_cached("waveform", self.waveform.device_ptr())?;
         self.hubert
-            .set_tensor_address("features", self.hubert_features.device_ptr())?;
-        let hubert_shape = self.hubert.tensor_shape("features")?;
-        let hubert_frames =
-            concrete_dim(&hubert_shape, 1, hubert_frames_for_samples(waveform.len()))?;
+            .set_tensor_address_cached("features", self.hubert_features.device_ptr())?;
+        let hubert_frames = if let Some((samples, frames)) = self.hubert_frame_shape {
+            if samples == waveform.len() {
+                frames
+            } else {
+                let hubert_shape = self.hubert.tensor_shape("features")?;
+                let frames =
+                    concrete_dim(&hubert_shape, 1, hubert_frames_for_samples(waveform.len()))?;
+                self.hubert_frame_shape = Some((waveform.len(), frames));
+                frames
+            }
+        } else {
+            let hubert_shape = self.hubert.tensor_shape("features")?;
+            let frames = concrete_dim(&hubert_shape, 1, hubert_frames_for_samples(waveform.len()))?;
+            self.hubert_frame_shape = Some((waveform.len(), frames));
+            frames
+        };
         if trace {
-            eprintln!("trt trace: hubert shape={hubert_shape:?} frames={hubert_frames}");
+            eprintln!("trt trace: hubert frames={hubert_frames}");
         }
 
         let rmvpe = if streaming_f0 {
@@ -1186,21 +1206,29 @@ impl RvcTrtPipeline {
             }
         }
         if self.rmvpe_external_stft {
-            rmvpe.set_tensor_address("stft_magnitude", self.rmvpe_magnitude.device_ptr())?;
+            rmvpe.set_tensor_address_cached("stft_magnitude", self.rmvpe_magnitude.device_ptr())?;
         } else {
-            rmvpe.set_tensor_address("waveform", rmvpe_waveform)?;
+            rmvpe.set_tensor_address_cached("waveform", rmvpe_waveform)?;
         }
-        rmvpe.set_tensor_address("threshold", self.threshold.device_ptr())?;
-        rmvpe.set_tensor_address("pitchf", self.pitchf_raw.device_ptr())?;
+        rmvpe.set_tensor_address_cached("threshold", self.threshold.device_ptr())?;
+        rmvpe.set_tensor_address_cached("pitchf", self.pitchf_raw.device_ptr())?;
         if self.rmvpe_debug_outputs {
-            rmvpe.set_tensor_address("rmvpe_debug_mel", self.rmvpe_debug_mel.device_ptr())?;
-            rmvpe.set_tensor_address(
+            rmvpe
+                .set_tensor_address_cached("rmvpe_debug_mel", self.rmvpe_debug_mel.device_ptr())?;
+            rmvpe.set_tensor_address_cached(
                 "rmvpe_debug_bottleneck",
                 self.rmvpe_debug_bottleneck.device_ptr(),
             )?;
-            rmvpe.set_tensor_address("rmvpe_debug_unet", self.rmvpe_debug_unet.device_ptr())?;
-            rmvpe.set_tensor_address("rmvpe_debug_gru", self.rmvpe_debug_gru.device_ptr())?;
-            rmvpe.set_tensor_address("rmvpe_debug_logits", self.rmvpe_debug_logits.device_ptr())?;
+            rmvpe.set_tensor_address_cached(
+                "rmvpe_debug_unet",
+                self.rmvpe_debug_unet.device_ptr(),
+            )?;
+            rmvpe
+                .set_tensor_address_cached("rmvpe_debug_gru", self.rmvpe_debug_gru.device_ptr())?;
+            rmvpe.set_tensor_address_cached(
+                "rmvpe_debug_logits",
+                self.rmvpe_debug_logits.device_ptr(),
+            )?;
             if trace {
                 eprintln!(
                     "trt trace: rmvpe debug shapes mel={:?} bottleneck={:?} unet={:?} gru={:?} logits={:?}",
@@ -1212,10 +1240,23 @@ impl RvcTrtPipeline {
                 );
             }
         }
-        let pitch_shape = rmvpe.tensor_shape("pitchf")?;
-        let pitch_frames = concrete_dim(&pitch_shape, 1, rmvpe_samples / 160 + 1)?;
+        let pitch_frames = if let Some((samples, streaming, frames)) = self.pitch_frame_shape {
+            if samples == rmvpe_samples && streaming == streaming_f0 {
+                frames
+            } else {
+                let pitch_shape = rmvpe.tensor_shape("pitchf")?;
+                let frames = concrete_dim(&pitch_shape, 1, rmvpe_samples / 160 + 1)?;
+                self.pitch_frame_shape = Some((rmvpe_samples, streaming_f0, frames));
+                frames
+            }
+        } else {
+            let pitch_shape = rmvpe.tensor_shape("pitchf")?;
+            let frames = concrete_dim(&pitch_shape, 1, rmvpe_samples / 160 + 1)?;
+            self.pitch_frame_shape = Some((rmvpe_samples, streaming_f0, frames));
+            frames
+        };
         if trace {
-            eprintln!("trt trace: rmvpe shape={pitch_shape:?} frames={pitch_frames}");
+            eprintln!("trt trace: rmvpe frames={pitch_frames}");
         }
 
         let p_len_frames = waveform.len() / RVC_HOP_SAMPLES;
@@ -1264,7 +1305,7 @@ impl RvcTrtPipeline {
             ("pitchf", &self.pitchf),
         ] {
             self.frontend
-                .set_tensor_address(name, buffer.device_ptr())?;
+                .set_tensor_address_cached(name, buffer.device_ptr())?;
         }
         if trace {
             eprintln!("trt trace: frontend addresses set");
@@ -1276,7 +1317,7 @@ impl RvcTrtPipeline {
             self.pitchf_raw.device_ptr()
         };
         self.frontend
-            .set_tensor_address("pitchf_in", pitchf_input)?;
+            .set_tensor_address_cached("pitchf_in", pitchf_input)?;
 
         let up = self
             .config
@@ -1318,22 +1359,22 @@ impl RvcTrtPipeline {
             self.last_sid = Some(sid);
         }
         self.synth
-            .set_tensor_address("feats", self.feats.device_ptr())?;
+            .set_tensor_address_cached("feats", self.feats.device_ptr())?;
         self.synth
-            .set_tensor_address("p_len", self.p_len.device_ptr())?;
+            .set_tensor_address_cached("p_len", self.p_len.device_ptr())?;
         self.synth
-            .set_tensor_address("sid", self.sid.device_ptr())?;
+            .set_tensor_address_cached("sid", self.sid.device_ptr())?;
         self.synth
-            .set_tensor_address("rnd", self.rnd.device_ptr())?;
+            .set_tensor_address_cached("rnd", self.rnd.device_ptr())?;
         self.synth
-            .set_tensor_address("audio", self.audio.device_ptr())?;
+            .set_tensor_address_cached("audio", self.audio.device_ptr())?;
         if self.config.uses_f0 {
             self.synth
-                .set_tensor_address("pitch", self.pitch.device_ptr())?;
+                .set_tensor_address_cached("pitch", self.pitch.device_ptr())?;
             self.synth
-                .set_tensor_address("pitchf", self.pitchf.device_ptr())?;
+                .set_tensor_address_cached("pitchf", self.pitchf.device_ptr())?;
             self.synth
-                .set_tensor_address("nsf_noise", self.nsf_noise.device_ptr())?;
+                .set_tensor_address_cached("nsf_noise", self.nsf_noise.device_ptr())?;
         }
         let graph_key = PipelineShapeKey {
             samples: waveform.len(),
@@ -1688,7 +1729,7 @@ fn pitch_frames_for_samples(samples: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{RvcRealtimeConfig, RvcTrtProfile, frame_shape};
+    use super::{frame_shape, RvcRealtimeConfig, RvcTrtProfile};
 
     #[test]
     fn reference_profile_matches_real_application_windows() {

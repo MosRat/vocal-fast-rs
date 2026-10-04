@@ -1,6 +1,6 @@
 //! Safe ownership wrappers for TensorRT runtime/context and CUDA resources.
 
-use std::{fs, os::raw::c_void, path::Path, ptr, sync::Arc};
+use std::{collections::HashMap, fs, os::raw::c_void, path::Path, ptr, sync::Arc};
 
 use crate::{error::NativeBuildError, ffi};
 
@@ -70,6 +70,12 @@ impl Runtime {
 pub struct OwnedContext {
     raw: *mut ffi::Context,
     _runtime: Arc<Runtime>,
+    // TensorRT keeps tensor addresses in the execution context.  Repeating
+    // the FFI call for every binding on every callback is unnecessary when a
+    // fixed profile reuses the same device allocations.  The cache is
+    // invalidated by set_input_shape, because a shape transition is the
+    // point where callers must establish the complete binding set again.
+    bound_addresses: HashMap<String, usize>,
 }
 
 unsafe impl Send for OwnedContext {}
@@ -132,6 +138,7 @@ impl OwnedContext {
             Ok(Self {
                 raw,
                 _runtime: runtime,
+                bound_addresses: HashMap::new(),
             })
         }
     }
@@ -178,6 +185,7 @@ impl OwnedContext {
                 "set input shape failed",
             )))
         } else {
+            self.bound_addresses.clear();
             Ok(())
         }
     }
@@ -200,6 +208,25 @@ impl OwnedContext {
         } else {
             Ok(())
         }
+    }
+
+    /// Set a binding only when its device pointer changed since the last
+    /// shape configuration.  TensorRT retains addresses across enqueue calls,
+    /// so this removes repeated name conversion and native FFI work from the
+    /// fixed-profile hot path while preserving the explicit setter for callers
+    /// that need unconditional rebinding.
+    pub fn set_tensor_address_cached(
+        &mut self,
+        name: &str,
+        address: *mut c_void,
+    ) -> Result<(), NativeBuildError> {
+        let key = address as usize;
+        if self.bound_addresses.get(name).copied() == Some(key) {
+            return Ok(());
+        }
+        self.set_tensor_address(name, address)?;
+        self.bound_addresses.insert(name.to_owned(), key);
+        Ok(())
     }
 
     pub fn tensor_shape(&mut self, name: &str) -> Result<Vec<i64>, NativeBuildError> {

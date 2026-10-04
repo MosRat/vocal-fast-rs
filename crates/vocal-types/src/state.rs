@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Common lifecycle vocabulary used by model, engine and device adapters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum LifecycleState {
     #[default]
     Created,
@@ -26,8 +27,11 @@ impl LifecycleState {
                 | (Self::Ready, Self::Running | Self::Stopping | Self::Failed)
                 | (Self::Running, Self::Stopping | Self::Failed)
                 | (Self::Stopping, Self::Stopped | Self::Failed)
-                | (Self::Stopped, Self::Loading)
-                | (Self::Failed, Self::Loading | Self::Stopping)
+                | (Self::Stopped, Self::Loading | Self::Ready)
+                | (
+                    Self::Failed,
+                    Self::Created | Self::Loading | Self::Ready | Self::Stopping
+                )
         ) || self == next
     }
 }

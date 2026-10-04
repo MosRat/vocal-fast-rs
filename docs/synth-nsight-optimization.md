@@ -99,3 +99,67 @@ build-time improvement was observed. The file contract is retained for
 forward compatibility with a runtime that implements timing-cache data; it is
 not reported as an optimization on the current SDK.
 
+## Stage 1 operation split and fixed-profile follow-up
+
+The next A/B kept the RMVPE frontend identical (`VOCAL_TRT_RMVPE_FFT=cufft`),
+kept RMVPE encoder/decoder in FP32, and changed only stage 1 residual
+convolution precision. The measurements use ten warmups and one hundred native
+CUDA Graph replays on the RTX 3060:
+
+| Synth residual setting | Pipeline event (ms) | Synth event (ms) | Kernel launches | Aggregate kernel time (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| `convs1` FP16, `convs2` FP32, accumulation FP32 | 52.76 | 33.41 | 208,450 | 5,205.88 |
+| `convs1` FP16, `convs2` FP16, accumulation FP32 | **48.73** | **29.06** | 208,450 | **4,909.50** |
+| `convs1` FP16, `convs2` FP16, accumulation FP16 | **45.63** | **27.36** | 208,450 | **4,714.40** |
+
+The second row removes the FP16-to-FP32 conversion before `convs2`; the third
+row also keeps the residual add in FP16 for stage 1. The latter was run with
+both `target/default-canonical.vfr` and `target/tsukuyomi-canonical.vfr`.
+Synth-only cosine against the FP32 Applio Synth was `0.99999917` and
+`0.99999934`, respectively, on the deterministic 44960 fixture. The complete
+waveform cosine is still dominated by the shared RMVPE/frontend comparison and
+must not be used as a Synth precision measurement.
+
+The recommended experimental controls are:
+
+```powershell
+$env:VOCAL_TRT_RMVPE_FFT = "cufft"
+$env:VOCAL_TRT_SYNTH_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK = "0x2"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV1_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV1_STAGE_MASK = "0x2"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV2_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV2_STAGE_MASK = "0x2"
+```
+
+These settings remain opt-in. A production voice model must pass the same
+Synth-only and final-audio gates before enabling FP16 residual accumulation.
+The corresponding Nsight Systems exports are
+`target/compare/nsys-opt-op16-s2-c2-cufft-44960.sqlite` and
+`target/compare/nsys-opt-op16-s2-c2-acc16-cufft-44960.sqlite`.
+
+## RMVPE decoder experiment and realtime shapes
+
+With stage 1 `convs1+convs2` FP16 and accumulation FP32, changing only the
+RMVPE decoder to FP16 reduced the 44960 RMVPE event from `8.09 ms` to
+`6.66 ms`. STFT/cuFFT, encoder, GRU, logits, and pitch decode remained FP32.
+The deterministic fixture produced F0 RMSE `0.00285 Hz`, 100% coarse-bin
+agreement, and final cosine `0.999848` against the Applio FP32 reference. This
+is an opt-in throughput experiment; the encoder remains FP32 because it is the
+more sensitive U-Net region.
+
+The fixed-shape smoke matrix is now:
+
+| Host path | Waveform/profile | Pitch frames | RMVPE event (ms) | Total event (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| full-window voice-changer | 11200 | 71 | 4.23 | 16.78 |
+| full-window WebUI/Applio | 44960 | 282 | 8.09 | 48.73 |
+| realtime F0 on 11200 | RMVPE 4960 | 32 | 3.36 | 15.44 |
+| realtime F0 on 44960 | RMVPE 4960 | 32 | 3.36 | 44.13 |
+
+The 4960 rows use `rmvpe-realtime.plan`; the full-window rows use the selected
+`rmvpe-full.plan`. All rows reported one native CUDA Graph capture followed by
+109 replays. Nsight Compute could not collect hardware counter sections on this
+machine because the driver returned `ERR_NVGPUCTRPERM`; Nsight Systems kernel
+and CUDA-event measurements remain valid.

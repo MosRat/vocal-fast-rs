@@ -158,8 +158,8 @@ impl WorkerIo {
         &mut self,
     ) -> Result<(AudioReadLease<'_>, AudioWriteLease<'_>), AudioError> {
         let Self { input, output } = self;
-        let input = input.try_acquire()?;
         let output = output.try_acquire()?;
+        let input = input.try_acquire()?;
         Ok((input, output))
     }
 }

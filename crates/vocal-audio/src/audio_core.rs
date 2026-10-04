@@ -259,6 +259,22 @@ mod tests {
     }
 
     #[test]
+    fn paired_acquire_does_not_consume_input_when_output_is_full() {
+        let config = config();
+        let io = StreamIo::new_with_queue_config(config, StreamQueueConfig::new(2, 1)).unwrap();
+        let (mut device, mut worker) = io.split();
+        device.input.try_push(&[1.0, 2.0]).unwrap();
+        worker.output.try_push(&[9.0, 9.0]).unwrap();
+
+        assert!(matches!(
+            worker.try_input_output(),
+            Err(AudioError::QueueFull)
+        ));
+        assert_eq!(worker.input.len(), 1);
+        assert_eq!(worker.input.try_pop().unwrap().samples, vec![1.0, 2.0]);
+    }
+
+    #[test]
     fn drainer_reports_source_timestamp_for_profiled_audio() {
         let clock = AudioClock::new();
         let timestamp = clock.now();

@@ -16,6 +16,8 @@ pub enum CliError {
     Model(#[from] vocal_model::ModelError),
     #[error("engine error: {0}")]
     Engine(#[from] vocal_engine::EngineError),
+    #[error("runtime error: {0}")]
+    Runtime(#[from] vocal_runtime::RuntimeError),
     #[error("TensorRT graph error: {0}")]
     Graph(#[from] vocal_engine::tensorrt::GraphError),
     #[error("audio error: {0}")]

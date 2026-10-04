@@ -3929,6 +3929,7 @@ dependencies = [
  "vocal-audio",
  "vocal-engine",
  "vocal-model",
+ "vocal-runtime",
  "vocal-types",
  "windows-sys 0.61.2",
 ]
@@ -3945,6 +3946,20 @@ dependencies = [
  "tracing",
  "vocal-types",
  "zip",
+]
+
+[[package]]
+name = "vocal-runtime"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+ "vocal-engine",
+ "vocal-model",
+ "vocal-types",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

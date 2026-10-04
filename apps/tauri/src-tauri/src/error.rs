@@ -1,4 +1,4 @@
-use std::{array::TryFromSliceError, io, num::TryFromIntError, path::PathBuf};
+use std::{array::TryFromSliceError, io, num::TryFromIntError};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -51,6 +51,31 @@ impl GuiError {
             Self::Binary(_) => "binary_error",
             Self::IntegerRange(_) => "integer_range",
             Self::Internal(_) => "internal_error",
+        }
+    }
+}
+
+impl From<vocal_runtime::RuntimeError> for GuiError {
+    fn from(error: vocal_runtime::RuntimeError) -> Self {
+        match error {
+            vocal_runtime::RuntimeError::Config(message) => Self::InvalidConfig(message),
+            vocal_runtime::RuntimeError::State { state, action } => {
+                Self::InvalidState { state, action }
+            }
+            vocal_runtime::RuntimeError::ConfigConflict { expected, actual } => {
+                Self::ConfigConflict { expected, actual }
+            }
+            vocal_runtime::RuntimeError::Lock => Self::Internal("runtime lock poisoned".into()),
+            vocal_runtime::RuntimeError::Model(error) => Self::from(error),
+            vocal_runtime::RuntimeError::Engine(error) => Self::from(error),
+            vocal_runtime::RuntimeError::Types(error) => Self::InvalidAudio(error.to_string()),
+            vocal_runtime::RuntimeError::Io { path, message } => Self::Io {
+                path: path.display().to_string(),
+                message,
+            },
+            vocal_runtime::RuntimeError::Json(error) => {
+                Self::InvalidConfig(format!("invalid configuration JSON: {error}"))
+            }
         }
     }
 }
@@ -111,13 +136,6 @@ impl From<TryFromIntError> for GuiError {
 impl From<tauri::Error> for GuiError {
     fn from(error: tauri::Error) -> Self {
         Self::Internal(error.to_string())
-    }
-}
-
-pub fn io_at(path: impl Into<PathBuf>, error: io::Error) -> GuiError {
-    GuiError::Io {
-        path: path.into().display().to_string(),
-        message: error.to_string(),
     }
 }
 

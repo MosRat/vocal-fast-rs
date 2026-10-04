@@ -1,0 +1,224 @@
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use serde::{Deserialize, Serialize};
+use vocal_engine::BackendKind;
+use vocal_types::{AudioFormat, AudioProcessingConfig, ConversionConfig, TypesError};
+
+use crate::error::{RuntimeError, RuntimeResult, io_at};
+
+pub const RUNTIME_CONFIG_SCHEMA_VERSION: u32 = 1;
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeBackend {
+    #[default]
+    Passthrough,
+    RvcCpu,
+}
+
+impl RuntimeBackend {
+    pub const fn engine_kind(self) -> BackendKind {
+        match self {
+            Self::Passthrough => BackendKind::Passthrough,
+            Self::RvcCpu => BackendKind::RvcCpuPipeline,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub struct RuntimeConfig {
+    #[serde(default = "current_schema_version")]
+    pub schema_version: u32,
+    pub input_format: AudioFormat,
+    pub output_format: AudioFormat,
+    pub conversion: ConversionConfig,
+    pub backend: RuntimeBackend,
+    pub model_path: Option<String>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub block_frames: usize,
+    pub queue_blocks: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: RUNTIME_CONFIG_SCHEMA_VERSION,
+            input_format: AudioFormat::MONO_48K,
+            output_format: AudioFormat::MONO_48K,
+            conversion: ConversionConfig::default(),
+            backend: RuntimeBackend::Passthrough,
+            model_path: None,
+            input_device: None,
+            output_device: None,
+            block_frames: 480,
+            queue_blocks: 3,
+        }
+    }
+}
+
+impl RuntimeConfig {
+    pub fn validate(&self) -> RuntimeResult<()> {
+        if self.schema_version > RUNTIME_CONFIG_SCHEMA_VERSION {
+            return Err(RuntimeError::Config(format!(
+                "configuration schema {} is newer than supported schema {}",
+                self.schema_version, RUNTIME_CONFIG_SCHEMA_VERSION
+            )));
+        }
+        AudioProcessingConfig {
+            input: self.input_format,
+            output: self.output_format,
+            conversion: self.conversion,
+        }
+        .validate()
+        .map_err(|error: TypesError| RuntimeError::Config(error.to_string()))?;
+        if self.block_frames == 0 || self.queue_blocks == 0 {
+            return Err(RuntimeError::Config(
+                "block_frames and queue_blocks must be non-zero".into(),
+            ));
+        }
+        if self.block_frames > 8192 || self.queue_blocks > 64 {
+            return Err(RuntimeError::Config(
+                "block_frames must be <= 8192 and queue_blocks must be <= 64".into(),
+            ));
+        }
+        if self.input_format != self.output_format {
+            return Err(RuntimeError::Config(
+                "input and output formats must match for duplex streaming".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigStore {
+    path: PathBuf,
+}
+
+impl ConfigStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> RuntimeResult<Option<RuntimeConfig>> {
+        if !self.path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&self.path).map_err(|error| io_at(&self.path, error))?;
+        let mut config: RuntimeConfig = serde_json::from_slice(&bytes)?;
+        if config.schema_version == 0 {
+            config.schema_version = RUNTIME_CONFIG_SCHEMA_VERSION;
+        }
+        config.validate()?;
+        Ok(Some(config))
+    }
+
+    pub fn save(&self, config: &RuntimeConfig) -> RuntimeResult<()> {
+        config.validate()?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| io_at(parent, error))?;
+        }
+        let bytes = serde_json::to_vec_pretty(config)?;
+        let temp = self.temp_path();
+        let result = (|| {
+            let mut file = fs::File::create(&temp).map_err(|error| io_at(&temp, error))?;
+            file.write_all(&bytes)
+                .map_err(|error| io_at(&temp, error))?;
+            file.sync_all().map_err(|error| io_at(&temp, error))?;
+            replace_file(&temp, &self.path).map_err(|error| io_at(&self.path, error))?;
+            sync_parent(self.path.parent())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn temp_path(&self) -> PathBuf {
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.json");
+        self.path.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+}
+
+fn current_schema_version() -> u32 {
+    RUNTIME_CONFIG_SCHEMA_VERSION
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let status = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
+    (status != 0)
+        .then_some(())
+        .ok_or_else(std::io::Error::last_os_error)
+}
+
+fn sync_parent(parent: Option<&Path>) -> RuntimeResult<()> {
+    #[cfg(unix)]
+    if let Some(parent) = parent {
+        fs::File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| io_at(parent, error))?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_store_round_trips_and_migrates_unversioned_data() {
+        let path = std::env::temp_dir().join(format!(
+            "vocal-runtime-config-{}-{}.json",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = ConfigStore::new(&path);
+        let config = RuntimeConfig::default();
+        store.save(&config).expect("save config");
+        assert_eq!(
+            store.load().expect("load config").unwrap().schema_version,
+            1
+        );
+        let mut legacy = serde_json::to_value(config).expect("serialize config");
+        legacy.as_object_mut().unwrap().remove("schemaVersion");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).expect("write legacy config");
+        assert_eq!(store.load().unwrap().unwrap().schema_version, 1);
+        fs::remove_file(path).expect("remove config");
+    }
+}

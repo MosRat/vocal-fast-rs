@@ -11,6 +11,8 @@ pub enum AudioError {
     QueueEmpty,
     #[error("invalid audio configuration: {0}")]
     InvalidConfig(String),
+    #[error("audio processing failed: {0}")]
+    Processing(String),
     #[error("audio block has the wrong number of samples: expected {expected}, got {actual}")]
     BlockSizeMismatch { expected: usize, actual: usize },
     #[error("audio callback data is not a whole number of frames")]
@@ -28,6 +30,7 @@ impl AudioError {
             Self::QueueFull => "audio.queue_full",
             Self::QueueEmpty => "audio.queue_empty",
             Self::InvalidConfig(_) => "audio.invalid_config",
+            Self::Processing(_) => "audio.processing",
             Self::BlockSizeMismatch { .. } => "audio.block_size_mismatch",
             Self::PartialFrame => "audio.partial_frame",
             Self::AllocationFailed(_) => "audio.allocation_failed",

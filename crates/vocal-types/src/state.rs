@@ -30,7 +30,7 @@ impl LifecycleState {
                 )
                 | (Self::Running, Self::Stopping | Self::Failed)
                 | (Self::Stopping, Self::Stopped | Self::Failed)
-                | (Self::Stopped, Self::Loading | Self::Ready)
+                | (Self::Stopped, Self::Loading | Self::Ready | Self::Running)
                 | (
                     Self::Failed,
                     Self::Created | Self::Loading | Self::Ready | Self::Stopping

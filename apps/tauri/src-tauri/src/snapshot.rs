@@ -5,8 +5,6 @@
 //! becoming coupled to the JSON shape consumed by the frontend.
 
 use serde::Serialize;
-use vocal_engine::EngineStatus;
-use vocal_model::RvcModelManifest;
 use vocal_types::{LatencyMetrics, LifecycleState};
 
 use crate::{
@@ -15,31 +13,7 @@ use crate::{
     events::ErrorReport,
 };
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelSummary {
-    pub id: String,
-    pub display_name: String,
-    pub architecture: String,
-    pub version: String,
-    pub sample_rate: u32,
-    pub feature_dims: usize,
-    pub uses_f0: bool,
-}
-
-impl From<&RvcModelManifest> for ModelSummary {
-    fn from(manifest: &RvcModelManifest) -> Self {
-        Self {
-            id: manifest.id.clone(),
-            display_name: manifest.display_name.clone(),
-            architecture: manifest.architecture.clone(),
-            version: manifest.version.clone(),
-            sample_rate: manifest.sample_rate,
-            feature_dims: manifest.feature_dims(),
-            uses_f0: manifest.uses_f0(),
-        }
-    }
-}
+pub use vocal_runtime::ModelSummary;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +59,16 @@ impl From<LatencyMetrics> for UiMetrics {
     }
 }
 
+impl From<vocal_runtime::RuntimeMetrics> for UiMetrics {
+    fn from(metrics: vocal_runtime::RuntimeMetrics) -> Self {
+        Self {
+            input_frames: metrics.input_frames,
+            processing_micros: metrics.processing_micros,
+            output_frames: metrics.output_frames,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiEngineStatus {
@@ -94,8 +78,8 @@ pub struct UiEngineStatus {
     pub last_error: Option<String>,
 }
 
-impl From<EngineStatus> for UiEngineStatus {
-    fn from(status: EngineStatus) -> Self {
+impl From<vocal_runtime::RuntimeEngineStatus> for UiEngineStatus {
+    fn from(status: vocal_runtime::RuntimeEngineStatus) -> Self {
         Self {
             state: status.state,
             processed_chunks: status.processed_chunks,

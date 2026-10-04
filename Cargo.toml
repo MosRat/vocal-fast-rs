@@ -5,6 +5,7 @@ members = [
     "crates/vocal-audio",
     "crates/vocal-model",
     "crates/vocal-engine",
+    "crates/vocal-runtime",
     "crates/vocal-tensorrt",
     "crates/vocal-cli",
 ]
@@ -26,3 +27,4 @@ vocal-types = { path = "crates/vocal-types" }
 vocal-audio = { path = "crates/vocal-audio" }
 vocal-model = { path = "crates/vocal-model" }
 vocal-engine = { path = "crates/vocal-engine" }
+vocal-runtime = { path = "crates/vocal-runtime" }

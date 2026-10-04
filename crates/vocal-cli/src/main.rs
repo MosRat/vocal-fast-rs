@@ -4,15 +4,13 @@ use std::{io::Read, time::Instant};
 use vocal_audio::{AudioRing, StreamConfig};
 #[cfg(not(feature = "tensorrt-rtx"))]
 use vocal_engine::tensorrt::{TensorRtCompiler, TrtExecCompiler};
-use vocal_engine::{
-    BackendKind, EngineConfig, create_engine,
-    tensorrt::{TensorRtGraphOptions, build_rvc_graph},
-};
+use vocal_engine::tensorrt::{TensorRtGraphOptions, build_rvc_graph};
 use vocal_model::{
     ACOUSTIC_TENSOR_SCHEMA, load_cache, load_directory, load_manifest, load_rvc_directory,
     load_rvc_onnx, load_rvc_pth, write_cache,
 };
-use vocal_types::{AudioChunk, AudioFormat, ConversionConfig};
+use vocal_runtime::{RuntimeBackend, RuntimeConfig, RuntimeContext};
+use vocal_types::{AudioChunk, AudioFormat, ModelDescriptor};
 
 mod cli_config;
 mod cli_error;
@@ -1052,28 +1050,32 @@ fn benchmark_trt(
 
 fn demo(blocks: usize) -> CliResult<()> {
     let format = AudioFormat::MONO_16K;
-    let mut engine = create_engine(EngineConfig {
-        backend: BackendKind::RvcCpuPipeline,
-        model: vocal_types::ModelDescriptor {
-            id: "fixture".into(),
-            display_name: "Fixture".into(),
-            architecture: "rvc-v2".into(),
-            sample_rate: format.sample_rate,
-            version: "0.1".into(),
-        },
+    let context = RuntimeContext::new(RuntimeConfig {
+        input_format: format,
+        output_format: format,
+        backend: RuntimeBackend::RvcCpu,
+        ..RuntimeConfig::default()
     })?;
+    context.load_model_descriptor(ModelDescriptor {
+        id: "fixture".into(),
+        display_name: "Fixture".into(),
+        architecture: "rvc-v2".into(),
+        sample_rate: format.sample_rate,
+        version: "0.1".into(),
+    })?;
+    context.start_processing()?;
     for sequence in 0..blocks {
         let input = AudioChunk {
             format,
             samples: vec![0.0; 160],
             sequence: sequence as u64,
         };
-        let _output = engine.process(&input, ConversionConfig::default())?;
+        let _output = context.process(&input)?;
     }
+    let snapshot = context.snapshot()?;
     println!(
         "processed {} blocks; metrics={:?}",
-        blocks,
-        engine.metrics()
+        blocks, snapshot.metrics
     );
     Ok(())
 }

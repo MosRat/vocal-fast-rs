@@ -11,10 +11,8 @@ use vocal_audio::{
     AudioClock, AudioError, StreamConfig, StreamIo, StreamQueueConfig, WorkerInputPolicy,
     WorkerSchedule,
 };
-use vocal_engine::InferenceEngine;
+use vocal_runtime::{RuntimeConfig, RuntimeContext};
 use vocal_types::{AudioChunk, LifecycleState};
-
-use crate::config::GuiConfig;
 
 const WORKER_WAIT: Duration = Duration::from_millis(100);
 
@@ -135,8 +133,8 @@ impl AudioSession {
     }
 
     pub fn start(
-        config: &GuiConfig,
-        engine: Box<dyn InferenceEngine>,
+        config: &RuntimeConfig,
+        runtime: RuntimeContext,
         report: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<Self, String> {
         let host = recommended_host();
@@ -179,7 +177,6 @@ impl AudioSession {
         let worker_alive_flag = Arc::clone(&worker_alive);
         let telemetry = Arc::new(WorkerTelemetry::default());
         let worker_telemetry = Arc::clone(&telemetry);
-        let conversion = config.conversion;
         let format = config.input_format;
         let worker_report = Arc::clone(&report);
         let join = thread::Builder::new()
@@ -190,7 +187,6 @@ impl AudioSession {
                     timeout: Some(WORKER_WAIT),
                 };
                 let mut sequence = 0_u64;
-                let mut engine = engine;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !worker_stop.load(Ordering::Acquire) {
                     let result = worker_io.process_once(schedule, |input, output| {
@@ -200,9 +196,9 @@ impl AudioSession {
                             samples: input.to_vec(),
                             sequence,
                         };
-                        let converted = engine
-                            .process(&chunk, conversion)
-                            .map_err(|error| AudioError::InvalidConfig(error.to_string()))?;
+                        let converted = runtime
+                            .process(&chunk)
+                            .map_err(|error| AudioError::Processing(error.to_string()))?;
                         if converted.samples.len() != output.len() {
                             return Err(AudioError::BlockSizeMismatch {
                                 expected: output.len(),
@@ -303,21 +299,15 @@ impl AudioSession {
 
     /// Reclaim a stream whose worker has already exited. This is called from
     /// the control-plane snapshot path, so it never runs on the real-time
-    /// callbacks. If a worker is reporting its own failure, the current thread
-    /// skips `join`; a later snapshot or Drop completes that join safely.
+    /// callbacks. It deliberately does not join here: a worker may be waiting
+    /// for the application state lock while publishing its failure. Drop owns
+    /// the final join once the control-plane call has returned.
     pub fn reap_if_dead(&mut self) {
         if self.worker_alive.load(Ordering::Acquire) {
             return;
         }
         self.stop.store(true, Ordering::Release);
         self.stream.take();
-        let is_current = self
-            .join
-            .as_ref()
-            .is_some_and(|join| join.thread().id() == thread::current().id());
-        if !is_current && let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
     }
 }
 

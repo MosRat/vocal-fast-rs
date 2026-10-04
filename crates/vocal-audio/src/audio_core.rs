@@ -134,6 +134,9 @@ mod tests {
         stats.record_queue_depth(2);
         stats.record_queue_state(2, 4, 5, 1);
         stats.record_endpoint(480, 48_000);
+        stats.record_endpoint_capacity_for(AudioDirection::Render, 960, 48_000);
+        stats.record_stream_latency_for(AudioDirection::Render, 10_000);
+        stats.record_wake_to_buffer_for(AudioDirection::Render, Duration::from_micros(80));
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.underflow_samples, 4);
         assert_eq!(snapshot.timestamped_packets, 1);
@@ -147,6 +150,21 @@ mod tests {
             snapshot.max_endpoint_latency,
             Some(Duration::from_millis(10))
         );
+        assert_eq!(snapshot.endpoint_capacity_frames, 960);
+        assert_eq!(
+            snapshot.endpoint_capacity_latency,
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(snapshot.render.endpoint_capacity_frames, 960);
+        assert_eq!(
+            snapshot.render.endpoint_capacity_latency,
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(
+            snapshot.render.stream_latency,
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(snapshot.render.wake_to_buffer_samples, 1);
     }
 
     #[test]
@@ -383,5 +401,75 @@ mod tests {
         assert_eq!(snapshot.render.max_endpoint_frames, 480);
         assert_eq!(snapshot.render.clock_samples, 2);
         assert_eq!(snapshot.render.clock_drift_ppm, Some(0));
+    }
+
+    #[test]
+    fn frame_slip_correction_is_bounded_to_one_source_frame() {
+        let mut ring = AudioRing::new(StreamConfig {
+            block_frames: 2,
+            queue_blocks: 4,
+            ..config()
+        })
+        .unwrap();
+        ring.push(&[1.0, 2.0]).unwrap();
+        ring.push(&[3.0, 4.0]).unwrap();
+        ring.push(&[5.0, 6.0]).unwrap();
+        let (producer, mut consumer) = ring.split();
+        drop(producer);
+        let mut drainer = BlockDrainer::new(StreamConfig {
+            block_frames: 2,
+            queue_blocks: 4,
+            ..config()
+        })
+        .unwrap();
+        let mut output = [0.0; 4];
+        drainer
+            .drain_with_slip(&mut output, &mut consumer, FrameSlip::Drop)
+            .unwrap();
+        assert_eq!(output, [1.0, 2.0, 4.0, 5.0]);
+
+        let mut ring = AudioRing::new(StreamConfig {
+            block_frames: 2,
+            queue_blocks: 4,
+            ..config()
+        })
+        .unwrap();
+        ring.push(&[1.0, 2.0]).unwrap();
+        ring.push(&[3.0, 4.0]).unwrap();
+        let (_, mut consumer) = ring.split();
+        let mut drainer = BlockDrainer::new(StreamConfig {
+            block_frames: 2,
+            queue_blocks: 4,
+            ..config()
+        })
+        .unwrap();
+        drainer
+            .drain_with_slip(&mut output, &mut consumer, FrameSlip::Duplicate)
+            .unwrap();
+        assert_eq!(output, [1.0, 2.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn frame_drop_clears_tail_when_no_replacement_frame_exists() {
+        let mut ring = AudioRing::new(StreamConfig {
+            block_frames: 2,
+            queue_blocks: 1,
+            ..config()
+        })
+        .unwrap();
+        ring.push(&[1.0, 2.0]).unwrap();
+        let (_, mut consumer) = ring.split();
+        let mut drainer = BlockDrainer::new(StreamConfig {
+            block_frames: 2,
+            queue_blocks: 1,
+            ..config()
+        })
+        .unwrap();
+        let mut output = [99.0; 4];
+        let report = drainer
+            .drain_with_slip(&mut output, &mut consumer, FrameSlip::Drop)
+            .unwrap();
+        assert_eq!(output, [1.0, 2.0, 0.0, 0.0]);
+        assert_eq!(report.underflow_samples, 2);
     }
 }

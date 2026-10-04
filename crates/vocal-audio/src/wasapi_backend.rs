@@ -2,9 +2,9 @@
 //!
 //! This module is intentionally behind `wasapi-backend` and only compiles on
 //! Windows. It keeps COM and WASAPI interfaces on their owning threads, then
-//! exposes the same [`WorkerIo`] lease API as the portable adapter. No mutex is
-//! used on the capture or render hot path; the mutex below only records a
-//! control-plane device error for the UI.
+//! exposes the same [`WorkerIo`] lease API as the portable adapter. No mutex or
+//! allocation is used on the capture or render hot path; control-plane errors
+//! are retained in a lock-free one-shot state.
 
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,8 +32,8 @@ compile_error!("the WASAPI f32 path requires a little-endian Windows target");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WasapiMode {
-    /// Shared mode with event-driven scheduling. Windows chooses the engine
-    /// period; this is the interoperable default.
+    /// Shared mode with event-driven scheduling. Windows 10+ selects a legal
+    /// low-latency engine period through `IAudioClient3`; this is the default.
     SharedEvent,
     /// Exclusive event-driven mode. The requested block period is passed to
     /// the driver and must be supported by the endpoint.
@@ -626,6 +626,7 @@ fn capture_loop(
             match direct_result {
                 Ok(Some((true, _, _))) => {
                     if let Some(latency) = latency.as_ref() {
+                        latency.record_block_path(AudioDirection::Capture, true);
                         let stats = input.stats();
                         latency.record_queue_state_for(
                             AudioDirection::Capture,
@@ -647,6 +648,7 @@ fn capture_loop(
                         }
                     }
                     if let Some(latency) = latency.as_ref() {
+                        latency.record_block_path(AudioDirection::Capture, false);
                         let stats = input.stats();
                         latency.record_queue_state_for(
                             AudioDirection::Capture,
@@ -688,6 +690,7 @@ fn capture_loop(
                 }
             }
             if let Some(latency) = latency.as_ref() {
+                latency.record_block_path(AudioDirection::Capture, false);
                 let stats = input.stats();
                 latency.record_queue_state_for(
                     AudioDirection::Capture,
@@ -779,6 +782,7 @@ fn render_loop(
                 Ok(Some(timestamp)) => {
                     drainer.record_direct_block();
                     if let Some(latency) = profile.stats.as_ref() {
+                        latency.record_block_path(AudioDirection::Render, true);
                         let stats = output.stats();
                         latency.record_queue_state_for(
                             AudioDirection::Render,
@@ -820,6 +824,7 @@ fn render_loop(
             }
         };
         if let Some(latency) = profile.stats.as_ref() {
+            latency.record_block_path(AudioDirection::Render, false);
             latency.record_underflow(report.underflow_samples);
             let stats = output.stats();
             latency.record_queue_state_for(

@@ -211,6 +211,7 @@ fn build_duplex_inner(
                     .unwrap_or(AudioTimestamp::ZERO);
                 let _ = assembler.push_at(data, &mut input_producer, timestamp);
                 if let Some(latency) = input_latency.as_ref() {
+                    latency.record_block_path(AudioDirection::Capture, false);
                     latency.record_assembler_buffered(
                         assembler
                             .buffered_samples()
@@ -252,6 +253,7 @@ fn build_duplex_inner(
                 match drainer.drain(data, &mut output_consumer) {
                     Ok(report) => {
                         if let Some(latency) = output_latency.as_ref() {
+                            latency.record_block_path(AudioDirection::Render, false);
                             latency.record_drainer_pending(
                                 drainer
                                     .pending_samples()

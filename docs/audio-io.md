@@ -114,6 +114,15 @@ needed to decide when a future asynchronous resampler should add or remove a
 frame. The current data path never changes sample count from telemetry alone.
 Endpoint capacity is kept separate from runtime current-padding samples, and
 the latter has p50/p95/p99/p99.9 fields for each direction.
+The directional profile also reports direct versus staged block counts and a
+direct-path percentage, which can be used to validate the selected engine
+period on real hardware. `endpoint_capacity_*` is the static endpoint buffer
+size, while `max_endpoint_*` and the percentile fields describe runtime
+`GetCurrentPadding()` samples. Native WASAPI additionally reports
+`stream_latency`, taken from `IAudioClient::GetStreamLatency`, and
+`wake_to_buffer_*`, measuring the time from an event wake to endpoint buffer
+acquisition. These values make safety offset, queued device frames, and
+scheduling delay visible as separate terms.
 The default methods write `AudioTimestamp::ZERO`, so production streams do not
 pay for a clock read on every callback.
 
@@ -159,7 +168,11 @@ render avoid per-sample format conversion. When the endpoint packet is exactly
 one model block, capture writes directly into a ring lease and render writes a
 ring lease directly through `GetBuffer`/`ReleaseBuffer`'s high-level wrapper;
 the assembler/drainer staging copy is then skipped. Variable packet sizes and
-underflow still use the bounded staging buffers.
+underflow still use the bounded staging buffers. The native path remains
+strict f32 with the device mix rate and channel count. Applications that need
+another format can implement `AudioFormatAdapter` and run it around `StreamIo`
+with caller-owned scratch buffers; the native callback does not perform
+implicit conversion or invoke that trait.
 
 Capture and render event threads register with Windows MMCSS under the
 `Pro Audio` task category. Registration is scoped to each thread and is

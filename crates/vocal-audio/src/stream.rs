@@ -333,6 +333,17 @@ pub struct DrainReport {
     pub source_timestamp: AudioTimestamp,
 }
 
+/// One-frame correction used by an asynchronous device-clock controller.
+/// Corrections are intentionally frame sized and placed away from the block
+/// boundary to avoid changing the worker's fixed block contract.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FrameSlip {
+    #[default]
+    None,
+    Drop,
+    Duplicate,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrainStats {
     pub blocks_consumed: u64,
@@ -421,6 +432,89 @@ impl BlockDrainer {
                 .copy_from_slice(&self.current[self.offset..self.offset + take]);
             self.offset += take;
             written += take;
+        }
+        self.record(report);
+        Ok(report)
+    }
+
+    /// Drain with one optional frame slip. `Drop` consumes one additional
+    /// source frame and `Duplicate` consumes one fewer source frame. The
+    /// normal path remains the existing zero-copy/direct fast path.
+    pub fn drain_with_slip(
+        &mut self,
+        output: &mut [f32],
+        consumer: &mut AudioConsumer,
+        slip: FrameSlip,
+    ) -> Result<DrainReport, AudioError> {
+        if slip == FrameSlip::None {
+            return self.drain(output, consumer);
+        }
+        if !output
+            .len()
+            .is_multiple_of(self.config.format.channels as usize)
+        {
+            return Err(AudioError::PartialFrame);
+        }
+        let channels = self.config.format.channels as usize;
+        let output_frames = output.len() / channels;
+        if output_frames < 2 {
+            return self.drain(output, consumer);
+        }
+        let correction_frame = output_frames / 2;
+        let mut report = DrainReport::default();
+
+        for frame in 0..output_frames {
+            if self.offset == self.current.len() {
+                match consumer.try_copy_into_with_timestamp(&mut self.current) {
+                    Ok((_, timestamp)) => {
+                        self.offset = 0;
+                        self.current_timestamp = timestamp;
+                        if !report.source_timestamp.is_set() {
+                            report.source_timestamp = timestamp;
+                        }
+                        report.blocks_consumed += 1;
+                    }
+                    Err(AudioError::QueueEmpty) => {
+                        let start = frame * channels;
+                        output[start..].fill(0.0);
+                        report.underflow_samples += output.len() - start;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            if frame == correction_frame && slip == FrameSlip::Drop {
+                self.offset += channels;
+                if self.offset == self.current.len() && frame + 1 < output_frames {
+                    match consumer.try_copy_into_with_timestamp(&mut self.current) {
+                        Ok((_, timestamp)) => {
+                            self.offset = 0;
+                            self.current_timestamp = timestamp;
+                            report.blocks_consumed += 1;
+                        }
+                        Err(AudioError::QueueEmpty) => {
+                            // The dropped source frame has no replacement.
+                            // Clear it as well as the remaining tail: the
+                            // caller normally reuses a pre-allocated output
+                            // buffer, so leaving this range untouched would
+                            // replay samples from the previous callback.
+                            let start = frame * channels;
+                            output[start..].fill(0.0);
+                            report.underflow_samples += output.len() - start;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+
+            let start = frame * channels;
+            output[start..start + channels]
+                .copy_from_slice(&self.current[self.offset..self.offset + channels]);
+            if !(frame == correction_frame && slip == FrameSlip::Duplicate) {
+                self.offset += channels;
+            }
         }
         self.record(report);
         Ok(report)

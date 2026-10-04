@@ -68,7 +68,8 @@ impl AppState {
     }
 
     pub fn snapshot(&self) -> GuiResult<UiSnapshot> {
-        Ok(self.lock()?.snapshot())
+        let mut state = self.lock()?;
+        Ok(state.snapshot())
     }
 
     pub fn list_audio_devices(&self) -> GuiResult<AudioDeviceCatalog> {
@@ -519,7 +520,10 @@ fn descriptor_clone(state: &RuntimeState) -> Option<ModelDescriptor> {
 }
 
 impl RuntimeState {
-    fn snapshot(&self) -> UiSnapshot {
+    fn snapshot(&mut self) -> UiSnapshot {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.reap_if_dead();
+        }
         let audio = self
             .audio
             .as_ref()

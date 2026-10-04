@@ -277,18 +277,14 @@ impl AudioSession {
             })
             .unwrap_or_else(|| (0, 0, None, "Stopped".into()));
         let worker_alive = self.worker_alive.load(Ordering::Acquire);
-        let state = self
-            .stream
-            .as_ref()
-            .map(|stream| map_stream_state(stream.status().lifecycle))
-            .map(|state| {
-                if !worker_alive && state == LifecycleState::Running {
-                    LifecycleState::Failed
-                } else {
-                    state
-                }
-            })
-            .unwrap_or(LifecycleState::Stopped);
+        let state = if !worker_alive {
+            LifecycleState::Failed
+        } else {
+            self.stream
+                .as_ref()
+                .map(|stream| map_stream_state(stream.status().lifecycle))
+                .unwrap_or(LifecycleState::Stopped)
+        };
         AudioTelemetry {
             active: self.stream.is_some() && worker_alive,
             state,
@@ -302,6 +298,25 @@ impl AudioSession {
             queue_overflows,
             latency_p95_micros,
             stream_state,
+        }
+    }
+
+    /// Reclaim a stream whose worker has already exited. This is called from
+    /// the control-plane snapshot path, so it never runs on the real-time
+    /// callbacks. If a worker is reporting its own failure, the current thread
+    /// skips `join`; a later snapshot or Drop completes that join safely.
+    pub fn reap_if_dead(&mut self) {
+        if self.worker_alive.load(Ordering::Acquire) {
+            return;
+        }
+        self.stop.store(true, Ordering::Release);
+        self.stream.take();
+        let is_current = self
+            .join
+            .as_ref()
+            .is_some_and(|join| join.thread().id() == thread::current().id());
+        if !is_current && let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }

@@ -37,6 +37,13 @@ so it changes loading and build memory traffic rather than model semantics.
 Full FP16 is substantially faster in this fixed-shape Synth-only benchmark,
 but its error is outside the default parity gate and must remain opt-in.
 
+The existing `VOCAL_TRT_SYNTH_FUSE_RESBLOCK_SCALE=1` switch was also tested
+with the mixed policy at this shape.  It measured 41.26 ms, relative L2
+3.2073%, and cosine 0.9994856 versus 39.99 ms, 3.0637%, and 0.9995356
+without folding.  Because low-precision weight rounding makes this transform
+slightly less accurate and slower in this build, it remains opt-in rather than
+being used as the default FP16 boundary fix.
+
 ## Build
 
 ```powershell

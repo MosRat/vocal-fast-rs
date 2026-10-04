@@ -296,7 +296,10 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Pickle, ModelError> {
                 vm.push(Value::Int(i128::from_le_bytes(n)));
             }
             b'G' => {
-                let raw: [u8; 8] = vm.take(8)?.try_into().unwrap();
+                let raw: [u8; 8] = vm
+                    .take(8)?
+                    .try_into()
+                    .map_err(|_| bad("pickle float payload is truncated"))?;
                 vm.push(Value::Float(f64::from_be_bytes(raw)));
             }
             b'X' | 0x8c | 0x8d => {

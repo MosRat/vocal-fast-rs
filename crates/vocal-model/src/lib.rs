@@ -8,28 +8,122 @@ use serde_json::Value;
 use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
-use thiserror::Error;
 use vocal_types::ModelDescriptor;
 
 mod acoustic;
 mod canonical;
+mod config;
+mod error;
+mod logging;
 mod onnx;
 mod pickle;
 mod schema;
+mod state;
 
 pub use acoustic::{
     ACOUSTIC_TENSOR_SCHEMA, AcousticConfig, AcousticKind, AcousticPort, AcousticTensorMap,
 };
+pub use config::{
+    CACHE_ALIGNMENT, CACHE_HEADER_BYTES, CACHE_MAGIC, DEFAULT_MAX_METADATA_BYTES,
+    DEFAULT_MAX_TENSOR_BYTES, DEFAULT_MAX_TENSORS, ModelLoadConfig,
+};
+pub use error::ModelError;
 pub use schema::{RVC_TENSOR_SCHEMA, RvcSynthConfig};
+pub use state::{ModelLoadState, ModelLoadStatus};
 
-pub const CACHE_MAGIC: &[u8; 8] = b"VFRM\0\0\0\x01";
-pub const CACHE_HEADER_BYTES: u64 = 64;
-pub const CACHE_ALIGNMENT: u64 = 64;
-const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TENSORS: u64 = 100_000;
-const MAX_TENSOR_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Stateful model access facade. It keeps policy and lifecycle information
+/// together while the free functions remain available for simple callers.
+pub struct ModelLoader {
+    config: ModelLoadConfig,
+    status: ModelLoadStatus,
+}
+
+impl ModelLoader {
+    pub fn new(config: ModelLoadConfig) -> Result<Self, ModelError> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            status: ModelLoadStatus::default(),
+        })
+    }
+
+    pub fn config(&self) -> &ModelLoadConfig {
+        &self.config
+    }
+
+    pub fn status(&self) -> &ModelLoadStatus {
+        &self.status
+    }
+
+    pub fn load_manifest(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<RvcModelManifest, ModelError> {
+        let config = self.config.clone();
+        self.run("manifest", || load_manifest_with_config(path, &config))
+    }
+
+    pub fn load_cache(&mut self, path: impl AsRef<Path>) -> Result<ModelPackage, ModelError> {
+        let config = self.config.clone();
+        self.run("cache", || load_cache_with_config(path, &config))
+    }
+
+    pub fn load_directory(
+        &mut self,
+        root: impl AsRef<Path>,
+        manifest: RvcModelManifest,
+    ) -> Result<ModelPackage, ModelError> {
+        let config = self.config.clone();
+        self.run("directory", || {
+            load_directory_with_config(root, manifest, &config)
+        })
+    }
+
+    pub fn load_rvc_directory(
+        &mut self,
+        root: impl AsRef<Path>,
+        manifest: RvcModelManifest,
+    ) -> Result<ModelPackage, ModelError> {
+        let config = self.config.clone();
+        self.run("rvc-directory", || {
+            load_rvc_directory_with_config(root, manifest, &config)
+        })
+    }
+
+    pub fn write_cache(
+        &mut self,
+        path: impl AsRef<Path>,
+        package: &ModelPackage,
+    ) -> Result<(), ModelError> {
+        let config = self.config.clone();
+        self.run("cache-write", || {
+            write_cache_with_config(path, package, &config)
+        })
+    }
+
+    fn run<T>(
+        &mut self,
+        operation: &'static str,
+        load: impl FnOnce() -> Result<T, ModelError>,
+    ) -> Result<T, ModelError> {
+        self.status.begin();
+        logging::load_started(operation);
+        match load() {
+            Ok(value) => {
+                self.status.ready();
+                logging::load_finished(operation, 0);
+                Ok(value)
+            }
+            Err(error) => {
+                self.status.failed();
+                logging::load_failed(operation);
+                Err(error)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RvcModelManifest {
@@ -187,21 +281,23 @@ impl ModelPackage {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum ModelError {
-    #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
-    #[error("manifest JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("invalid cache: {0}")]
-    InvalidCache(String),
-    #[error("missing model file: {0}")]
-    MissingFile(PathBuf),
-    #[error("unsupported RVC model: {0}")]
-    UnsupportedModel(String),
+pub fn load_manifest(path: impl AsRef<Path>) -> Result<RvcModelManifest, ModelError> {
+    load_manifest_with_config(path, &ModelLoadConfig::default())
 }
 
-pub fn load_manifest(path: impl AsRef<Path>) -> Result<RvcModelManifest, ModelError> {
+pub fn load_manifest_with_config(
+    path: impl AsRef<Path>,
+    config: &ModelLoadConfig,
+) -> Result<RvcModelManifest, ModelError> {
+    config.validate()?;
+    let path = path.as_ref();
+    let size = fs::metadata(path)?.len();
+    if size > config.max_metadata_bytes {
+        return Err(ModelError::InvalidCache(format!(
+            "manifest is {size} bytes, limit is {}",
+            config.max_metadata_bytes
+        )));
+    }
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
@@ -209,18 +305,33 @@ pub fn load_directory(
     root: impl AsRef<Path>,
     manifest: RvcModelManifest,
 ) -> Result<ModelPackage, ModelError> {
+    load_directory_with_config(root, manifest, &ModelLoadConfig::default())
+}
+
+pub fn load_directory_with_config(
+    root: impl AsRef<Path>,
+    manifest: RvcModelManifest,
+    load_config: &ModelLoadConfig,
+) -> Result<ModelPackage, ModelError> {
+    load_config.validate()?;
     let root = root.as_ref();
     let model_path = root.join(&manifest.model_file);
     if !model_path.is_file() {
         return Err(ModelError::MissingFile(model_path));
     }
-    let mut tensors = vec![Tensor::byte_tensor("rvc.pth", fs::read(model_path)?)];
+    let mut tensors = vec![Tensor::byte_tensor(
+        "rvc.pth",
+        read_bounded_file(&model_path, load_config.max_tensor_bytes)?,
+    )];
     if let Some(file) = &manifest.index_file {
         let path = root.join(file);
         if !path.is_file() {
             return Err(ModelError::MissingFile(path));
         }
-        tensors.push(Tensor::byte_tensor("aux.retrieval.faiss", fs::read(path)?));
+        tensors.push(Tensor::byte_tensor(
+            "aux.retrieval.faiss",
+            read_bounded_file(&path, load_config.max_tensor_bytes)?,
+        ));
     }
     Ok(ModelPackage {
         manifest,
@@ -236,6 +347,16 @@ pub fn load_rvc_pth(
     path: impl AsRef<Path>,
     manifest: RvcModelManifest,
 ) -> Result<ModelPackage, ModelError> {
+    load_rvc_pth_with_config(path, manifest, &ModelLoadConfig::default())
+}
+
+pub fn load_rvc_pth_with_config(
+    path: impl AsRef<Path>,
+    manifest: RvcModelManifest,
+    load_config: &ModelLoadConfig,
+) -> Result<ModelPackage, ModelError> {
+    load_config.validate()?;
+    ensure_file_size(path.as_ref(), load_config.max_tensor_bytes)?;
     let (metadata, tensors) = pickle::load_rvc_pth(path.as_ref())?;
     validate_rvc_checkpoint_metadata(&manifest, &metadata)?;
     let (metadata, tensors) = canonical::normalize_pth(&manifest, metadata, tensors)?;
@@ -253,6 +374,15 @@ pub fn load_rvc_directory(
     root: impl AsRef<Path>,
     manifest: RvcModelManifest,
 ) -> Result<ModelPackage, ModelError> {
+    load_rvc_directory_with_config(root, manifest, &ModelLoadConfig::default())
+}
+
+pub fn load_rvc_directory_with_config(
+    root: impl AsRef<Path>,
+    manifest: RvcModelManifest,
+    load_config: &ModelLoadConfig,
+) -> Result<ModelPackage, ModelError> {
+    load_config.validate()?;
     let root = root.as_ref();
     let model_path = root.join(&manifest.model_file);
     let mut package = match model_path
@@ -261,8 +391,11 @@ pub fn load_rvc_directory(
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("pth") => load_rvc_pth(&model_path, manifest.clone())?,
-        Some("onnx") => load_rvc_onnx(&model_path, manifest.clone())?,
+        Some("pth") => load_rvc_pth_with_config(&model_path, manifest.clone(), load_config)?,
+        Some("onnx") => {
+            ensure_file_size(&model_path, load_config.max_tensor_bytes)?;
+            load_rvc_onnx(&model_path, manifest.clone())?
+        }
         _ => {
             return Err(ModelError::UnsupportedModel(
                 "RVC model must end in .pth or .onnx".into(),
@@ -274,9 +407,10 @@ pub fn load_rvc_directory(
         if !path.is_file() {
             return Err(ModelError::MissingFile(path));
         }
-        package
-            .tensors
-            .push(Tensor::byte_tensor("aux.retrieval.faiss", fs::read(path)?));
+        package.tensors.push(Tensor::byte_tensor(
+            "aux.retrieval.faiss",
+            read_bounded_file(&path, load_config.max_tensor_bytes)?,
+        ));
     }
     Ok(package)
 }
@@ -371,11 +505,24 @@ fn validate_rvc_checkpoint_metadata(
 
 /// VFRM v1: fixed header, config JSON, binary tensor directory, aligned data.
 pub fn write_cache(path: impl AsRef<Path>, package: &ModelPackage) -> Result<(), ModelError> {
-    validate_canonical_package(package)?;
+    write_cache_with_config(path, package, &ModelLoadConfig::default())
+}
+
+pub fn write_cache_with_config(
+    path: impl AsRef<Path>,
+    package: &ModelPackage,
+    load_config: &ModelLoadConfig,
+) -> Result<(), ModelError> {
+    load_config.validate()?;
+    if load_config.validate_canonical {
+        validate_canonical_package(package)?;
+    }
     let config = serde_json::to_vec(
         &serde_json::json!({"manifest": package.manifest, "metadata": package.metadata}),
     )?;
-    if config.len() as u64 > MAX_METADATA_BYTES || package.tensors.len() as u64 > MAX_TENSORS {
+    if config.len() as u64 > load_config.max_metadata_bytes
+        || package.tensors.len() as u64 > load_config.max_tensors
+    {
         return Err(ModelError::InvalidCache(
             "cache metadata or tensor count too large".into(),
         ));
@@ -432,6 +579,14 @@ pub fn write_cache(path: impl AsRef<Path>, package: &ModelPackage) -> Result<(),
 }
 
 pub fn load_cache(path: impl AsRef<Path>) -> Result<ModelPackage, ModelError> {
+    load_cache_with_config(path, &ModelLoadConfig::default())
+}
+
+pub fn load_cache_with_config(
+    path: impl AsRef<Path>,
+    load_config: &ModelLoadConfig,
+) -> Result<ModelPackage, ModelError> {
+    load_config.validate()?;
     let mut input = io::BufReader::new(fs::File::open(path)?);
     let mut magic = [0_u8; 8];
     input.read_exact(&mut magic)?;
@@ -447,9 +602,9 @@ pub fn load_cache(path: impl AsRef<Path>) -> Result<ModelPackage, ModelError> {
     let _reserved0 = read_u64(&mut input)?;
     let _reserved1 = read_u64(&mut input)?;
     if header_size != CACHE_HEADER_BYTES
-        || metadata_len > MAX_METADATA_BYTES
-        || tensor_count > MAX_TENSORS
-        || directory_len > MAX_TENSOR_BYTES
+        || metadata_len > load_config.max_metadata_bytes
+        || tensor_count > load_config.max_tensors
+        || directory_len > load_config.max_tensor_bytes
         || data_offset < CACHE_HEADER_BYTES + metadata_len + directory_len
     {
         return Err(ModelError::InvalidCache("invalid header bounds".into()));
@@ -487,7 +642,10 @@ pub fn load_cache(path: impl AsRef<Path>) -> Result<ModelPackage, ModelError> {
         }
         let offset = read_u64(&mut input)?;
         let len = read_u64(&mut input)?;
-        if offset < data_offset || len > MAX_TENSOR_BYTES || offset.checked_add(len).is_none() {
+        if offset < data_offset
+            || len > load_config.max_tensor_bytes
+            || offset.checked_add(len).is_none()
+        {
             return Err(ModelError::InvalidCache(
                 "tensor data range is invalid".into(),
             ));
@@ -518,7 +676,9 @@ pub fn load_cache(path: impl AsRef<Path>) -> Result<ModelPackage, ModelError> {
         metadata,
         tensors,
     };
-    validate_canonical_package(&package)?;
+    if load_config.validate_canonical {
+        validate_canonical_package(&package)?;
+    }
     Ok(package)
 }
 
@@ -544,6 +704,23 @@ fn validate_canonical_package(package: &ModelPackage) -> Result<(), ModelError> 
         package.validate_acoustic(None)?;
     }
     Ok(())
+}
+
+fn ensure_file_size(path: &Path, limit: u64) -> Result<(), ModelError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > limit {
+        return Err(ModelError::InvalidCache(format!(
+            "file {} is {} bytes, limit is {limit}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>, ModelError> {
+    ensure_file_size(path, limit)?;
+    Ok(fs::read(path)?)
 }
 
 fn align_up(value: u64, alignment: u64) -> u64 {

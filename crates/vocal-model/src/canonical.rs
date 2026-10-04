@@ -150,7 +150,7 @@ pub(crate) fn normalize_pth(
             continue;
         }
         if name == "enc_p.emb_phone.weight" || name == "dec.m_source.l_linear.weight" {
-            let tensor = source.get(name).unwrap();
+            let tensor = source.get(name).ok_or_else(|| missing(name))?;
             if tensor.shape.len() != 2 {
                 return Err(ModelError::UnsupportedModel(format!(
                     "invalid Linear checkpoint shape for {name}: {:?}",
@@ -186,7 +186,7 @@ pub(crate) fn normalize_pth(
         }
         consumed.insert(name.clone());
         entries.push(CanonicalTensor {
-            tensor: source.get(name).unwrap().clone(),
+            tensor: source.get(name).ok_or_else(|| missing(name))?.clone(),
             source_names: vec![name.clone()],
             transform: "identity",
         });

@@ -518,7 +518,10 @@ fn validate_signature(
     require_input(inputs, prefix, 3, &[1, 10])?;
     require_input(inputs, length, 1, &[7])?;
     require_input(inputs, speaker, 1, &[7])?;
-    let feature = inputs.iter().find(|x| x.name == prefix).unwrap();
+    let feature = inputs
+        .iter()
+        .find(|x| x.name == prefix)
+        .ok_or_else(|| ModelError::UnsupportedModel(format!("ONNX input {prefix} is missing")))?;
     let shape = shape_of(feature)?;
     if shape.len() != 3
         || shape[0] != Some(1)
@@ -533,7 +536,10 @@ fn validate_signature(
     if names.contains("pitch") {
         require_input(inputs, "pitch", 2, &[7])?;
         require_input(inputs, "pitchf", 2, &[1, 10])?;
-        let p = shape_of(inputs.iter().find(|x| x.name == "pitch").unwrap())?;
+        let p =
+            shape_of(inputs.iter().find(|x| x.name == "pitch").ok_or_else(|| {
+                ModelError::UnsupportedModel("pitch missing with pitchf".into())
+            })?)?;
         let pf =
             shape_of(inputs.iter().find(|x| x.name == "pitchf").ok_or_else(|| {
                 ModelError::UnsupportedModel("pitchf missing with pitch".into())
@@ -546,7 +552,9 @@ fn validate_signature(
     }
     if names.contains("rnd") {
         require_input(inputs, "rnd", 3, &[1, 10])?;
-        let rnd = shape_of(inputs.iter().find(|x| x.name == "rnd").unwrap())?;
+        let rnd = shape_of(inputs.iter().find(|x| x.name == "rnd").ok_or_else(|| {
+            ModelError::UnsupportedModel("rnd input disappeared during validation".into())
+        })?)?;
         if rnd.len() != 3 || rnd[0] != Some(1) || rnd[1] != Some(192) {
             return Err(ModelError::UnsupportedModel(
                 "RVC rnd input must be [1, 192, dynamic]".into(),

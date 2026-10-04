@@ -126,6 +126,8 @@ pub fn run() {
             commands::stop_session,
             commands::clear_error,
             commands::process_block,
+            commands::open_devtools,
+            commands::harden_webview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running vocal-fast Tauri application");

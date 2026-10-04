@@ -21,7 +21,8 @@ export type IconName =
   | 'alert'
   | 'cpu'
   | 'database'
-  | 'keyboard';
+  | 'keyboard'
+  | 'inspect';
 
 const paths: Record<IconName, string> = {
   waveform: '<path d="M3 12h2l2.2-6 3.6 12 2.2-8 1.8 4H21"/>',
@@ -54,6 +55,7 @@ const paths: Record<IconName, string> = {
     '<ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"/>',
   keyboard:
     '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10"/>',
+  inspect: '<circle cx="11" cy="11" r="6"/><path d="m16 16 4.5 4.5M11 8v6M8 11h6"/>',
 };
 
 export function icon(name: IconName, size = 18): string {

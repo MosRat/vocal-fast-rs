@@ -30,9 +30,34 @@ body::before {
   mix-blend-mode: soft-light;
 }
 
+html.splash-window body::before { display: none; }
+
+@media (prefers-reduced-transparency: reduce) {
+  body::before { display: none; }
+  .titlebar,
+  .sidebar,
+  .workspace-tabs,
+  .panel,
+  .splash-card { backdrop-filter: none; }
+  .titlebar { background: var(--surface-1); }
+  .sidebar,
+  .workspace-tabs,
+  .panel,
+  .splash-card { background: var(--surface-1); }
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .titlebar,
+  .sidebar,
+  .workspace-tabs,
+  .panel,
+  .splash-card { background: var(--surface-1); }
+}
+
 #app { position: relative; z-index: 1; }
 
 .titlebar {
+  -webkit-app-region: drag;
   background: color-mix(in srgb, var(--surface-1) 78%, transparent);
   box-shadow: 0 1px 0 var(--surface-highlight), 0 10px 35px rgba(0, 0, 0, .04);
 }
@@ -49,6 +74,7 @@ body::before {
 }
 
 .titlebar-tools { display: flex; align-items: center; gap: 4px; margin-left: auto; margin-right: 10px; }
+.titlebar-tools, .titlebar-tools *, .titlebar-actions, .titlebar-actions *, .titlebar-brand button { -webkit-app-region: no-drag; }
 .titlebar-tool { display: inline-flex; min-height: 30px; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid transparent; border-radius: 6px; color: var(--text-tertiary); background: transparent; font-size: 11px; cursor: pointer; transition: background .18s ease, border-color .18s ease, color .18s ease; }
 .titlebar-tool:hover { border-color: var(--border); color: var(--text); background: var(--surface-3); }
 .titlebar-tool:focus-visible { outline: none; box-shadow: var(--focus-ring); }

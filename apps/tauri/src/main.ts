@@ -51,6 +51,52 @@ function runningInTauri(): boolean {
   return '__TAURI_INTERNALS__' in window;
 }
 
+function isNativeInspectorShortcut(event: KeyboardEvent): boolean {
+  const modifier = event.ctrlKey || event.metaKey;
+  const key = event.key.toLowerCase();
+  return (
+    event.key === 'F12' ||
+    event.key === 'ContextMenu' ||
+    (event.shiftKey && event.key === 'F10') ||
+    (modifier && event.shiftKey && (key === 'i' || key === 'j' || key === 'c')) ||
+    (modifier && key === 'u')
+  );
+}
+
+/** Keep Tauri windows feeling like a native shell while leaving Vite preview usable. */
+function installNativeInteractionGuards(): void {
+  if (!runningInTauri()) return;
+  document.addEventListener(
+    'contextmenu',
+    (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    { capture: true },
+  );
+  document.addEventListener(
+    'auxclick',
+    (event) => {
+      if (event.button === 2) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    },
+    { capture: true },
+  );
+  window.addEventListener(
+    'keydown',
+    (event) => {
+      if (!isNativeInspectorShortcut(event)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    },
+    { capture: true },
+  );
+}
+
+installNativeInteractionGuards();
+
 function readStoredTheme(): ThemePreference {
   try {
     const value = localStorage.getItem(THEME_STORAGE_KEY);
@@ -115,7 +161,17 @@ async function openAuxiliaryWindow(kind: AuxiliaryWindow): Promise<void> {
       resizable: true,
       decorations: false,
       shadow: true,
+      visible: false,
+      devtools: true,
+      zoomHotkeysEnabled: false,
+      noRedirectionBitmap: true,
+      parent: 'main',
+      focus: true,
       center: true,
+    });
+    await child.once('tauri://created', async () => {
+      await child.show();
+      await child.setFocus();
     });
     await child.once('tauri://error', (event) => {
       localError = {
@@ -129,6 +185,18 @@ async function openAuxiliaryWindow(kind: AuxiliaryWindow): Promise<void> {
     localError = normalizeError(error);
     render();
   }
+}
+
+function openInspector(): void {
+  void runAction(
+    async () => {
+      if (!runningInTauri()) {
+        throw new Error('The native WebView inspector is available in the desktop app.');
+      }
+      await call('open_devtools');
+    },
+    'open-devtools',
+  );
 }
 
 function escapeHtml(value: string): string {
@@ -198,7 +266,7 @@ function renderErrorDialog(report: ErrorReport): string {
 }
 
 function renderTitlebar(): string {
-  return `<header class="titlebar" data-tauri-drag-region><div class="titlebar-brand"><div class="app-glyph">${icon('waveform', 17)}</div><span>vocal-fast</span><span class="titlebar-divider"></span><span class="titlebar-context">${activeSection === 'settings' ? 'Settings' : activeSection === 'diagnostics' ? 'Diagnostics' : 'Studio'}</span></div><div class="titlebar-tools"><button id="openDiagnostics" class="titlebar-tool" title="Open diagnostics window">${icon('chart', 15)}<span>Diagnostics</span></button><button id="openSettings" class="titlebar-tool" title="Open settings window">${icon('settings', 15)}<span>Settings</span></button></div><div class="titlebar-actions"><button id="minimizeWindow" class="window-button" title="Minimize">${icon('minimize', 15)}</button><button id="maximizeWindow" class="window-button" title="Maximize">${icon(windowMaximized ? 'restore' : 'maximize', 14)}</button><button id="closeWindow" class="window-button close" title="Close">${icon('close', 15)}</button></div></header>`;
+  return `<header class="titlebar" data-tauri-drag-region><div class="titlebar-brand"><div class="app-glyph">${icon('waveform', 17)}</div><span>vocal-fast</span><span class="titlebar-divider"></span><span class="titlebar-context">${activeSection === 'settings' ? 'Settings' : activeSection === 'diagnostics' ? 'Diagnostics' : 'Studio'}</span></div><div class="titlebar-tools"><button id="openDiagnostics" class="titlebar-tool" title="Open diagnostics window">${icon('chart', 15)}<span>Diagnostics</span></button><button id="openSettings" class="titlebar-tool" title="Open settings window">${icon('settings', 15)}<span>Settings</span></button><button id="openInspect" class="titlebar-tool" title="Open WebView inspector">${icon('inspect', 15)}<span>Inspect</span></button></div><div class="titlebar-actions"><button id="minimizeWindow" class="window-button" title="Minimize">${icon('minimize', 15)}</button><button id="maximizeWindow" class="window-button" title="Maximize">${icon(windowMaximized ? 'restore' : 'maximize', 14)}</button><button id="closeWindow" class="window-button close" title="Close">${icon('close', 15)}</button></div></header>`;
 }
 
 function renderTabs(): string {
@@ -464,6 +532,7 @@ function wireHandlers(): void {
   byId<HTMLButtonElement>('settingsStudio')?.addEventListener('click', () => navigateTo('studio'));
   byId<HTMLButtonElement>('openDiagnostics')?.addEventListener('click', () => void openAuxiliaryWindow('diagnostics'));
   byId<HTMLButtonElement>('openSettings')?.addEventListener('click', () => void openAuxiliaryWindow('settings'));
+  byId<HTMLButtonElement>('openInspect')?.addEventListener('click', openInspector);
   byId<HTMLButtonElement>('minimizeWindow')?.addEventListener('click', () => void windowCommand('minimize'));
   byId<HTMLButtonElement>('maximizeWindow')?.addEventListener('click', () => void windowCommand('maximize'));
   byId<HTMLButtonElement>('closeWindow')?.addEventListener('click', () => void windowCommand('close'));
@@ -511,6 +580,11 @@ async function connect(): Promise<void> {
     return;
   }
   try {
+    await call('harden_webview').catch((error) => {
+      // A non-Windows runtime may not expose WebView2 settings. The DOM
+      // guards still provide the same interaction policy in that case.
+      localError = normalizeError(error);
+    });
     const events = new Channel<BackendEvent>();
     events.onmessage = (event) => {
       if (event.sequence <= lastEventSequence) return;

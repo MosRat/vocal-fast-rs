@@ -1,4 +1,4 @@
-use tauri::{State, ipc::Channel};
+use tauri::{State, WebviewWindow, ipc::Channel};
 use vocal_types::AudioFormat;
 
 use crate::{
@@ -88,6 +88,68 @@ pub fn process_block(
             sequence,
         ),
     )
+}
+
+/// Open the native WebView inspector on an explicit user action.
+///
+/// DevTools are enabled in the Tauri feature set, but no browser shortcut or
+/// context menu is exposed by the frontend. Keeping this behind a command
+/// makes the escape hatch available to diagnostics and automation without
+/// making it part of the normal window interaction model.
+#[tauri::command]
+pub fn open_devtools(window: WebviewWindow) -> GuiResult<()> {
+    harden_webview_impl(&window)?;
+    window.open_devtools();
+    Ok(())
+}
+
+/// Disable browser-owned context menus and accelerator keys while keeping the
+/// WebView inspector enabled for the explicit diagnostics command.
+#[tauri::command]
+pub fn harden_webview(window: WebviewWindow) -> GuiResult<()> {
+    harden_webview_impl(&window)
+}
+
+fn harden_webview_impl(window: &WebviewWindow) -> GuiResult<()> {
+    #[cfg(windows)]
+    {
+        use std::sync::{Arc, Mutex};
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+        use windows_core::Interface;
+
+        let failure = Arc::new(Mutex::new(None::<String>));
+        let failure_in_callback = failure.clone();
+        window.with_webview(move |webview| {
+            let result = (|| -> Result<(), String> {
+                let core = unsafe { webview.controller().CoreWebView2() }
+                    .map_err(|error| error.to_string())?;
+                let settings = unsafe { core.Settings() }.map_err(|error| error.to_string())?;
+                unsafe {
+                    settings
+                        .SetAreDefaultContextMenusEnabled(false)
+                        .map_err(|error| error.to_string())?;
+                    let settings3 = settings
+                        .cast::<ICoreWebView2Settings3>()
+                        .map_err(|error| error.to_string())?;
+                    settings3
+                        .SetAreBrowserAcceleratorKeysEnabled(false)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if let Ok(mut slot) = failure_in_callback.lock() {
+                    *slot = Some(error);
+                }
+            }
+        })?;
+        if let Some(error) = failure.lock().ok().and_then(|mut slot| slot.take()) {
+            return Err(crate::error::GuiError::Internal(format!(
+                "failed to configure WebView2 interaction policy: {error}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn report<T>(state: &AppState, result: GuiResult<T>) -> GuiResult<T> {

@@ -65,10 +65,18 @@ T Layers::quantized_activation(T x,std::string const& name) {
 Weights Layers::w(std::string const& name) {
     auto& p=weight(name);
     if(real_type()==DataType::kFLOAT) return {DataType::kFLOAT,p.data,p.count};
+    // Preserve an already low-precision VFRM constant all the way into the
+    // TensorRT network.  This avoids the previous F16 -> F32 -> F16 host
+    // round trip and lets the builder account for the exact stored bits.
+    if (p.data16 != nullptr &&
+        ((real_type()==DataType::kHALF && p.dtype==4) ||
+         (real_type()==DataType::kBF16 && p.dtype==6))) {
+        return {real_type(), p.data16, p.count};
+    }
     low_constants.emplace_back(static_cast<size_t>(p.count));
     auto& dst=low_constants.back();
     for(int64_t i=0;i<p.count;++i)
-        dst[static_cast<size_t>(i)]=o.precision==1?float_to_half_bits(p.data[i]):float_to_bf16_bits(p.data[i]);
+        dst[static_cast<size_t>(i)]=o.precision==1?float_to_half_bits(p.scalar(i)):float_to_bf16_bits(p.scalar(i));
     return {real_type(),dst.data(),p.count};
 }
 Weights Layers::w_scaled(std::string const& name,float scale) {
@@ -77,7 +85,7 @@ Weights Layers::w_scaled(std::string const& name,float scale) {
     require(!o.quantize_weights,"scaled Synth weights are incompatible with weight-only INT8");
     floats.emplace_back(static_cast<size_t>(p.count));
     auto& values=floats.back();
-    for(int64_t i=0;i<p.count;++i) values[static_cast<size_t>(i)]=p.data[i]*scale;
+    for(int64_t i=0;i<p.count;++i) values[static_cast<size_t>(i)]=p.scalar(i)*scale;
     if(real_type()==DataType::kFLOAT) return {DataType::kFLOAT,values.data(),p.count};
     low_constants.emplace_back(static_cast<size_t>(p.count));
     auto& dst=low_constants.back();

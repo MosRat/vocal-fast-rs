@@ -159,33 +159,53 @@ def autocast(enabled: bool, device: torch.device):
 def decode(net, x, pitchf, g, mode: str, device: torch.device):
     """HiFi-GAN NSF decoder with selectable FP16 component boundaries."""
     dec = net.dec
-    use = lambda name: mode in (name, "decoder_full", "all_fp16")
+    # Keep the component switches explicit.  ``decoder_core_fp16`` models the
+    # deployment candidate that moves the expensive upsample/noise/post Conv
+    # operators to FP16 while retaining FP32 residual-block accumulation.
+    # ``decoder_full_no_source`` additionally moves residual Conv arithmetic to
+    # FP16 but leaves the NSF phase/source in FP32.  The source is tested
+    # separately because phase arithmetic is more sensitive than convolution.
+    full = mode in ("decoder_full", "decoder_full_no_source", "decoder_full_accum", "all_fp16")
+    core = mode in ("decoder_core_fp16", "decoder_full", "decoder_full_no_source", "decoder_full_accum", "all_fp16") or mode.startswith("decoder_core_stage")
+    source16 = mode in ("decoder_source", "decoder_full", "all_fp16")
+    pre16 = mode in ("decoder_pre", "decoder_full", "decoder_full_no_source", "decoder_full_accum", "all_fp16")
+    stage_mask = {f"decoder_core_stage{i}": 1 << i for i in range(len(dec.ups))}
+    post16 = core or mode == "decoder_post"
+    upsample16 = core or mode == "decoder_upsample"
+    noise16 = core or mode == "decoder_noise"
 
-    with autocast(use("decoder_source"), device):
+    with autocast(source16, device):
         har_source, _, _ = dec.m_source(pitchf, dec.upp)
     har_source = har_source.transpose(1, 2).float()
-    with autocast(use("decoder_pre"), device):
+    with autocast(pre16, device):
         x = dec.conv_pre(x)
         if g is not None:
             x = x + dec.cond(g)
     x = x.float()
     for i, (ups, noise_conv) in enumerate(zip(dec.ups, dec.noise_convs)):
         x = F.leaky_relu(x, dec.lrelu_slope)
-        with autocast(use("decoder_upsample"), device):
+        with autocast(upsample16, device):
             xu = ups(x)
-        with autocast(use("decoder_noise"), device):
+        with autocast(noise16, device):
             xn = noise_conv(har_source)
         x = (xu + xn).float()
         blocks = []
         for j in range(dec.num_kernels):
-            with autocast(use("decoder_resblocks"), device):
+            stage_enabled = full or mode == "decoder_resblocks" or (stage_mask.get(mode, 0) & (1 << i)) != 0
+            with autocast(stage_enabled, device):
                 blocks.append(dec.resblocks[i * dec.num_kernels + j](x))
-        x = (sum(v.float() for v in blocks) / dec.num_kernels).float()
+        # A half accumulation is deliberately a separate experiment.  The
+        # default full-decoder candidate still sums branches in FP32 even when
+        # each residual Conv runs in FP16.
+        if mode == "decoder_full_accum":
+            x = (sum(blocks) / dec.num_kernels).float()
+        else:
+            x = (sum(v.float() for v in blocks) / dec.num_kernels).float()
     # Match Applio HiFiGANNSFGenerator.forward: the final activation calls
     # F.leaky_relu without an explicit slope (PyTorch default 0.01), while
     # the upsample/residual loop uses LRELU_SLOPE=0.1.
     x = F.leaky_relu(x)
-    with autocast(use("decoder_post"), device):
+    with autocast(post16, device):
         x = torch.tanh(dec.conv_post(x))
     return x[:, 0].float()
 
@@ -264,7 +284,9 @@ def main() -> None:
     net, c = build_reference(config, tensors, inp["noise"])
     net.to(device).eval()
     modes = ["fp32", "encoder", "flow", "decoder_source", "decoder_pre", "decoder_upsample",
-             "decoder_noise", "decoder_resblocks", "decoder_post", "decoder_full", "all_fp16"]
+             "decoder_noise", "decoder_resblocks", "decoder_post", "decoder_core_fp16",
+             "decoder_core_stage0", "decoder_core_stage1", "decoder_core_stage2", "decoder_core_stage3",
+             "decoder_full_no_source", "decoder_full", "decoder_full_accum", "all_fp16"]
     # The reference is explicitly Applio/PyTorch FP32, independent of native TRT.
     ref = run_variant(net, inp, device, "fp32")
     report = {"reference": "Applio Synthesizer PyTorch FP32 eval/inference_mode",

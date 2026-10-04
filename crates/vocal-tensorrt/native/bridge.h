@@ -9,6 +9,7 @@
 #include <utility>
 #include <map>
 #include <cstdint>
+#include <cmath>
 
 namespace vocal {
 using LogCallback = void (*)(int severity, char const* message);
@@ -60,7 +61,21 @@ struct CudaGraphExec { cudaGraphExec_t exec{}; };
 struct CufftFrontend;
 // Versioned C data contract, independent of TensorRT C++ layouts. Rust validates
 // the canonical package before passing these borrowed arrays for the build call.
-struct Weight { char const* name; float const* data; int64_t count; int32_t rank; int64_t dims[4]; };
+// `data` is an F32 build-time mirror.  For VFRM F16/BF16 tensors `data16`
+// points at the original little-endian bits and `dtype` carries the canonical
+// TensorDType code (4 = F16, 6 = BF16, 5 = F32).  Keeping both views avoids a
+// lossy expand/repack round trip when TensorRT accepts a low-precision
+// constant directly, while preserving host-float graph transforms.
+struct Weight {
+    char const* name;
+    float const* data;
+    uint16_t const* data16;
+    int32_t dtype;
+    int64_t count;
+    int32_t rank;
+    int64_t dims[4];
+    float scalar(int64_t index) const noexcept;
+};
 struct Config {
     int32_t abi_version, feature_width, uses_f0, sample_rate, hidden, latent, filter, heads;
     int32_t encoder_layers, encoder_kernel, window, relative_heads, speakers, speaker_channels;
@@ -112,6 +127,12 @@ struct Options {
     int32_t synth_fuse_resblock_scale;
     // Replace ConvTranspose1d with polyphase Conv1d + shuffle.
     int32_t synth_polyphase_upsample;
+    // Full Synth decoder FP16 experiment. Learned decoder convolutions use
+    // the decoder type; residual accumulation/source remain independently
+    // selectable for accuracy.
+    int32_t synth_full_fp16;
+    int32_t synth_fp16_residual_accum;
+    int32_t synth_fp16_source;
     // RMVPE mixed-precision regions. Public I/O remains FP32. STFT, GRU, and
     // logits are fixed to FP32 by the native graph; their fields document the
     // ABI contract and are reserved for future experiments.
@@ -210,3 +231,50 @@ extern "C" int vocal_cuda_download_async(
     Memory* memory, size_t source_offset, HostMemory* destination,
     size_t destination_offset, size_t bytes, Stream* stream, char** error) noexcept;
 }
+
+namespace vocal {
+inline float half_bits_to_float(uint16_t bits) noexcept {
+    uint32_t sign = (static_cast<uint32_t>(bits & 0x8000U)) << 16;
+    uint32_t exponent = (bits >> 10) & 0x1fU;
+    uint32_t mantissa = bits & 0x3ffU;
+    uint32_t value{};
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            value = sign;
+        } else {
+            // Normalize the subnormal mantissa into the single-precision
+            // exponent range.  This branch is build-time only and is kept
+            // deliberately independent of CUDA host headers.
+            int shift = 0;
+            while ((mantissa & 0x400U) == 0) {
+                mantissa <<= 1;
+                ++shift;
+            }
+            mantissa &= 0x3ffU;
+            uint32_t e = static_cast<uint32_t>(127 - 15 - shift + 1);
+            value = sign | (e << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1fU) {
+        value = sign | 0x7f800000U | (mantissa << 13);
+    } else {
+        value = sign | ((exponent + 112U) << 23) | (mantissa << 13);
+    }
+    float result{};
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+inline float Weight::scalar(int64_t index) const noexcept {
+    if (index < 0 || index >= count) return 0.0f;
+    if (data != nullptr) return data[index];
+    if (data16 == nullptr) return 0.0f;
+    uint16_t bits = data16[index];
+    if (dtype == 6) {
+        uint32_t value = static_cast<uint32_t>(bits) << 16;
+        float result{};
+        std::memcpy(&result, &value, sizeof(result));
+        return result;
+    }
+    return half_bits_to_float(bits);
+}
+} // namespace vocal

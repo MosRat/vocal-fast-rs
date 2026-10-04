@@ -43,7 +43,12 @@ pub(crate) struct NativeConfig {
 #[repr(C)]
 pub(crate) struct NativeWeight {
     pub name: *const std::os::raw::c_char,
+    /// F32 is kept as a build-time mirror for graph transforms that need to
+    /// inspect or repack values.  Low-precision TensorRT constants can use
+    /// `data16` directly when the VFRM tensor already has that storage type.
     pub data: *const f32,
+    pub data16: *const u16,
+    pub dtype: i32,
     pub count: i64,
     pub rank: i32,
     pub dims: [i64; 4],
@@ -74,6 +79,9 @@ pub(crate) struct NativeOptions {
     pub synth_w8a8_activation_scale: f32,
     pub synth_fuse_resblock_scale: i32,
     pub synth_polyphase_upsample: i32,
+    pub synth_full_fp16: i32,
+    pub synth_fp16_residual_accum: i32,
+    pub synth_fp16_source: i32,
     pub rmvpe_encoder_precision: i32,
     pub rmvpe_decoder_precision: i32,
     pub rmvpe_stft_precision: i32,
@@ -227,7 +235,74 @@ pub(crate) fn tensor_f32(tensor: &Tensor) -> Result<Vec<f32>, NativeBuildError> 
     Ok(values)
 }
 
+/// Return the original two-byte representation for F16/BF16 tensors.
+///
+/// The native graph still receives an F32 mirror because a few graph rewrites
+/// (QKV packing and polyphase deconvolution) operate on host floats.  Keeping
+/// this second buffer lets the ordinary Synth convolution path pass the VFRM
+/// bits directly to TensorRT instead of expanding to F32 and converting back
+/// during graph construction.
+pub(crate) fn tensor_u16(tensor: &Tensor) -> Result<Vec<u16>, NativeBuildError> {
+    if !matches!(tensor.dtype, TensorDType::F16 | TensorDType::BF16) {
+        return Ok(Vec::new());
+    }
+    let (chunks, remainder) = tensor.data.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(NativeBuildError::Argument(format!(
+            "tensor {} byte length is not aligned to 16-bit storage",
+            tensor.name
+        )));
+    }
+    let count = tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &d| {
+            usize::try_from(d).ok().and_then(|d| acc.checked_mul(d))
+        })
+        .ok_or_else(|| {
+            NativeBuildError::Argument(format!("tensor {} shape overflows", tensor.name))
+        })?;
+    if chunks.len() != count {
+        return Err(NativeBuildError::Argument(format!(
+            "tensor {} element count mismatch",
+            tensor.name
+        )));
+    }
+    Ok(chunks
+        .iter()
+        .map(|bytes| u16::from_le_bytes(*bytes))
+        .collect())
+}
+
 pub(crate) fn c_string(value: impl AsRef<std::path::Path>) -> Result<CString, NativeBuildError> {
     CString::new(value.as_ref().to_string_lossy().as_bytes())
         .map_err(|_| NativeBuildError::Argument("path contains NUL".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_original_f16_bits() {
+        let tensor = Tensor {
+            name: "dec.conv_pre.weight".into(),
+            dtype: TensorDType::F16,
+            shape: vec![2],
+            data: vec![0x00, 0x3c, 0x00, 0xbc],
+        };
+        assert_eq!(tensor_u16(&tensor).unwrap(), vec![0x3c00, 0xbc00]);
+        assert_eq!(tensor_f32(&tensor).unwrap(), vec![1.0, -1.0]);
+    }
+
+    #[test]
+    fn non_low_precision_has_no_u16_view() {
+        let tensor = Tensor {
+            name: "dec.conv_pre.bias".into(),
+            dtype: TensorDType::F32,
+            shape: vec![1],
+            data: 1.0f32.to_le_bytes().to_vec(),
+        };
+        assert!(tensor_u16(&tensor).unwrap().is_empty());
+    }
 }

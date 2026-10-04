@@ -271,6 +271,9 @@ impl TensorRtConfig {
             }
             Err(_) => false,
         };
+        build.synth_full_fp16 = bool_value("VOCAL_TRT_SYNTH_FULL_FP16", false)?;
+        build.synth_fp16_residual_accum = bool_value("VOCAL_TRT_SYNTH_FP16_RESIDUAL_ACCUM", false)?;
+        build.synth_fp16_source = bool_value("VOCAL_TRT_SYNTH_FP16_SOURCE", false)?;
         build.log_build_options = bool_value("VOCAL_TRT_LOG_BUILD_OPTIONS", false)?;
         build.dispatch_tune = dispatch("VOCAL_TRT_DISPATCH_TUNE", DispatchTune::Auto)?;
         build.tactic_sources = mask("VOCAL_TRT_TACTIC_SOURCES", default_tactic_sources())?;
@@ -394,6 +397,20 @@ impl TensorRtConfig {
                     "Synth W8A8 and W8A16 masks cannot select the same Conv2 node".into(),
                 ));
             }
+        }
+        if (self.build.synth_full_fp16
+            || self.build.synth_fp16_residual_accum
+            || self.build.synth_fp16_source)
+            && self.build.synth_precision != PrecisionMode::Fp16
+        {
+            return Err(ConfigError::InvalidCombination(
+                "Synth FP16 decoder options require VOCAL_TRT_SYNTH_PRECISION=fp16".into(),
+            ));
+        }
+        if self.build.synth_fp16_residual_accum && !self.build.synth_full_fp16 {
+            return Err(ConfigError::InvalidCombination(
+                "VOCAL_TRT_SYNTH_FP16_RESIDUAL_ACCUM requires VOCAL_TRT_SYNTH_FULL_FP16=1".into(),
+            ));
         }
         self.profile
             .validate()
@@ -569,6 +586,9 @@ mod tests {
             "VOCAL_TRT_SYNTH_W8A8_CONV1_MASK",
             "VOCAL_TRT_SYNTH_W8A8_CONV2_MASK",
             "VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE",
+            "VOCAL_TRT_SYNTH_FULL_FP16",
+            "VOCAL_TRT_SYNTH_FP16_RESIDUAL_ACCUM",
+            "VOCAL_TRT_SYNTH_FP16_SOURCE",
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -602,6 +622,8 @@ mod tests {
             env::set_var("VOCAL_TRT_SYNTH_W8A16_CONV2_MASK", "0x30000");
             env::set_var("VOCAL_TRT_SYNTH_W8A8_CONV1_MASK", "0x1000");
             env::set_var("VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE", "0.0079044188");
+            env::set_var("VOCAL_TRT_SYNTH_FULL_FP16", "1");
+            env::set_var("VOCAL_TRT_SYNTH_FP16_SOURCE", "1");
             env::set_var("VOCAL_TRT_GRAPH_CACHE_SIZE", "4");
             env::set_var("VOCAL_TRT_GRAPH_MODE", "hybrid");
         }
@@ -612,6 +634,8 @@ mod tests {
         assert_eq!(config.build.synth_w8a16_conv2_mask, 0x30000);
         assert_eq!(config.build.synth_w8a8_conv1_mask, 0x1000);
         assert!((config.build.synth_w8a8_activation_scale - 0.0079044).abs() < 1e-6);
+        assert!(config.build.synth_full_fp16);
+        assert!(config.build.synth_fp16_source);
         assert_eq!(config.profile.min_samples, 44_960);
         assert_eq!(config.runtime.graph_cache_size, 4);
         assert_eq!(

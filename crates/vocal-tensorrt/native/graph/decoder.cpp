@@ -23,21 +23,30 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     // once at the decoder boundary. The large upsample path remains low
     // precision while the boundary avoids an unnecessary half round-trip.
     DataType decoder_type=real_type();
+    bool full_fp16=decoder_type==DataType::kHALF && o.synth_full_fp16!=0;
     T x=nullptr;
     if(decoder_type!=DataType::kFLOAT) {
-        auto z_fp=cast(z,DataType::kFLOAT);
-        auto speaker_fp=cast(speaker,DataType::kFLOAT);
-        active_type=DataType::kFLOAT;
-        x=add(conv(z_fp,"dec.conv_pre"),conv(speaker_fp,"dec.cond"));
+        if(full_fp16) {
+            active_type=decoder_type;
+            x=add(conv(z,"dec.conv_pre"),conv(speaker,"dec.cond"));
+        } else {
+            auto z_fp=cast(z,DataType::kFLOAT);
+            auto speaker_fp=cast(speaker,DataType::kFLOAT);
+            active_type=DataType::kFLOAT;
+            x=add(conv(z_fp,"dec.conv_pre"),conv(speaker_fp,"dec.cond"));
+        }
         active_type=decoder_type;
-        x=cast(x,decoder_type);
+        if(x->getType()!=decoder_type) x=cast(x,decoder_type);
     } else {
         x=add(conv(z,"dec.conv_pre"),conv(speaker,"dec.cond"));
     }
     if(o.debug_outputs)mark(x,"decoder_pre");
     T harmonic=nullptr;
     if(c.uses_f0) {
-        if(decoder_type!=DataType::kFLOAT) {
+        if(decoder_type!=DataType::kFLOAT && o.synth_fp16_source!=0) {
+            active_type=decoder_type;
+            harmonic=source(cast(pitchf,decoder_type),cast(noise,decoder_type));
+        } else if(decoder_type!=DataType::kFLOAT) {
             auto pitchf_fp=cast(pitchf,DataType::kFLOAT);
             auto noise_fp=cast(noise,DataType::kFLOAT);
             active_type=DataType::kFLOAT;
@@ -64,7 +73,10 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         if(o.debug_outputs)mark(x,("decoder_up_"+std::to_string(i)).c_str());
         if(harmonic) {
             int tail=1;for(int j=i+1;j<c.upsample_count;j++)tail*=c.rates[j];
-            if(decoder_type!=DataType::kFLOAT) {
+            if(full_fp16) {
+                active_type=decoder_type;
+                x=add(x,conv(harmonic,"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
+            } else if(decoder_type!=DataType::kFLOAT) {
                 active_type=DataType::kFLOAT;
                 x=add(cast(x,DataType::kFLOAT),conv(cast(harmonic,DataType::kFLOAT),"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
                 active_type=decoder_type;
@@ -81,8 +93,10 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         // source phase is the most sensitive NSF path.
         bool residual_low=decoder_type!=DataType::kFLOAT && o.synth_resblock_precision!=0 &&
             ((o.synth_resblock_stage_mask >> i) & 1) != 0;
-        DataType accum_type=residual_low?decoder_type:DataType::kFLOAT;
-        if(!residual_low) {
+        bool residual_compute_low=full_fp16 || residual_low;
+        bool residual_accum_low=full_fp16 && o.synth_fp16_residual_accum!=0 || residual_low;
+        DataType accum_type=residual_accum_low?decoder_type:DataType::kFLOAT;
+        if(accum_type==DataType::kFLOAT) {
             if(decoder_type!=DataType::kFLOAT) {
                 active_type=DataType::kFLOAT;
                 x=cast(x,DataType::kFLOAT);
@@ -92,6 +106,7 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         }
         auto operation_type=[&](int precision,int mask)->DataType {
             if(decoder_type==DataType::kFLOAT) return DataType::kFLOAT;
+            if(residual_compute_low) return decoder_type;
             if(precision!=0 && ((mask>>i)&1)!=0) return precision_type(precision);
             return accum_type;
         };
@@ -145,7 +160,7 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             active_type=accum_type;
             x=scale(sum,residual_scale);
         }
-        if(!residual_low && decoder_type!=DataType::kFLOAT) {
+        if(accum_type==DataType::kFLOAT && decoder_type!=DataType::kFLOAT) {
             active_type=decoder_type;
             x=cast(x,decoder_type);
         }
@@ -157,20 +172,31 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     if(o.debug_outputs) mark(post_input,"decoder_post_input");
     T pre=nullptr;
     if(decoder_type!=DataType::kFLOAT) {
-        active_type=DataType::kFLOAT;
-        pre=conv(cast(post_input,DataType::kFLOAT),"dec.conv_post",1,1,-1,false,
-                 fuse_residual_scale?residual_scale:1.0f);
-        active_type=decoder_type;
+        if(full_fp16) {
+            active_type=decoder_type;
+            pre=conv(post_input,"dec.conv_post",1,1,-1,false,
+                     fuse_residual_scale?residual_scale:1.0f);
+        } else {
+            active_type=DataType::kFLOAT;
+            pre=conv(cast(post_input,DataType::kFLOAT),"dec.conv_post",1,1,-1,false,
+                     fuse_residual_scale?residual_scale:1.0f);
+            active_type=decoder_type;
+        }
     } else {
         pre=conv(post_input,"dec.conv_post",1,1,-1,false,
                  fuse_residual_scale?residual_scale:1.0f);
     }
     if(o.debug_outputs)mark(pre,"audio_pre_tanh");
     if(decoder_type!=DataType::kFLOAT) {
-        active_type=DataType::kFLOAT;
-        auto audio=act(pre,ActivationType::kTANH);
-        active_type=decoder_type;
-        return audio;
+        if(full_fp16) {
+            active_type=decoder_type;
+            return act(pre,ActivationType::kTANH);
+        } else {
+            active_type=DataType::kFLOAT;
+            auto audio=act(pre,ActivationType::kTANH);
+            active_type=decoder_type;
+            return audio;
+        }
     }
     return act(pre,ActivationType::kTANH);
 }

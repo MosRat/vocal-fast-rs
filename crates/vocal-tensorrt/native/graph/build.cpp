@@ -14,6 +14,18 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 "invalid Synth conv1 precision");
         require(options->synth_resblock_conv2_precision>=0 && options->synth_resblock_conv2_precision<=2,
                 "invalid Synth conv2 precision");
+        require(options->synth_full_fp16==0 || options->synth_full_fp16==1,
+                "invalid Synth full FP16 option");
+        require(options->synth_fp16_residual_accum==0 || options->synth_fp16_residual_accum==1,
+                "invalid Synth FP16 residual accumulation option");
+        require(options->synth_fp16_source==0 || options->synth_fp16_source==1,
+                "invalid Synth FP16 source option");
+        if(options->synth_full_fp16 || options->synth_fp16_residual_accum || options->synth_fp16_source) {
+            require(options->precision==1,
+                    "Synth FP16 decoder options require FP16 Synth precision");
+        }
+        require(options->synth_fp16_residual_accum==0 || options->synth_full_fp16!=0,
+                "Synth FP16 residual accumulation requires full FP16 decoder");
         if(options->synth_w8a16_conv2_mask!=0) {
             require(options->precision==1,
                     "Synth W8A16 requires Synth FP16 activation precision");
@@ -116,9 +128,10 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
             g.use_low_precision();
             z=g.cast_real(z);
             speaker=g.cast_real(speaker);
-            // Keep F0 and deterministic NSF noise in FP32. The decoder owns
-            // any explicit cast needed for its low-precision convolutions;
-            // quantizing pitch before source synthesis amplifies phase error.
+        // Keep F0 and deterministic NSF noise in FP32 by default. The
+        // decoder owns any explicit cast needed for its low-precision
+        // convolutions; source FP16 is a separate diagnostic option because
+        // phase accumulation is more sensitive than Conv arithmetic.
         }
         auto audio=g.decoder(z,speaker,pitchf,noise);
         if(options->precision!=0) audio=g.cast(audio,DataType::kFLOAT);
@@ -129,6 +142,9 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                     std::string("[RVC] ") + std::to_string(n->getNbLayers()) +
                     " native layers, " + std::to_string(g.used.size()) +
                     " weights, F0=" + std::to_string(c->uses_f0) +
+                    ", synth_full_fp16=" + std::to_string(options->synth_full_fp16) +
+                    ", synth_fp16_residual_accum=" + std::to_string(options->synth_fp16_residual_accum) +
+                    ", synth_fp16_source=" + std::to_string(options->synth_fp16_source) +
                     ", fused_hubert_qkv=" + std::to_string(options->fused_qkv) +
                     ", fused_rvc_qkv=" + std::to_string(options->fused_rvc_qkv) +
                     ", synth_w8a16_conv2_mask=0x" + [&]{

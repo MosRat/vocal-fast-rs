@@ -395,6 +395,12 @@ pub struct RvcTrtPipelineArtifacts {
     #[serde(default)]
     pub synth_polyphase_upsample: bool,
     #[serde(default)]
+    pub synth_full_fp16: bool,
+    #[serde(default)]
+    pub synth_fp16_residual_accum: bool,
+    #[serde(default)]
+    pub synth_fp16_source: bool,
+    #[serde(default)]
     pub dispatch_tune: DispatchTune,
     #[serde(default = "default_tactic_sources")]
     pub tactic_sources: u32,
@@ -527,6 +533,9 @@ impl RvcTrtPipelineArtifacts {
         let synth_w8a8_activation_scale = builder_options.synth_w8a8_activation_scale;
         let synth_fuse_resblock_scale = builder_options.synth_fuse_resblock_scale;
         let synth_polyphase_upsample = builder_options.synth_polyphase_upsample;
+        let synth_full_fp16 = builder_options.synth_full_fp16;
+        let synth_fp16_residual_accum = builder_options.synth_fp16_residual_accum;
+        let synth_fp16_source = builder_options.synth_fp16_source;
         let dispatch_tune = if builder_options.dispatch_tune == DispatchTune::Auto {
             if profile.min_samples == 11_200 && profile.max_samples == 11_200 {
                 DispatchTune::Realtime11200
@@ -633,6 +642,9 @@ impl RvcTrtPipelineArtifacts {
             synth_w8a8_activation_scale,
             synth_fuse_resblock_scale,
             synth_polyphase_upsample,
+            synth_full_fp16,
+            synth_fp16_residual_accum,
+            synth_fp16_source,
             dispatch_tune,
             tactic_sources: builder_options.tactic_sources,
             weight_int8,

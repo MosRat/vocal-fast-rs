@@ -212,6 +212,20 @@ pub struct NativeBuildOptions {
     /// contracts are rejected at build time.
     #[serde(default)]
     pub synth_polyphase_upsample: bool,
+    /// Move all learned Synth decoder convolutions (pre/upsample/noise,
+    /// residual blocks and post) to the decoder precision. Residual branch
+    /// accumulation remains FP32 unless `synth_fp16_residual_accum` is set.
+    /// The NSF phase/source stays FP32 unless `synth_fp16_source` is set.
+    #[serde(default)]
+    pub synth_full_fp16: bool,
+    /// Allow residual branch sums to remain in FP16 in the full-decoder
+    /// experiment. This saves cast kernels but is more numerically sensitive.
+    #[serde(default)]
+    pub synth_fp16_residual_accum: bool,
+    /// Run the NSF source arithmetic in the decoder precision. This is kept
+    /// separate because phase accumulation is more sensitive than Conv1d.
+    #[serde(default)]
+    pub synth_fp16_source: bool,
     /// Emit one structured build summary through `tracing`.
     #[serde(default)]
     pub log_build_options: bool,
@@ -287,6 +301,9 @@ impl Default for NativeBuildOptions {
             synth_w8a8_activation_scale: default_w8a8_activation_scale(),
             synth_fuse_resblock_scale: false,
             synth_polyphase_upsample: false,
+            synth_full_fp16: false,
+            synth_fp16_residual_accum: false,
+            synth_fp16_source: false,
             log_build_options: false,
             dispatch_tune: DispatchTune::Auto,
             tactic_sources: default_tactic_sources(),

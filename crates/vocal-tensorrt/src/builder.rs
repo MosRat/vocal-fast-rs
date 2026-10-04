@@ -114,6 +114,9 @@ impl NativeTensorRtBuilder {
                 w8a16_conv2_mask = format_args!("0x{:x}", self.options.synth_w8a16_conv2_mask),
                 w8a8_conv1_mask = format_args!("0x{:x}", self.options.synth_w8a8_conv1_mask),
                 w8a8_conv2_mask = format_args!("0x{:x}", self.options.synth_w8a8_conv2_mask),
+                synth_full_fp16 = self.options.synth_full_fp16,
+                synth_fp16_residual_accum = self.options.synth_fp16_residual_accum,
+                synth_fp16_source = self.options.synth_fp16_source,
                 "building native RVC Synth plan"
             );
         }
@@ -149,6 +152,9 @@ impl NativeTensorRtBuilder {
             synth_w8a8_activation_scale: self.options.synth_w8a8_activation_scale,
             synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
             synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
+            synth_full_fp16: self.options.synth_full_fp16 as i32,
+            synth_fp16_residual_accum: self.options.synth_fp16_residual_accum as i32,
+            synth_fp16_source: self.options.synth_fp16_source as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
             rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
@@ -181,6 +187,10 @@ impl NativeTensorRtBuilder {
             .iter()
             .map(|tensor| abi::tensor_f32(tensor))
             .collect::<Result<Vec<_>, _>>()?;
+        let data16 = canonical
+            .iter()
+            .map(|tensor| abi::tensor_u16(tensor))
+            .collect::<Result<Vec<_>, _>>()?;
         let native_weights = canonical
             .iter()
             .enumerate()
@@ -204,6 +214,12 @@ impl NativeTensorRtBuilder {
                 Ok(NativeWeight {
                     name: names[index].as_ptr(),
                     data: data[index].as_ptr(),
+                    data16: if data16[index].is_empty() {
+                        ptr::null()
+                    } else {
+                        data16[index].as_ptr()
+                    },
+                    dtype: tensor.dtype as i32,
                     count: i64::try_from(data[index].len()).map_err(|_| {
                         NativeBuildError::Argument(format!("tensor {} is too large", tensor.name))
                     })?,
@@ -275,6 +291,9 @@ impl NativeTensorRtBuilder {
             synth_w8a8_activation_scale: self.options.synth_w8a8_activation_scale,
             synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
             synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
+            synth_full_fp16: self.options.synth_full_fp16 as i32,
+            synth_fp16_residual_accum: self.options.synth_fp16_residual_accum as i32,
+            synth_fp16_source: self.options.synth_fp16_source as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
             rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
@@ -319,6 +338,10 @@ impl NativeTensorRtBuilder {
             .iter()
             .map(|tensor| abi::tensor_f32(tensor))
             .collect::<Result<Vec<_>, _>>()?;
+        let data16 = canonical
+            .iter()
+            .map(|tensor| abi::tensor_u16(tensor))
+            .collect::<Result<Vec<_>, _>>()?;
         let native_weights = canonical
             .iter()
             .enumerate()
@@ -338,6 +361,12 @@ impl NativeTensorRtBuilder {
                 Ok(abi::NativeWeight {
                     name: names[index].as_ptr(),
                     data: data[index].as_ptr(),
+                    data16: if data16[index].is_empty() {
+                        ptr::null()
+                    } else {
+                        data16[index].as_ptr()
+                    },
+                    dtype: tensor.dtype as i32,
                     count: i64::try_from(data[index].len()).map_err(|_| {
                         NativeBuildError::Argument("HuBERT tensor too large".into())
                     })?,
@@ -462,6 +491,10 @@ impl NativeTensorRtBuilder {
             .iter()
             .map(|(_, tensor)| abi::tensor_f32(tensor))
             .collect::<Result<Vec<_>, _>>()?;
+        let data16 = selected
+            .iter()
+            .map(|(_, tensor)| abi::tensor_u16(tensor))
+            .collect::<Result<Vec<_>, _>>()?;
         let native_weights = selected
             .iter()
             .enumerate()
@@ -481,6 +514,12 @@ impl NativeTensorRtBuilder {
                 Ok(NativeWeight {
                     name: names[index].as_ptr(),
                     data: data[index].as_ptr(),
+                    data16: if data16[index].is_empty() {
+                        ptr::null()
+                    } else {
+                        data16[index].as_ptr()
+                    },
+                    dtype: tensor.dtype as i32,
                     count: i64::try_from(data[index].len())
                         .map_err(|_| NativeBuildError::Argument("RMVPE tensor too large".into()))?,
                     rank: i32::try_from(tensor.shape.len()).map_err(|_| {
@@ -515,6 +554,9 @@ impl NativeTensorRtBuilder {
             synth_w8a8_activation_scale: self.options.synth_w8a8_activation_scale,
             synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
             synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
+            synth_full_fp16: self.options.synth_full_fp16 as i32,
+            synth_fp16_residual_accum: self.options.synth_fp16_residual_accum as i32,
+            synth_fp16_source: self.options.synth_fp16_source as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
             rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),

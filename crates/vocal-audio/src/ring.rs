@@ -28,7 +28,6 @@ impl<T> DerefMut for CachePadded<T> {
 }
 
 struct RingSlot {
-    samples: UnsafeCell<Vec<f32>>,
     sequence: UnsafeCell<u64>,
     timestamp: UnsafeCell<AudioTimestamp>,
 }
@@ -41,6 +40,9 @@ unsafe impl Sync for RingSlot {}
 
 struct RingInner {
     config: StreamConfig,
+    /// One allocation per ring keeps slot samples contiguous. The producer
+    /// and consumer still own disjoint ranges through the SPSC cursors.
+    arena: UnsafeCell<Vec<f32>>,
     slots: Box<[RingSlot]>,
     wake: AudioWake,
     space_wake: AudioWake,
@@ -60,13 +62,20 @@ unsafe impl Sync for RingInner {}
 impl RingInner {
     fn new(config: StreamConfig) -> Result<Arc<Self>, AudioError> {
         let config = config.validate()?;
+        let arena = allocate_samples(
+            config
+                .queue_blocks
+                .checked_mul(config.block_samples())
+                .ok_or_else(|| {
+                    AudioError::InvalidConfig("ring arena size overflows usize".into())
+                })?,
+        )?;
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(config.queue_blocks)
             .map_err(|error| AudioError::AllocationFailed(error.to_string()))?;
         for _ in 0..config.queue_blocks {
             slots.push(RingSlot {
-                samples: UnsafeCell::new(allocate_samples(config.block_samples())?),
                 sequence: UnsafeCell::new(0),
                 timestamp: UnsafeCell::new(AudioTimestamp::ZERO),
             });
@@ -74,6 +83,7 @@ impl RingInner {
         let slots = slots.into_boxed_slice();
         Ok(Arc::new(Self {
             config,
+            arena: UnsafeCell::new(arena),
             slots,
             wake: AudioWake::new(),
             space_wake: AudioWake::new(),
@@ -86,6 +96,29 @@ impl RingInner {
             dropped_stale: CachePadded(AtomicU64::new(0)),
             high_water: CachePadded(AtomicUsize::new(0)),
         }))
+    }
+
+    unsafe fn samples(&self, index: usize) -> &[f32] {
+        let start = (index % self.slots.len()) * self.config.block_samples();
+        // SAFETY: the caller has established SPSC ownership of this slot.
+        unsafe {
+            std::slice::from_raw_parts(
+                (*self.arena.get()).as_ptr().add(start),
+                self.config.block_samples(),
+            )
+        }
+    }
+
+    unsafe fn samples_mut(&self, index: usize) -> &mut [f32] {
+        let start = (index % self.slots.len()) * self.config.block_samples();
+        // SAFETY: the caller has established exclusive SPSC ownership of this
+        // slot and no published cursor points at it during the mutable borrow.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                (*self.arena.get()).as_mut_ptr().add(start),
+                self.config.block_samples(),
+            )
+        }
     }
 
     fn try_write(&self, samples: &[f32], timestamp: AudioTimestamp) -> Result<u64, AudioError> {
@@ -104,11 +137,11 @@ impl RingInner {
         }
 
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let slot = &self.slots[write % self.slots.len()];
         // SAFETY: only the single producer can reach this slot while the
         // write index has not been published.
         unsafe {
-            (*slot.samples.get()).copy_from_slice(samples);
+            self.samples_mut(write).copy_from_slice(samples);
+            let slot = &self.slots[write % self.slots.len()];
             *slot.sequence.get() = sequence;
             *slot.timestamp.get() = timestamp;
         }
@@ -144,12 +177,12 @@ impl RingInner {
             return Err(AudioError::QueueEmpty);
         }
 
-        let slot = &self.slots[read % self.slots.len()];
         // SAFETY: the acquire load observes the producer's release store. The
         // producer cannot reuse this slot until the read index is published
         // below.
         let result = unsafe {
-            let samples = &*slot.samples.get();
+            let samples = self.samples(read);
+            let slot = &self.slots[read % self.slots.len()];
             read_fn(samples, *slot.sequence.get())
         };
         self.popped.0.fetch_add(1, Ordering::Relaxed);
@@ -435,18 +468,16 @@ pub struct AudioWriteLease<'a> {
 
 impl AudioWriteLease<'_> {
     pub fn samples_mut(&mut self) -> &mut [f32] {
-        let slot = &self.producer.inner.slots[self.index % self.producer.inner.slots.len()];
         // SAFETY: the producer owns this unpublished slot for the lifetime of
         // the lease; no consumer can observe it until commit.
-        unsafe { &mut *slot.samples.get() }
+        unsafe { self.producer.inner.samples_mut(self.index) }
     }
 
     pub fn samples(&self) -> &[f32] {
-        let slot = &self.producer.inner.slots[self.index % self.producer.inner.slots.len()];
         // SAFETY: the producer owns this unpublished slot for the lifetime of
         // the lease. This read-only view is used only to recover an unusual
         // short packet before the lease is dropped.
-        unsafe { &*slot.samples.get() }
+        unsafe { self.producer.inner.samples(self.index) }
     }
 
     pub fn sequence(&self) -> u64 {
@@ -633,9 +664,8 @@ pub struct AudioReadLease<'a> {
 
 impl AudioReadLease<'_> {
     pub fn samples(&self) -> &[f32] {
-        let slot = &self.consumer.inner.slots[self.index % self.consumer.inner.slots.len()];
         // SAFETY: the consumer owns this published slot until the lease drops.
-        unsafe { &*slot.samples.get() }
+        unsafe { self.consumer.inner.samples(self.index) }
     }
 
     pub fn sequence(&self) -> u64 {

@@ -27,6 +27,9 @@ The ring is intentionally SPSC. Do not clone endpoint handles or run two
 producers/consumers against one queue. A monitor path can call
 `AudioConsumer::try_copy_latest_into` to drop stale blocks and bound latency;
 the main render path should use FIFO draining to preserve every block.
+Each ring owns one contiguous pre-allocated sample arena; slots contain only
+metadata and an offset derived from the SPSC cursor. This removes per-slot
+sample allocations and improves locality without adding a lock.
 
 `DeviceIo::stats()` and `WorkerIo::stats()` expose queue depth, pushes, pops,
 overflow counters, stale-block drops, and the high-water mark. The worker can
@@ -49,8 +52,9 @@ override it.
 
 The producer publishes a generation after every commit. On Windows the worker
 waits with `WaitOnAddress` and the callback wakes it with
-`WakeByAddressSingle`; the callback never takes a mutex or sleeps. Portable
-builds retain a bounded polling fallback.
+`WakeByAddressSingle` only when a worker is actually waiting; the callback
+never takes a mutex or sleeps. Portable builds retain a bounded polling
+fallback.
 
 The zero-copy worker loop is shaped like this:
 

@@ -6,18 +6,20 @@
 //! the ring before sleeping.  Non-Windows builds retain a bounded polling
 //! fallback so the core remains portable.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct AudioWake {
     generation: AtomicU32,
+    waiting: AtomicBool,
 }
 
 impl AudioWake {
     pub(crate) const fn new() -> Self {
         Self {
             generation: AtomicU32::new(0),
+            waiting: AtomicBool::new(false),
         }
     }
 
@@ -28,6 +30,9 @@ impl AudioWake {
     /// Publish a new generation and wake one waiting worker.
     pub(crate) fn notify(&self) {
         self.generation.fetch_add(1, Ordering::Release);
+        if !self.waiting.load(Ordering::Acquire) {
+            return;
+        }
         #[cfg(windows)]
         unsafe {
             windows_sys::Win32::System::Threading::WakeByAddressSingle(
@@ -47,6 +52,17 @@ impl AudioWake {
             return true;
         }
 
+        // Publish the waiter before the final generation check. If a
+        // producer races this transition, either it sees `waiting = true` and
+        // wakes us, or the second check observes its generation update and we
+        // skip sleeping. This removes an unconditional OS wake from every
+        // producer commit without introducing a lost wake-up.
+        self.waiting.store(true, Ordering::SeqCst);
+        if self.generation() != observed {
+            self.waiting.store(false, Ordering::SeqCst);
+            return true;
+        }
+
         #[cfg(windows)]
         {
             let timeout_ms = timeout.map_or(u32::MAX, |duration| {
@@ -61,6 +77,7 @@ impl AudioWake {
                     timeout_ms,
                 );
             }
+            self.waiting.store(false, Ordering::SeqCst);
             self.generation() != observed
         }
 
@@ -70,6 +87,7 @@ impl AudioWake {
             // primitive. Keep the fallback bounded so callers never sleep
             // forever without a platform wake source.
             std::thread::sleep(timeout.unwrap_or(Duration::from_millis(1)));
+            self.waiting.store(false, Ordering::SeqCst);
             self.generation() != observed
         }
     }

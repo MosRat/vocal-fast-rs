@@ -184,6 +184,7 @@ class FakeInt8Layer(nn.Module):
         mode: str,
         calibration: Calibration,
         smooth: torch.Tensor | None,
+        activation_granularity: str = "tensor",
     ) -> None:
         super().__init__()
         self.mode = mode
@@ -191,13 +192,45 @@ class FakeInt8Layer(nn.Module):
         self.weight = nn.Parameter(quantize_weight(original, smooth), requires_grad=False)
         self.bias = None if original.bias is None else nn.Parameter(original.bias.detach().float(), requires_grad=False)
         self.smooth = None if smooth is None else smooth.detach().float()
-        self.activation_scale = max(calibration.absmax / 127.0, 1e-8)
+        self.activation_granularity = activation_granularity
+        if mode == "w8a8" and activation_granularity != "tensor":
+            if calibration.channel_absmax is None:
+                raise ValueError(f"{activation_granularity} activation requires channel calibration")
+            channel = torch.from_numpy(np.asarray(calibration.channel_absmax, dtype=np.float32))
+            if self.smooth is not None:
+                channel = channel / self.smooth.clamp_min(1e-8)
+            if activation_granularity.startswith("group"):
+                group_size = int(activation_granularity.removeprefix("group"))
+                if group_size <= 0:
+                    raise ValueError(f"invalid activation group: {activation_granularity}")
+                grouped = channel.clone()
+                for start in range(0, int(channel.numel()), group_size):
+                    stop = min(start + group_size, int(channel.numel()))
+                    grouped[start:stop] = channel[start:stop].max()
+                channel = grouped
+            self.activation_scale = channel.clamp_min(1e-8) / 127.0
+        else:
+            effective_absmax = calibration.absmax
+            if mode == "w8a8" and self.smooth is not None:
+                if calibration.channel_absmax is None:
+                    raise ValueError("SmoothQuant requires channel calibration")
+                effective_absmax = float(
+                    (torch.from_numpy(np.asarray(calibration.channel_absmax, dtype=np.float32))
+                     / self.smooth.clamp_min(1e-8)).max().item()
+                )
+            self.activation_scale = max(effective_absmax / 127.0, 1e-8)
         if isinstance(original, (nn.Conv1d, nn.ConvTranspose1d)):
+            self.in_channels = original.in_channels
+            self.out_channels = original.out_channels
+            self.kernel_size = original.kernel_size
             self.stride = original.stride
             self.padding = original.padding
             self.dilation = original.dilation
             self.groups = original.groups
             self.output_padding = original.output_padding if isinstance(original, nn.ConvTranspose1d) else None
+        elif isinstance(original, nn.Linear):
+            self.in_features = original.in_features
+            self.out_features = original.out_features
 
     def _prepare(self, x: torch.Tensor) -> torch.Tensor:
         x = x.float()
@@ -213,6 +246,13 @@ class FakeInt8Layer(nn.Module):
         # dequantized value in FP32 makes this a conservative accuracy model
         # for an eventual INT32 accumulate + scale implementation.
         scale = torch.as_tensor(self.activation_scale, device=x.device, dtype=x.dtype)
+        if scale.ndim == 1:
+            if self.kind == "Linear":
+                scale = scale.reshape(*([1] * (x.ndim - 1)), -1)
+            elif x.ndim == 3:
+                scale = scale.reshape(1, -1, 1)
+            else:
+                scale = scale.reshape(*([1] * (x.ndim - 1)), -1)
         return torch.round((x / scale).clamp(-127.0, 127.0)) * scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -296,8 +336,24 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--smooth-alphas", default="0.3,0.5,0.7")
     parser.add_argument("--include-smooth", action="store_true")
+    parser.add_argument(
+        "--activation-granularities",
+        default="tensor",
+        help="W8A8 activation scales: tensor, channel, or groupN (for example group32)",
+    )
     parser.add_argument("--cumulative-counts", default="1,2,4,8", help="hot-set sizes to evaluate after the single-layer sweep")
     args = parser.parse_args()
+
+    activation_granularities = [
+        value.strip().lower()
+        for value in args.activation_granularities.split(",")
+        if value.strip()
+    ]
+    allowed_granularities = {"tensor", "channel"}
+    allowed_granularities.update(f"group{size}" for size in (8, 16, 32, 64, 128))
+    invalid_granularities = sorted(set(activation_granularities) - allowed_granularities)
+    if invalid_granularities:
+        parser.error("unsupported activation granularity: " + ", ".join(invalid_granularities))
 
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
     inputs = load_inputs(args.vin)
@@ -337,6 +393,7 @@ def main() -> None:
             "w8a16": "FP16 activation, FP16 dequantized weights",
             "w8a8": "calibrated per-tensor INT8 activation, FP32 dequantized reference op",
             "smoothquant": "per-input-channel activation/weight rescaling before W8A8",
+            "activation_granularities": activation_granularities,
         },
         "candidates": [],
         "inputs_results": {},
@@ -365,34 +422,42 @@ def main() -> None:
                 "outlier_ratio_max_over_median": float(channel.max() / max(np.median(channel), 1e-8)) if channel.size else 0.0,
             }
         for mode in ("w8a16", "w8a8"):
-            variants = [("none", None)]
-            if args.include_smooth and mode == "w8a8":
-                variants += [(f"alpha_{alpha:g}", alpha) for alpha in parse_alphas(args.smooth_alphas)]
-            for smooth_name, alpha in variants:
-                smooth = smooth_scale(layer, c, alpha) if alpha is not None else None
-                variant_net = copy.deepcopy(base_cpu).to(device).eval()
-                target = variant_net.get_submodule(name)
-                replacement = FakeInt8Layer(target, mode, c, smooth).to(device)
-                replace_module(variant_net, name, replacement)
-                per_input = []
-                for index, item in enumerate(inputs):
-                    actual, latency = timed_run(variant_net, item, device, args.iterations)
-                    per_input.append({
-                        "input": str((args.vin or [ROOT / "target/compare/sine-11200.vin"])[index]),
-                        "latency_ms": latency,
-                        "audio": metric(references[index]["audio"], actual["audio"]),
-                        "z": metric(references[index]["z"], actual["z"]),
-                        "finite": bool(torch.isfinite(actual["audio"]).all().item()),
-                    })
-                key = f"{mode}:{smooth_name}"
-                candidate["results"][key] = per_input
-                del variant_net
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+            granularities = ["tensor"] if mode == "w8a16" else activation_granularities
+            for activation_granularity in granularities:
+                variants = [("none", None)]
+                if args.include_smooth and mode == "w8a8":
+                    variants += [(f"alpha_{alpha:g}", alpha) for alpha in parse_alphas(args.smooth_alphas)]
+                for smooth_name, alpha in variants:
+                    smooth = smooth_scale(layer, c, alpha) if alpha is not None else None
+                    variant_net = copy.deepcopy(base_cpu).to(device).eval()
+                    target = variant_net.get_submodule(name)
+                    replacement = FakeInt8Layer(
+                        target, mode, c, smooth, activation_granularity
+                    ).to(device)
+                    replace_module(variant_net, name, replacement)
+                    per_input = []
+                    for index, item in enumerate(inputs):
+                        actual, latency = timed_run(variant_net, item, device, args.iterations)
+                        per_input.append({
+                            "input": str((args.vin or [ROOT / "target/compare/sine-11200.vin"])[index]),
+                            "latency_ms": latency,
+                            "audio": metric(references[index]["audio"], actual["audio"]),
+                            "z": metric(references[index]["z"], actual["z"]),
+                            "finite": bool(torch.isfinite(actual["audio"]).all().item()),
+                        })
+                    key = (
+                        f"{mode}:{smooth_name}"
+                        if activation_granularity == "tensor"
+                        else f"{mode}:{activation_granularity}:{smooth_name}"
+                    )
+                    candidate["results"][key] = per_input
+                    del variant_net
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
         smooth_results = {
             key: value
             for key, value in candidate["results"].items()
-            if key.startswith("w8a8:alpha_")
+            if key.startswith("w8a8:") and ":alpha_" in key
         }
         if smooth_results:
             def smooth_score(value: list[dict[str, object]]) -> float:

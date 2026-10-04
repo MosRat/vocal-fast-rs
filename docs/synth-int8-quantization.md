@@ -136,3 +136,58 @@ W8A16 Synth-only cosine was `0.9999977` at 11200 and `0.9999966` at 44960.
 The complete Applio end-to-end cosine was about `0.971` at 11200 and `0.969` at
 44960; that larger gap is dominated by HuBERT/RMVPE implementation differences,
 not by the selected Synth quantization.
+
+## W8A8 and SmoothQuant follow-up
+
+The Python sweep was extended with per-channel and grouped activation
+calibration, and it now evaluates SmoothQuant with the post-rescaling scalar
+activation range. TensorRT-RTX 1.6.1 documents per-channel activation
+quantization as unsupported for INT8, so the native path uses a calibrated
+per-tensor activation scale. The per-channel results are useful for screening,
+but are not directly deployable as an INT8 activation Q/DQ pair.
+
+The best deployable single-node candidate is
+`dec.resblocks.4.convs1.0` (mask `0x1000`). Its Python fake-quant result at the
+two calibration lengths was:
+
+| variant | 11200 relative L2 | 44960 relative L2 | 44960 cosine |
+|---|---:|---:|---:|
+| W8A8 per-tensor | 0.22% | 0.98% | 0.9999525 |
+| W8A8 + SmoothQuant alpha 0.7 | 0.11% | 0.50% | 0.9999873 |
+
+The native TensorRT path currently implements the first row. It takes the
+calibrated scale `0.0079044188` through an explicit INT8 Quantize/Dequantize
+pair and uses per-output-channel INT8 weights. The fixed-profile RTX 3060
+measurements were:
+
+| profile | FP16 baseline Synth | W8A8 Synth | FP16 total | W8A8 total |
+|---|---:|---:|---:|---:|
+| 11200 samples | 10.27 ms | 11.39 ms | 16.91 ms | 18.54 ms |
+| 44960 samples | 36.73 ms | 40.13 ms | 50.67 ms | 53.74 ms |
+
+Native W8A8 versus the corresponding FP16 baseline audio was cosine `0.9999994`
+at 11200 and `0.9999981` at 44960, with relative L2 `0.107%` and `0.197%`.
+The explicit Q/DQ nodes are not selected as a faster INT8 tactic on this
+TensorRT-RTX build, so the W8A8 setting remains opt-in and is not a default
+performance configuration.
+
+The native configuration is intentionally limited to one selected node because
+one scalar activation scale is carried in the current ABI:
+
+```powershell
+$env:VOCAL_TRT_SYNTH_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_W8A8_CONV1_MASK = "0x1000"
+$env:VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE = "0.0079044188"
+```
+
+SmoothQuant vectors can be added later as model calibration tensors. They must
+be calibrated per voice/model and validated cumulatively; the Python sweep
+shows that combining individually safe nodes can exceed the 1% waveform error
+gate.
+
+The other Synth regions were also screened. Flow convolutions can pass the
+single-layer W8A8 gate, but their largest candidates are about 100M MACs each,
+far below the decoder residual and upsample hotspots. The `enc_p` attention and
+feed-forward convolutions are more sensitive and contribute roughly 10--124M
+MACs per node. Quantizing those regions therefore adds Q/DQ overhead without a
+measured end-to-end benefit on the fixed realtime profiles.

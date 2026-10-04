@@ -30,6 +30,39 @@ bool Layers::w8a16_selected(std::string const& name) const {
     uint64_t bit=uint64_t{1} << static_cast<unsigned>(block*3+suffix);
     return (o.synth_w8a16_conv2_mask&bit)!=0;
 }
+bool Layers::w8a8_selected(std::string const& name) const {
+    if(o.synth_w8a8_conv1_mask==0 && o.synth_w8a8_conv2_mask==0) return false;
+    int block=-1,suffix=-1;
+    auto const* text=name.c_str();
+    if(std::sscanf(text,"dec.resblocks.%d.convs1.%d",&block,&suffix)==2) {
+        if(block<0 || block>=21 || suffix<0 || suffix>=3) return false;
+        uint64_t bit=uint64_t{1} << static_cast<unsigned>(block*3+suffix);
+        return (o.synth_w8a8_conv1_mask&bit)!=0;
+    }
+    if(std::sscanf(text,"dec.resblocks.%d.convs2.%d",&block,&suffix)==2) {
+        if(block<0 || block>=21 || suffix<0 || suffix>=3) return false;
+        uint64_t bit=uint64_t{1} << static_cast<unsigned>(block*3+suffix);
+        return (o.synth_w8a8_conv2_mask&bit)!=0;
+    }
+    return false;
+}
+T Layers::quantized_activation(T x,std::string const& name) {
+    require(o.synth_w8a8_activation_scale>0.0f && std::isfinite(o.synth_w8a8_activation_scale),
+            "invalid W8A8 activation scale");
+    floats.emplace_back(1, o.synth_w8a8_activation_scale);
+    auto& storage=floats.back();
+    auto* scale=n.addConstant(dims({1}),{DataType::kFLOAT,storage.data(),1});
+    require(scale,"W8A8 activation scale");
+    auto* scale_tensor=scale->getOutput(0);
+    require(scale_tensor,"W8A8 activation scale output");
+    auto* q=n.addQuantize(*x,*scale_tensor,DataType::kINT8);
+    require(q,"W8A8 activation quantize");
+    auto* q_tensor=q->getOutput(0);
+    require(q_tensor,"W8A8 activation quantize output");
+    auto* dq=n.addDequantize(*q_tensor,*scale_tensor,real_type());
+    require(dq,"W8A8 activation dequantize");
+    return output(dq,name+".w8a8_dq");
+}
 Weights Layers::w(std::string const& name) {
     auto& p=weight(name);
     if(real_type()==DataType::kFLOAT) return {DataType::kFLOAT,p.data,p.count};
@@ -58,7 +91,7 @@ T Layers::quantized_parameter(std::string const& name,Dims d,int axis) {
     // Keep biases, normalization affine terms and scalar lookup tables in
     // floating point. They are bandwidth-light and quantizing them makes
     // residual/normalization error accumulate without an INT8 MAC benefit.
-    bool eligible=(o.quantize_weights || w8a16_selected(name)) && p.rank>=2 &&
+    bool eligible=(o.quantize_weights || w8a16_selected(name) || w8a8_selected(name)) && p.rank>=2 &&
         name.find(".bias")==std::string::npos &&
         name.find(".gamma")==std::string::npos &&
         name.find(".beta")==std::string::npos;
@@ -158,9 +191,10 @@ T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool
             bias_weights={real_type(),low.data(),channels};
         }
     }
+    if(w8a8_selected(p)) x=quantized_activation(x,p);
     auto x4=reshape(x,dims({1,x->getDimensions().d[1],1,-1}));
     IConvolutionLayer* l=nullptr;
-    if((o.quantize_weights || w8a16_selected(p)) && weight_scale==1.0f) {
+    if((o.quantize_weights || w8a16_selected(p) || w8a8_selected(p)) && weight_scale==1.0f) {
         auto kernel_tensor=quantized_parameter(p+".weight",dims({channels,k.dims[1],1,kernel}),0);
         l=n.addConvolutionNd(*x4,channels,dims({1,kernel}),Weights{real_type(),nullptr,0},bias_weights);
         require(l,"conv "+p); l->setInput(1,*kernel_tensor);

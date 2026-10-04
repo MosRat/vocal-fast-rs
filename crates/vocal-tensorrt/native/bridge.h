@@ -102,6 +102,12 @@ struct Options {
     // The mask is intentionally separate from the legacy global weight-only
     // switch so only validated decoder hotspots are quantized.
     uint64_t synth_w8a16_conv2_mask;
+    // Experimental calibrated W8A8 masks. The activation scale is currently
+    // a single per-tensor value, so the builder restricts this path to one
+    // selected Conv1/Conv2 node at a time.
+    uint64_t synth_w8a8_conv1_mask;
+    uint64_t synth_w8a8_conv2_mask;
+    float synth_w8a8_activation_scale;
     // Fold residual average into the following decoder weights.
     int32_t synth_fuse_resblock_scale;
     // Replace ConvTranspose1d with polyphase Conv1d + shuffle.

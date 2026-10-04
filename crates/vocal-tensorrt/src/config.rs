@@ -246,6 +246,18 @@ impl TensorRtConfig {
             "VOCAL_TRT_SYNTH_W8A16_CONV2_MASK",
             build.synth_w8a16_conv2_mask,
         )?;
+        build.synth_w8a8_conv1_mask = u64_mask(
+            "VOCAL_TRT_SYNTH_W8A8_CONV1_MASK",
+            build.synth_w8a8_conv1_mask,
+        )?;
+        build.synth_w8a8_conv2_mask = u64_mask(
+            "VOCAL_TRT_SYNTH_W8A8_CONV2_MASK",
+            build.synth_w8a8_conv2_mask,
+        )?;
+        build.synth_w8a8_activation_scale = positive_float(
+            "VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE",
+            build.synth_w8a8_activation_scale,
+        )?;
         build.synth_fuse_resblock_scale = bool_value("VOCAL_TRT_SYNTH_FUSE_RESBLOCK_SCALE", false)?;
         build.synth_polyphase_upsample = match env::var("VOCAL_TRT_SYNTH_UPSAMPLE_IMPL") {
             Ok(value) if value.eq_ignore_ascii_case("polyphase") => true,
@@ -360,6 +372,29 @@ impl TensorRtConfig {
                 "Synth W8A16 Conv2 mask cannot be combined with VOCAL_TRT_WEIGHT_INT8".into(),
             ));
         }
+        let w8a8_mask = self.build.synth_w8a8_conv1_mask | self.build.synth_w8a8_conv2_mask;
+        if w8a8_mask != 0 {
+            if self.build.synth_precision != PrecisionMode::Fp16 {
+                return Err(ConfigError::InvalidCombination(
+                    "Synth W8A8 masks require VOCAL_TRT_SYNTH_PRECISION=fp16".into(),
+                ));
+            }
+            if self.build.quantize_weights {
+                return Err(ConfigError::InvalidCombination(
+                    "Synth W8A8 masks cannot be combined with VOCAL_TRT_WEIGHT_INT8".into(),
+                ));
+            }
+            if w8a8_mask.count_ones() != 1 {
+                return Err(ConfigError::InvalidCombination(
+                    "Synth W8A8 currently supports exactly one selected Conv1/Conv2 node".into(),
+                ));
+            }
+            if self.build.synth_w8a16_conv2_mask & self.build.synth_w8a8_conv2_mask != 0 {
+                return Err(ConfigError::InvalidCombination(
+                    "Synth W8A8 and W8A16 masks cannot select the same Conv2 node".into(),
+                ));
+            }
+        }
         self.profile
             .validate()
             .map_err(|error| ConfigError::InvalidCombination(error.to_string()))
@@ -468,6 +503,18 @@ fn u64_mask(name: &str, default: u64) -> Result<u64, ConfigError> {
     .map_err(|_| invalid(name, value, "a decimal or hexadecimal 64-bit mask"))
 }
 
+fn positive_float(name: &str, default: f32) -> Result<f32, ConfigError> {
+    let Some(value) = env::var(name).ok() else {
+        return Ok(default);
+    };
+    value
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| invalid(name, value, "a positive finite float"))
+}
+
 fn precision(name: &str, default: PrecisionMode) -> Result<PrecisionMode, ConfigError> {
     let Some(value) = env::var(name).ok() else {
         return Ok(default);
@@ -519,6 +566,9 @@ mod tests {
             "VOCAL_TRT_SYNTH_W8A16_CONV2_MASK",
             "VOCAL_TRT_SYNTH_PRECISION",
             "VOCAL_TRT_WEIGHT_INT8",
+            "VOCAL_TRT_SYNTH_W8A8_CONV1_MASK",
+            "VOCAL_TRT_SYNTH_W8A8_CONV2_MASK",
+            "VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE",
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -550,6 +600,8 @@ mod tests {
             env::set_var("VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK", "0xc");
             env::set_var("VOCAL_TRT_SYNTH_PRECISION", "fp16");
             env::set_var("VOCAL_TRT_SYNTH_W8A16_CONV2_MASK", "0x30000");
+            env::set_var("VOCAL_TRT_SYNTH_W8A8_CONV1_MASK", "0x1000");
+            env::set_var("VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE", "0.0079044188");
             env::set_var("VOCAL_TRT_GRAPH_CACHE_SIZE", "4");
             env::set_var("VOCAL_TRT_GRAPH_MODE", "hybrid");
         }
@@ -558,6 +610,8 @@ mod tests {
         assert_eq!(config.build.tactic_sources, 2);
         assert_eq!(config.build.synth_resblock_stage_mask, 12);
         assert_eq!(config.build.synth_w8a16_conv2_mask, 0x30000);
+        assert_eq!(config.build.synth_w8a8_conv1_mask, 0x1000);
+        assert!((config.build.synth_w8a8_activation_scale - 0.0079044).abs() < 1e-6);
         assert_eq!(config.profile.min_samples, 44_960);
         assert_eq!(config.runtime.graph_cache_size, 4);
         assert_eq!(
@@ -590,6 +644,22 @@ mod tests {
             env::set_var("VOCAL_TRT_SYNTH_PRECISION", "fp16");
             env::set_var("VOCAL_TRT_SYNTH_W8A16_CONV2_MASK", "0x30000");
             env::set_var("VOCAL_TRT_WEIGHT_INT8", "1");
+        }
+        assert!(matches!(
+            TensorRtConfig::from_env(),
+            Err(ConfigError::InvalidCombination(_))
+        ));
+        clear();
+    }
+
+    #[test]
+    fn rejects_multiple_w8a8_nodes() {
+        let _guard = env_lock();
+        clear();
+        unsafe {
+            env::set_var("VOCAL_TRT_SYNTH_PRECISION", "fp16");
+            env::set_var("VOCAL_TRT_SYNTH_W8A8_CONV1_MASK", "0x3");
+            env::set_var("VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE", "0.01");
         }
         assert!(matches!(
             TensorRtConfig::from_env(),

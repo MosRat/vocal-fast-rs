@@ -31,6 +31,8 @@ struct Layers {
     T cast_real(T x);
     void use_low_precision();
     bool w8a16_selected(std::string const& name) const;
+    bool w8a8_selected(std::string const& name) const;
+    T quantized_activation(T x, std::string const& name);
     // Create a build-time INT8 per-output-channel weight followed by an
     // explicit dequantize node. This keeps the experiment isolated from the
     // public floating-point graph ABI; the builder may or may not fold the

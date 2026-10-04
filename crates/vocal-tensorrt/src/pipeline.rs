@@ -385,6 +385,12 @@ pub struct RvcTrtPipelineArtifacts {
     #[serde(default)]
     pub synth_w8a16_conv2_mask: u64,
     #[serde(default)]
+    pub synth_w8a8_conv1_mask: u64,
+    #[serde(default)]
+    pub synth_w8a8_conv2_mask: u64,
+    #[serde(default = "crate::options::default_w8a8_activation_scale")]
+    pub synth_w8a8_activation_scale: f32,
+    #[serde(default)]
     pub synth_fuse_resblock_scale: bool,
     #[serde(default)]
     pub synth_polyphase_upsample: bool,
@@ -516,6 +522,9 @@ impl RvcTrtPipelineArtifacts {
         let synth_resblock_conv2_precision = builder_options.synth_resblock_conv2_precision;
         let synth_resblock_conv2_stage_mask = builder_options.synth_resblock_conv2_stage_mask;
         let synth_w8a16_conv2_mask = builder_options.synth_w8a16_conv2_mask;
+        let synth_w8a8_conv1_mask = builder_options.synth_w8a8_conv1_mask;
+        let synth_w8a8_conv2_mask = builder_options.synth_w8a8_conv2_mask;
+        let synth_w8a8_activation_scale = builder_options.synth_w8a8_activation_scale;
         let synth_fuse_resblock_scale = builder_options.synth_fuse_resblock_scale;
         let synth_polyphase_upsample = builder_options.synth_polyphase_upsample;
         let dispatch_tune = if builder_options.dispatch_tune == DispatchTune::Auto {
@@ -619,6 +628,9 @@ impl RvcTrtPipelineArtifacts {
             synth_resblock_conv2_precision,
             synth_resblock_conv2_stage_mask,
             synth_w8a16_conv2_mask,
+            synth_w8a8_conv1_mask,
+            synth_w8a8_conv2_mask,
+            synth_w8a8_activation_scale,
             synth_fuse_resblock_scale,
             synth_polyphase_upsample,
             dispatch_tune,

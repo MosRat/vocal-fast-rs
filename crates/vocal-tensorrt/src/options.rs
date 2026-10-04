@@ -191,6 +191,15 @@ pub struct NativeBuildOptions {
     /// decoder hotspots and requires `synth_precision = Fp16`.
     #[serde(default)]
     pub synth_w8a16_conv2_mask: u64,
+    /// Experimental calibrated W8A8 masks for Synth residual Conv1/Conv2
+    /// nodes. The native path currently uses one per-tensor activation scale,
+    /// so validation limits the masks to one selected node.
+    #[serde(default)]
+    pub synth_w8a8_conv1_mask: u64,
+    #[serde(default)]
+    pub synth_w8a8_conv2_mask: u64,
+    #[serde(default = "default_w8a8_activation_scale")]
+    pub synth_w8a8_activation_scale: f32,
     /// Fold the residual-block average into the following decoder weights.
     /// This removes four elementwise scale kernels while keeping the same
     /// FP32 operation order. It is opt-in because low-precision constants are
@@ -218,6 +227,10 @@ pub struct NativeBuildOptions {
 
 fn default_fused_qkv() -> bool {
     true
+}
+
+pub(crate) fn default_w8a8_activation_scale() -> f32 {
+    1.0
 }
 
 pub(crate) fn default_tactic_sources() -> u32 {
@@ -269,6 +282,9 @@ impl Default for NativeBuildOptions {
             synth_resblock_conv2_precision: PrecisionMode::Fp32,
             synth_resblock_conv2_stage_mask: 0,
             synth_w8a16_conv2_mask: 0,
+            synth_w8a8_conv1_mask: 0,
+            synth_w8a8_conv2_mask: 0,
+            synth_w8a8_activation_scale: default_w8a8_activation_scale(),
             synth_fuse_resblock_scale: false,
             synth_polyphase_upsample: false,
             log_build_options: false,

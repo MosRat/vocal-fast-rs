@@ -20,6 +20,21 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
             require(options->quantize_weights==0,
                     "Synth W8A16 mask cannot be combined with global weight-only INT8");
         }
+        auto w8a8_mask=options->synth_w8a8_conv1_mask|options->synth_w8a8_conv2_mask;
+        if(w8a8_mask!=0) {
+            require(options->precision==1,
+                    "Synth W8A8 requires Synth FP16 activation precision");
+            require(options->quantize_weights==0,
+                    "Synth W8A8 mask cannot be combined with global weight-only INT8");
+            int selected=0; for(auto bits=w8a8_mask;bits;bits>>=1) selected+=static_cast<int>(bits&1u);
+            require(selected==1,
+                    "Synth W8A8 currently supports exactly one selected Conv1/Conv2 node");
+            require(options->synth_w8a8_activation_scale>0.0f &&
+                        std::isfinite(options->synth_w8a8_activation_scale),
+                    "invalid Synth W8A8 activation scale");
+            require((options->synth_w8a16_conv2_mask&options->synth_w8a8_conv2_mask)==0,
+                    "Synth W8A8 and W8A16 masks select the same Conv2 node");
+        }
         require(options->synth_resblock_conv1_stage_mask>=0 && options->synth_resblock_conv2_stage_mask>=0,
                 "invalid Synth residual operation mask");
         uint32_t valid_stage_mask=c->upsample_count>=31?0xffffffffu:((1u<<c->upsample_count)-1u);
@@ -118,6 +133,12 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                     ", fused_rvc_qkv=" + std::to_string(options->fused_rvc_qkv) +
                     ", synth_w8a16_conv2_mask=0x" + [&]{
                         std::ostringstream stream; stream << std::hex << options->synth_w8a16_conv2_mask; return stream.str();
+                    }() +
+                    ", synth_w8a8_conv1_mask=0x" + [&]{
+                        std::ostringstream stream; stream << std::hex << options->synth_w8a8_conv1_mask; return stream.str();
+                    }() +
+                    ", synth_w8a8_conv2_mask=0x" + [&]{
+                        std::ostringstream stream; stream << std::hex << options->synth_w8a8_conv2_mask; return stream.str();
                     }() +
                     ", dispatch=" + std::to_string(options->dispatch_tune));
         auto result=new Build();

@@ -106,6 +106,16 @@ impl EventSink {
         Ok(())
     }
 
+    /// Publish a control-plane event without making the state mutation depend
+    /// on the webview being alive. A Tauri window can disappear during a
+    /// reload while the audio worker continues safely; the next subscriber
+    /// receives a fresh snapshot from `subscribe`.
+    pub fn publish(&self, event: BackendEvent) {
+        if let Err(error) = self.send(event) {
+            tracing::debug!(target: "vocal.gui", error = %error, "control event was not delivered");
+        }
+    }
+
     fn next_sequence(&self) -> u64 {
         let mut current = self.sequence.load(Ordering::Relaxed);
         loop {

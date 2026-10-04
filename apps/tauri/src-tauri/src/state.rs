@@ -86,7 +86,7 @@ impl AppState {
         let _operation = self.operation()?;
         self.events.attach(channel)?;
         let snapshot = self.snapshot()?;
-        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -144,7 +144,7 @@ impl AppState {
             }
             state.snapshot()
         };
-        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -154,7 +154,7 @@ impl AppState {
         let result = self.load_model_inner(path);
         match result {
             Ok(snapshot) => {
-                self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+                self.events.publish(BackendEvent::snapshot(snapshot.clone()));
                 Ok(snapshot)
             }
             Err(error) => {
@@ -195,7 +195,7 @@ impl AppState {
             state.last_error = None;
             state.snapshot()
         };
-        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -298,7 +298,7 @@ impl AppState {
             state.last_error = None;
             state.snapshot()
         };
-        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -331,8 +331,8 @@ impl AppState {
             state.lifecycle = LifecycleState::Stopped;
             state.snapshot()
         };
-        self.events.send(BackendEvent::snapshot(stopping))?;
-        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+        self.events.publish(BackendEvent::snapshot(stopping));
+        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -387,8 +387,8 @@ impl AppState {
             .unwrap_or_default();
         let snapshot = state.snapshot();
         drop(state);
-        self.events.send(BackendEvent::metrics(snapshot.metrics))?;
-        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+        self.events.publish(BackendEvent::metrics(snapshot.metrics));
+        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -426,7 +426,7 @@ impl AppState {
             }
             state.snapshot()
         };
-        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
+        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -448,7 +448,7 @@ impl AppState {
             state.lifecycle = next;
             state.snapshot()
         };
-        self.events.send(BackendEvent::snapshot(snapshot))?;
+        self.events.publish(BackendEvent::snapshot(snapshot));
         Ok(())
     }
 
@@ -460,11 +460,10 @@ impl AppState {
         } else {
             None
         };
-        let _ = self
-            .events
-            .send(BackendEvent::error(ErrorReport::from_error(&error)));
+        self.events
+            .publish(BackendEvent::error(ErrorReport::from_error(&error)));
         if let Some(snapshot) = snapshot {
-            let _ = self.events.send(BackendEvent::snapshot(snapshot));
+            self.events.publish(BackendEvent::snapshot(snapshot));
         }
     }
 
@@ -481,11 +480,10 @@ impl AppState {
         } else {
             None
         };
-        let _ = self
-            .events
-            .send(BackendEvent::error(ErrorReport::from_error(error)));
+        self.events
+            .publish(BackendEvent::error(ErrorReport::from_error(error)));
         if let Some(snapshot) = snapshot {
-            let _ = self.events.send(BackendEvent::snapshot(snapshot));
+            self.events.publish(BackendEvent::snapshot(snapshot));
         }
     }
 

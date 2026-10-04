@@ -43,6 +43,8 @@ pub enum WasapiMode {
 pub enum WasapiBackendError {
     #[error("invalid WASAPI stream configuration: {0}")]
     Audio(#[from] AudioError),
+    #[error("native WASAPI backend failed: {0}")]
+    Native(#[from] NativeWasapiError),
     #[error("WASAPI worker failed to start: {0}")]
     Startup(String),
     #[error("failed to spawn WASAPI worker: {0}")]
@@ -54,19 +56,15 @@ struct LatencyProfile {
     stats: Option<Arc<AudioLatencyStats>>,
 }
 
-/// Handles the capture and render event threads. Device interfaces are
-/// thread-affine in the `wasapi` crate, so the handles never leave their
-/// owning threads.
-pub struct WasapiStream {
-    stop: Arc<AtomicBool>,
-    errors: Arc<Mutex<Vec<String>>>,
-    latency: Option<Arc<AudioLatencyStats>>,
-    joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
+/// Unified WASAPI stream facade. Shared event mode uses the native
+/// `IAudioClient3` backend; the legacy wrapper remains available through the
+/// explicit `open_legacy*` methods and is also used for exclusive mode.
+pub enum WasapiStream {
+    Native(NativeWasapiStream),
+    Legacy(LegacyWasapiStream),
 }
 
 impl WasapiStream {
-    /// Open the default capture and render endpoints and start their event
-    /// loops. The returned worker endpoints are ready for a model thread.
     pub fn open(
         config: StreamConfig,
         mode: WasapiMode,
@@ -79,12 +77,14 @@ impl WasapiStream {
         mode: WasapiMode,
         queues: StreamQueueConfig,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
-        Self::open_inner(config, mode, queues, None)
+        match mode {
+            WasapiMode::SharedEvent => NativeWasapiStream::open_with_queue_config(config, queues)
+                .map(|(stream, worker)| (Self::Native(stream), worker))
+                .map_err(WasapiBackendError::Native),
+            WasapiMode::ExclusiveEvent => Self::open_legacy_with_queue_config(config, mode, queues),
+        }
     }
 
-    /// Profiled variant of [`Self::open`]. Capture blocks receive a monotonic
-    /// timestamp; the worker should copy it to its output lease so the stream
-    /// can report measured capture-to-render age.
     pub fn open_profiled(
         config: StreamConfig,
         mode: WasapiMode,
@@ -99,9 +99,100 @@ impl WasapiStream {
         queues: StreamQueueConfig,
         clock: AudioClock,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
-        Self::open_inner(config, mode, queues, Some(clock))
+        match mode {
+            WasapiMode::SharedEvent => {
+                NativeWasapiStream::open_profiled_with_queue_config(config, queues, clock)
+                    .map(|(stream, worker)| (Self::Native(stream), worker))
+                    .map_err(WasapiBackendError::Native)
+            }
+            WasapiMode::ExclusiveEvent => {
+                Self::open_legacy_profiled_with_queue_config(config, mode, queues, clock)
+            }
+        }
     }
 
+    /// Explicit legacy wrapper path for devices that cannot use
+    /// `IAudioClient3`.
+    pub fn open_legacy(
+        config: StreamConfig,
+        mode: WasapiMode,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        Self::open_legacy_with_queue_config(config, mode, StreamQueueConfig::default())
+    }
+
+    pub fn open_legacy_with_queue_config(
+        config: StreamConfig,
+        mode: WasapiMode,
+        queues: StreamQueueConfig,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        LegacyWasapiStream::open_inner(config, mode, queues, None)
+            .map(|(stream, worker)| (Self::Legacy(stream), worker))
+    }
+
+    pub fn open_legacy_profiled(
+        config: StreamConfig,
+        mode: WasapiMode,
+        clock: AudioClock,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        Self::open_legacy_profiled_with_queue_config(
+            config,
+            mode,
+            StreamQueueConfig::default(),
+            clock,
+        )
+    }
+
+    pub fn open_legacy_profiled_with_queue_config(
+        config: StreamConfig,
+        mode: WasapiMode,
+        queues: StreamQueueConfig,
+        clock: AudioClock,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        LegacyWasapiStream::open_inner(config, mode, queues, Some(clock))
+            .map(|(stream, worker)| (Self::Legacy(stream), worker))
+    }
+
+    pub fn take_errors(&self) -> Vec<String> {
+        match self {
+            Self::Native(stream) => stream.take_errors(),
+            Self::Legacy(stream) => stream.take_errors(),
+        }
+    }
+
+    pub fn latency(&self) -> Option<AudioLatencySnapshot> {
+        match self {
+            Self::Native(stream) => stream.latency(),
+            Self::Legacy(stream) => stream.latency(),
+        }
+    }
+
+    pub fn stop(self) {
+        drop(self);
+    }
+}
+
+impl Drop for WasapiStream {
+    fn drop(&mut self) {
+        match self {
+            Self::Native(stream) => stream.shutdown(),
+            Self::Legacy(stream) => stream.shutdown(),
+        }
+    }
+}
+
+/// Legacy wrapper based event threads. Device interfaces are
+/// thread-affine in the `wasapi` crate, so the handles never leave their
+/// owning threads.
+pub struct LegacyWasapiStream {
+    stop: Arc<AtomicBool>,
+    errors: Arc<Mutex<Vec<String>>>,
+    latency: Option<Arc<AudioLatencyStats>>,
+    joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
+}
+
+impl LegacyWasapiStream {
+    /// Open the default capture and render endpoints and start their event
+    /// loops. The returned worker endpoints are ready for a model thread.
     fn open_inner(
         config: StreamConfig,
         mode: WasapiMode,
@@ -212,8 +303,8 @@ impl WasapiStream {
         self.latency.as_deref().map(AudioLatencyStats::snapshot)
     }
 
-    pub fn stop(mut self) {
-        self.shutdown();
+    pub fn stop(self) {
+        drop(self);
     }
 
     fn shutdown(&mut self) {
@@ -225,7 +316,7 @@ impl WasapiStream {
     }
 }
 
-impl Drop for WasapiStream {
+impl Drop for LegacyWasapiStream {
     fn drop(&mut self) {
         self.shutdown();
     }

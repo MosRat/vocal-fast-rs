@@ -180,7 +180,7 @@ impl NativeWasapiStream {
         self.shutdown();
     }
 
-    fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) {
         signal_stop(&self.stop, self.stop_event.0);
         if let Some((capture, render)) = self.joins.take() {
             let _ = capture.join();

@@ -107,14 +107,14 @@ format and period support; it can reduce conversion latency but prevents other
 clients from using that endpoint in the selected format. The worker/ring layer
 is independent of this choice.
 
-`wasapi_backend::NativeWasapiStream` is the Windows 10+ path that performs
-this setup directly. It validates the endpoint's native f32 mix format,
-chooses a period aligned to `GetSharedModeEnginePeriod`, and initializes the
-stream with `InitializeSharedAudioStream` and event callbacks. It intentionally
-does not enable format conversion; callers should use the device's native
-sample rate and channel count or handle conversion outside the callback. The
-existing `WasapiStream` remains the wrapper based path for devices where the
-native shared client cannot be opened.
+`wasapi_backend::WasapiStream::open(..., WasapiMode::SharedEvent)` now selects
+the Windows 10+ `NativeWasapiStream` path. It validates the endpoint's native
+f32 mix format, chooses a period aligned to `GetSharedModeEnginePeriod`, and
+initializes the stream with `InitializeSharedAudioStream` and event callbacks.
+It intentionally does not enable format conversion; callers should use the
+device's native sample rate and channel count or handle conversion outside the
+callback. The older wrapper path is available only through
+`WasapiStream::open_legacy*`; `ExclusiveEvent` continues to use that path.
 
 The optional `cpal-backend` adapter is a portable first integration. It requests
 f32 and a fixed callback size, then still uses the assembler/drainer because a

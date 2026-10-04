@@ -7,17 +7,14 @@
 use serde::Serialize;
 use vocal_types::{LatencyMetrics, LifecycleState};
 
-use crate::{
-    audio::AudioTelemetry,
-    config::GuiConfig,
-    events::ErrorReport,
-};
+use crate::{audio::AudioTelemetry, config::GuiConfig, events::ErrorReport};
 
 pub use vocal_runtime::ModelSummary;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiSnapshot {
+    pub boot: UiBootStatus,
     pub lifecycle: LifecycleState,
     /// Per-subsystem states avoid making the aggregate lifecycle carry model,
     /// engine and device failures at the same time. `lifecycle` is retained
@@ -30,6 +27,30 @@ pub struct UiSnapshot {
     pub engine: Option<UiEngineStatus>,
     pub last_error: Option<ErrorReport>,
     pub audio: AudioTelemetry,
+}
+
+/// Application startup is intentionally separate from the runtime lifecycle.
+/// A model may still be restoring while the runtime itself is in `Created`,
+/// and the UI needs to represent that distinction without guessing from
+/// individual subsystem states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BootPhase {
+    Starting,
+    RestoringConfig,
+    RestoringModel,
+    Ready,
+    Failed,
+    ShuttingDown,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiBootStatus {
+    pub phase: BootPhase,
+    pub message: Option<String>,
+    pub elapsed_ms: u64,
+    pub recoverable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

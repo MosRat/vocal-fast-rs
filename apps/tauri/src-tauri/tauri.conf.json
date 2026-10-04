@@ -12,13 +12,33 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "vocal-fast",
         "width": 1180,
         "height": 780,
         "minWidth": 900,
         "minHeight": 620,
         "resizable": true,
+        "visible": false,
         "decorations": false
+      },
+      {
+        "label": "splash",
+        "url": "index.html#/splash",
+        "title": "vocal-fast",
+        "width": 430,
+        "height": 270,
+        "minWidth": 430,
+        "minHeight": 270,
+        "maxWidth": 430,
+        "maxHeight": 270,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true,
+        "alwaysOnTop": true,
+        "center": true,
+        "visible": true
       }
     ],
     "security": { "csp": null, "capabilities": ["default"] }

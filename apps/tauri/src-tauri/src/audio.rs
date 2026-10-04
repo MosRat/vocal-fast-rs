@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -189,49 +189,50 @@ impl AudioSession {
                 let mut sequence = 0_u64;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !worker_stop.load(Ordering::Acquire) {
-                    let result = worker_io.process_once(schedule, |input, output| {
-                        let started = Instant::now();
-                        let chunk = AudioChunk {
-                            format,
-                            samples: input.to_vec(),
-                            sequence,
-                        };
-                        let converted = runtime
-                            .process(&chunk)
-                            .map_err(|error| AudioError::Processing(error.to_string()))?;
-                        if converted.samples.len() != output.len() {
-                            return Err(AudioError::BlockSizeMismatch {
-                                expected: output.len(),
-                                actual: converted.samples.len(),
-                            });
+                        let result = worker_io.process_once(schedule, |input, output| {
+                            let started = Instant::now();
+                            let chunk = AudioChunk {
+                                format,
+                                samples: input.to_vec(),
+                                sequence,
+                            };
+                            let converted = runtime
+                                .process(&chunk)
+                                .map_err(|error| AudioError::Processing(error.to_string()))?;
+                            if converted.samples.len() != output.len() {
+                                return Err(AudioError::BlockSizeMismatch {
+                                    expected: output.len(),
+                                    actual: converted.samples.len(),
+                                });
+                            }
+                            output.copy_from_slice(&converted.samples);
+                            worker_telemetry
+                                .input_frames
+                                .fetch_add(chunk.frames() as u64, Ordering::Relaxed);
+                            worker_telemetry
+                                .output_frames
+                                .fetch_add(converted.frames() as u64, Ordering::Relaxed);
+                            worker_telemetry
+                                .processing_micros
+                                .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            sequence = sequence.wrapping_add(1);
+                            Ok(())
+                        });
+                        match result {
+                            Ok(())
+                            | Err(
+                                AudioError::Timeout
+                                | AudioError::QueueEmpty
+                                | AudioError::QueueFull,
+                            ) => {}
+                            Err(error) => {
+                                worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                                worker_alive_flag.store(false, Ordering::Release);
+                                worker_report(error.to_string());
+                                worker_stop.store(true, Ordering::Release);
+                                break;
+                            }
                         }
-                        output.copy_from_slice(&converted.samples);
-                        worker_telemetry
-                            .input_frames
-                            .fetch_add(chunk.frames() as u64, Ordering::Relaxed);
-                        worker_telemetry
-                            .output_frames
-                            .fetch_add(converted.frames() as u64, Ordering::Relaxed);
-                        worker_telemetry.processing_micros.fetch_add(
-                            started.elapsed().as_micros() as u64,
-                            Ordering::Relaxed,
-                        );
-                        sequence = sequence.wrapping_add(1);
-                        Ok(())
-                    });
-                    match result {
-                        Ok(())
-                        | Err(
-                            AudioError::Timeout | AudioError::QueueEmpty | AudioError::QueueFull,
-                        ) => {}
-                        Err(error) => {
-                            worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
-                            worker_alive_flag.store(false, Ordering::Release);
-                            worker_report(error.to_string());
-                            worker_stop.store(true, Ordering::Release);
-                            break;
-                        }
-                    }
                     }
                 }));
                 if result.is_err() {

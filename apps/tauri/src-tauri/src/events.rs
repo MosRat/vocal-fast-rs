@@ -83,7 +83,10 @@ impl EventSink {
             .lock()
             .map_err(|_| GuiError::Internal("event channel lock poisoned".into()))?;
         channels.retain(|(current, _, _)| current != &label);
-        let id = self.subscriber_id.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let id = self
+            .subscriber_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         channels.push((label, id, channel));
         Ok(())
     }
@@ -113,7 +116,11 @@ impl EventSink {
                 .channels
                 .lock()
                 .map_err(|_| GuiError::Internal("event channel lock poisoned".into()))?;
-            current.retain(|(label, id, _)| !failed.iter().any(|(failed_label, failed_id)| failed_label == label && failed_id == id));
+            current.retain(|(label, id, _)| {
+                !failed
+                    .iter()
+                    .any(|(failed_label, failed_id)| failed_label == label && failed_id == id)
+            });
         }
         Ok(())
     }

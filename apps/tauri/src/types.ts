@@ -1,4 +1,5 @@
 export type Lifecycle = 'created' | 'loading' | 'ready' | 'running' | 'stopping' | 'stopped' | 'failed';
+export type BootPhase = 'starting' | 'restoringConfig' | 'restoringModel' | 'ready' | 'failed' | 'shuttingDown';
 export type Backend = 'passthrough' | 'rvcCpu';
 export type ThemePreference = 'system' | 'light' | 'dark';
 export type WorkspaceRoute = 'studio' | 'audio' | 'tuning' | 'diagnostics';
@@ -66,7 +67,15 @@ export interface ErrorReport {
   recoverable: boolean;
 }
 
+export interface BootStatus {
+  phase: BootPhase;
+  message: string | null;
+  elapsedMs: number;
+  recoverable: boolean;
+}
+
 export interface Snapshot {
+  boot: BootStatus;
   lifecycle: Lifecycle;
   status: {
     session: Lifecycle;

@@ -12,12 +12,14 @@ GUI 是控制面。Rust 侧持有模型、engine、音频设备流、配置和�
 - `start_session` 创建 duplex capture/render stream 和 Rust worker；worker 通过 `WorkerIo::process_once` 驱动 engine，音频块不经过 WebView。
 - `process_block` 只用于没有实时流时的控制面测试；实时运行时会拒绝它，避免两个 engine 同时消费模型。
 - 前端每秒用 `get_snapshot` 补齐设备回调和 worker 指标，状态变化仍通过 Channel 推送。
+- 启动阶段使用独立 `splash` 窗口；`UiSnapshot.boot` 区分配置恢复、模型恢复、就绪、失败和关闭。模型恢复在后台线程执行，超过 30 秒会先显示主窗口并继续等待，不会阻塞用户界面。
+- 主窗口关闭会隐藏到系统托盘，Rust 侧统一停止音频会话；托盘提供显示、启动/停止、设置、诊断和退出入口，退出前会走同一个 `AppState::shutdown` 路径。
 
 ## 配置和错误
 
 配置写入应用配置目录下的 `config.json`，先写临时文件再替换目标文件。配置包括设备 ID、采样率、block/queue 和转换参数，带 revision；前端提交旧 revision 时会收到 `config_conflict`。模型可以单独卸载，卸载会清空 engine 和持久化模型路径。
 
-命令错误统一为带 `kind` 和 `details` 的结构化响应，并同时通过 Channel 发出 `ErrorReport`。前端保留最后一条错误，用户可以 dismiss 后继续操作。
+命令错误统一为带 `kind` 和 `details` 的结构化响应，并同时通过 Channel 发出 `ErrorReport`。前端保留最后一条错误，用户可以 dismiss、展开技术详情或复制报告后继续操作；启动超时和内部错误会自动打开错误对话框。
 
 ## 本地验证
 

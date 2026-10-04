@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use vocal_runtime::RuntimeContext;
 use vocal_types::{AudioChunk, AudioFormat, LifecycleState};
@@ -8,7 +11,7 @@ use crate::{
     config::{ConfigStore, GuiConfig},
     error::{GuiError, GuiResult},
     events::{BackendEvent, ErrorReport, EventSink},
-    snapshot::{UiEngineStatus, UiStatus},
+    snapshot::{BootPhase, UiBootStatus, UiEngineStatus, UiStatus},
 };
 
 pub use crate::snapshot::{UiMetrics, UiSnapshot};
@@ -17,6 +20,44 @@ struct RuntimeState {
     runtime: RuntimeContext,
     audio: Option<AudioSession>,
     last_error: Option<ErrorReport>,
+    boot: BootState,
+}
+
+struct BootState {
+    phase: BootPhase,
+    message: Option<String>,
+    recoverable: bool,
+    started_at: Instant,
+}
+
+impl BootState {
+    fn new() -> Self {
+        Self {
+            phase: BootPhase::Starting,
+            message: None,
+            recoverable: true,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn set(&mut self, phase: BootPhase, message: Option<String>, recoverable: bool) {
+        self.phase = phase;
+        self.message = message;
+        self.recoverable = recoverable;
+    }
+
+    fn snapshot(&self) -> UiBootStatus {
+        UiBootStatus {
+            phase: self.phase,
+            message: self.message.clone(),
+            elapsed_ms: self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            recoverable: self.recoverable,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -28,12 +69,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: GuiConfig) -> Self {
-        let runtime = RuntimeContext::new(config).expect("default runtime configuration must validate");
+        let runtime =
+            RuntimeContext::new(config).expect("default runtime configuration must validate");
         Self {
             inner: Arc::new(Mutex::new(RuntimeState {
                 runtime,
                 audio: None,
                 last_error: None,
+                boot: BootState::new(),
             })),
             command_lock: Arc::new(Mutex::new(())),
             events: Arc::new(EventSink::default()),
@@ -44,6 +87,73 @@ impl AppState {
         let runtime = self.lock()?.runtime.clone();
         runtime.set_config_store(store.runtime_store())?;
         Ok(())
+    }
+
+    pub fn set_boot_phase(
+        &self,
+        phase: BootPhase,
+        message: Option<String>,
+    ) -> GuiResult<UiSnapshot> {
+        let _operation = self.operation()?;
+        let snapshot = {
+            let mut state = self.lock()?;
+            state.boot.set(phase, message, true);
+            state.snapshot()?
+        };
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
+        Ok(snapshot)
+    }
+
+    pub fn mark_boot_ready(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.boot.set(BootPhase::Ready, None, true);
+            if state
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error.code == "startup_timeout")
+            {
+                state.last_error = None;
+            }
+        }
+        if let Ok(snapshot) = self.snapshot() {
+            self.events.publish(BackendEvent::snapshot(snapshot));
+        }
+    }
+
+    pub fn fail_boot(&self, error: &GuiError) {
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .boot
+                .set(BootPhase::Failed, Some(error.to_string()), true);
+            state.last_error = Some(ErrorReport::from_error(error));
+        }
+        self.events
+            .publish(BackendEvent::error(ErrorReport::from_error(error)));
+        if let Ok(snapshot) = self.snapshot() {
+            self.events.publish(BackendEvent::snapshot(snapshot));
+        }
+    }
+
+    /// Reveal the main UI after a long restore without cancelling the worker.
+    /// The worker can still complete later and transition the boot state to
+    /// `Ready`; this keeps a slow disk or antivirus scan from looking frozen.
+    pub fn mark_boot_timeout(&self) {
+        let error = ErrorReport {
+            code: "startup_timeout".into(),
+            message: "Startup is taking longer than expected; the model is still loading.".into(),
+            recoverable: true,
+        };
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .boot
+                .set(BootPhase::Failed, Some(error.message.clone()), true);
+            state.last_error = Some(error.clone());
+        }
+        self.events.publish(BackendEvent::error(error));
+        if let Ok(snapshot) = self.snapshot() {
+            self.events.publish(BackendEvent::snapshot(snapshot));
+        }
     }
 
     pub fn snapshot(&self) -> GuiResult<UiSnapshot> {
@@ -67,7 +177,8 @@ impl AppState {
         let _operation = self.operation()?;
         self.events.attach(label, channel)?;
         let snapshot = self.snapshot()?;
-        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -89,7 +200,8 @@ impl AppState {
         let runtime = self.lock()?.runtime.clone();
         runtime.update_config(config, expected_revision)?;
         let snapshot = self.snapshot()?;
-        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -108,8 +220,16 @@ impl AppState {
         let result = runtime.load_model(path);
         match result {
             Ok(_) => {
-                let snapshot = self.snapshot()?;
-                self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+                let snapshot = {
+                    let mut state = self.lock()?;
+                    state.last_error = None;
+                    if state.boot.phase == BootPhase::Failed {
+                        state.boot.set(BootPhase::Ready, None, true);
+                    }
+                    state.snapshot()?
+                };
+                self.events
+                    .publish(BackendEvent::snapshot(snapshot.clone()));
                 Ok(snapshot)
             }
             Err(error) => {
@@ -134,7 +254,8 @@ impl AppState {
         };
         runtime.unload_model()?;
         let snapshot = self.snapshot()?;
-        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -169,7 +290,8 @@ impl AppState {
             state.last_error = None;
             state.snapshot()?
         };
-        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -181,9 +303,33 @@ impl AppState {
         };
         drop(session);
         let runtime = self.lock()?.runtime.clone();
-        runtime.stop_processing()?;
+        if runtime.snapshot()?.lifecycle == LifecycleState::Running {
+            runtime.stop_processing()?;
+        }
         let snapshot = self.snapshot()?;
-        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
+        Ok(snapshot)
+    }
+
+    /// Stop the audio adapter and mark the application as shutting down. This
+    /// is shared by the tray Quit action and native close handling so every
+    /// exit path releases the audio worker before the process terminates.
+    pub fn shutdown(&self) -> GuiResult<UiSnapshot> {
+        let _operation = self.operation()?;
+        let session = {
+            let mut state = self.lock()?;
+            state.boot.set(BootPhase::ShuttingDown, None, false);
+            state.audio.take()
+        };
+        drop(session);
+        let runtime = self.lock()?.runtime.clone();
+        if runtime.snapshot()?.lifecycle == LifecycleState::Running {
+            runtime.stop_processing()?;
+        }
+        let snapshot = self.snapshot()?;
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -211,7 +357,8 @@ impl AppState {
         })?;
         let snapshot = self.snapshot()?;
         self.events.publish(BackendEvent::metrics(snapshot.metrics));
-        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -224,12 +371,18 @@ impl AppState {
         drop(session);
         let runtime = self.lock()?.runtime.clone();
         let snapshot = {
-            runtime.clear_error()?;
+            let runtime_snapshot = runtime.clear_error()?;
             let mut state = self.lock()?;
             state.last_error = None;
+            if state.boot.phase == BootPhase::Failed
+                && runtime_snapshot.lifecycle != LifecycleState::Loading
+            {
+                state.boot.set(BootPhase::Ready, None, true);
+            }
             state.snapshot()?
         };
-        self.events.publish(BackendEvent::snapshot(snapshot.clone()));
+        self.events
+            .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
     }
 
@@ -239,7 +392,10 @@ impl AppState {
             state.runtime.clone()
         });
         if let Some(runtime) = runtime.as_ref()
-            && matches!(error, GuiError::Engine(_) | GuiError::Audio(_) | GuiError::Internal(_))
+            && matches!(
+                error,
+                GuiError::Engine(_) | GuiError::Audio(_) | GuiError::Internal(_)
+            )
         {
             let _ = runtime.report_failure(error.code(), error.to_string());
         }
@@ -295,6 +451,7 @@ impl RuntimeState {
         });
         let engine = runtime.engine.map(UiEngineStatus::from);
         Ok(UiSnapshot {
+            boot: self.boot.snapshot(),
             lifecycle: runtime.lifecycle,
             status: UiStatus {
                 session: runtime.lifecycle,
@@ -358,9 +515,18 @@ mod tests {
     fn snapshot_exposes_independent_subsystem_states() {
         let state = AppState::new(GuiConfig::default());
         let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.boot.phase, BootPhase::Starting);
         assert_eq!(snapshot.status.session, LifecycleState::Created);
         assert_eq!(snapshot.status.model, LifecycleState::Created);
         assert_eq!(snapshot.status.engine, LifecycleState::Created);
         assert_eq!(snapshot.status.audio, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn stop_is_idempotent_when_no_audio_session_exists() {
+        let state = AppState::new(GuiConfig::default());
+        let snapshot = state.stop().expect("stop without session");
+        assert_eq!(snapshot.lifecycle, LifecycleState::Created);
+        assert_eq!(snapshot.boot.phase, BootPhase::Starting);
     }
 }

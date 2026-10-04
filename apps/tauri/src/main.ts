@@ -38,9 +38,9 @@ const THEME_STORAGE_KEY = 'vocal-fast.theme';
 let themePreference: ThemePreference = readStoredTheme();
 let windowMaximized = false;
 let activeSection: ViewRoute = routeFromLocation();
-let closeInFlight = false;
-let closeHookInstalled = false;
 let windowLabel = 'main';
+let errorDialogOpen = false;
+let splashStartedAt = performance.now();
 let draftConfig: GuiConfig | null = null;
 let renderTimer: number | undefined;
 const lastActionAt = new Map<string, number>();
@@ -81,8 +81,8 @@ if (runningInTauri()) {
   }
 }
 
-function isPrimaryWindow(): boolean {
-  return !runningInTauri() || windowLabel === 'main';
+function isSplashWindow(): boolean {
+  return windowLabel === 'splash' || window.location.hash === '#/splash';
 }
 
 function navigateTo(route: ViewRoute): void {
@@ -187,6 +187,16 @@ function scheduleRender(delay = 70): void {
   }, delay);
 }
 
+function renderSplash(): string {
+  const elapsed = Math.max(0, performance.now() - splashStartedAt);
+  const seconds = Math.floor(elapsed / 1000);
+  return `<main class="splash-shell" aria-busy="true"><div class="splash-glow"></div><div class="splash-card"><div class="splash-mark">${icon('waveform', 27)}</div><div class="splash-kicker">VOCAL-FAST</div><h1>Preparing your studio</h1><p>Restoring the audio path and the last session.</p><div class="splash-progress"><span></span></div><div class="splash-status"><span class="splash-dot"></span><span>Starting runtime${seconds > 2 ? ' · still working' : '…'}</span></div></div></main>`;
+}
+
+function renderErrorDialog(report: ErrorReport): string {
+  return `<div class="error-dialog-backdrop" role="presentation"><section class="error-dialog" role="alertdialog" aria-modal="true" aria-labelledby="error-dialog-title"><div class="error-dialog-icon">${icon('alert', 20)}</div><div class="error-dialog-body"><div class="kicker">RUNTIME NOTICE</div><h2 id="error-dialog-title">${escapeHtml(report.code)}</h2><p>${escapeHtml(report.message)}</p><details><summary>Technical details</summary><code>${escapeHtml(JSON.stringify(report, null, 2))}</code></details><div class="error-dialog-actions"><button id="copyError" class="button secondary">${icon('keyboard', 15)}<span>Copy details</span></button>${report.recoverable ? button('dismissError', 'Dismiss', 'close', 'ghost') : ''}</div></div></section></div>`;
+}
+
 function renderTitlebar(): string {
   return `<header class="titlebar" data-tauri-drag-region><div class="titlebar-brand"><div class="app-glyph">${icon('waveform', 17)}</div><span>vocal-fast</span><span class="titlebar-divider"></span><span class="titlebar-context">${activeSection === 'settings' ? 'Settings' : activeSection === 'diagnostics' ? 'Diagnostics' : 'Studio'}</span></div><div class="titlebar-tools"><button id="openDiagnostics" class="titlebar-tool" title="Open diagnostics window">${icon('chart', 15)}<span>Diagnostics</span></button><button id="openSettings" class="titlebar-tool" title="Open settings window">${icon('settings', 15)}<span>Settings</span></button></div><div class="titlebar-actions"><button id="minimizeWindow" class="window-button" title="Minimize">${icon('minimize', 15)}</button><button id="maximizeWindow" class="window-button" title="Maximize">${icon(windowMaximized ? 'restore' : 'maximize', 14)}</button><button id="closeWindow" class="window-button close" title="Close">${icon('close', 15)}</button></div></header>`;
 }
@@ -212,6 +222,12 @@ function renderSidebar(): string {
 }
 
 function render(): void {
+  if (isSplashWindow()) {
+    document.documentElement.classList.add('splash-window');
+    appRoot.innerHTML = renderSplash();
+    return;
+  }
+  document.documentElement.classList.remove('splash-window');
   const current = snapshot;
   const config = draftConfig ?? current?.config ?? defaultConfig();
   const audio = current?.audio;
@@ -221,6 +237,9 @@ function render(): void {
   const model = current?.model;
   const latency = audio?.latencyP95Micros ? `${(audio.latencyP95Micros / 1000).toFixed(2)} ms` : '—';
   const status = current?.lifecycle ?? 'created';
+  const boot = current?.boot;
+  const bootPending = boot && boot.phase !== 'ready' && boot.phase !== 'failed';
+  const bootMessage = boot?.message ?? (bootPending ? 'Preparing runtime…' : null);
   const inputName = audio?.active
     ? audio.inputDevice
     : config.inputDevice
@@ -238,7 +257,7 @@ function render(): void {
     <article class="panel tuning-panel" data-section-target="tuning">${panelHeader('VOICE CONTROLS', 'Shape the sound', '<span class="panel-badge subtle">Live-safe</span>')}<div class="slider-list">${slider('pitch', 'Pitch shift', `${config.conversion.pitchSemitones.toFixed(1)} st`, config.conversion.pitchSemitones, -24, 24, 0.1)}${slider('index', 'Index ratio', config.conversion.indexRatio.toFixed(2), config.conversion.indexRatio, 0, 1, 0.01)}${slider('protect', 'Unvoiced protect', config.conversion.protect.toFixed(2), config.conversion.protect, 0, 1, 0.01)}${slider('rms', 'RMS mix', config.conversion.rmsMixRate.toFixed(2), config.conversion.rmsMixRate, 0, 1, 0.01)}</div></article>
     <article class="panel config-panel" data-section-target="studio">${panelHeader('ENGINE & STREAM', 'Session configuration', '<span class="panel-badge subtle">Optimistic sync</span>')}<label class="field-label">Backend<select id="backend" ${running ? 'disabled' : ''}><option value="passthrough" ${config.backend === 'passthrough' ? 'selected' : ''}>Passthrough</option><option value="rvcCpu" ${config.backend === 'rvcCpu' ? 'selected' : ''}>RVC CPU</option></select></label><div class="form-grid"><label class="field-label">Sample rate<input id="inputRate" type="number" min="1" value="${config.inputFormat.sampleRate}" ${running ? 'disabled' : ''}/></label><label class="field-label">Channels<input id="channels" type="number" min="1" max="8" value="${config.inputFormat.channels}" ${running ? 'disabled' : ''}/></label><label class="field-label">Block frames<input id="blockFrames" type="number" min="1" max="8192" value="${config.blockFrames}" ${running ? 'disabled' : ''}/></label><label class="field-label">Queue depth<input id="queueBlocks" type="number" min="1" max="64" value="${config.queueBlocks}" ${running ? 'disabled' : ''}/></label></div>${button('save', 'Save configuration', 'check', 'primary full', busy || running)}</article>
     <article class="panel telemetry-panel span-2" data-section-target="diagnostics">${panelHeader('RUNTIME HEALTH', 'Audio telemetry', `<span class="stream-state ${audio?.active ? 'active' : ''}"><span class="status-dot"></span>${audio?.active ? 'Streaming' : 'Idle'}</span>`)}<div class="metrics-grid">${metric('Input frames', formatNumber(current?.metrics.inputFrames ?? 0), 'waveform')}${metric('Output frames', formatNumber(current?.metrics.outputFrames ?? 0), 'speaker')}${metric('Processing', current ? `${(current.metrics.processingMicros / 1000).toFixed(2)} ms` : '0.00 ms', 'cpu')}${metric('p95 audio age', latency, 'chart', audio?.latencyP95Micros ? 'positive' : '')}${metric('Underflows', formatNumber(audio?.underflowSamples ?? 0), 'alert', audio?.underflowSamples ? 'critical' : '')}${metric('Queue drops', formatNumber(audio?.queueOverflows ?? 0), 'database', audio?.queueOverflows ? 'critical' : '')}</div><div class="telemetry-footer"><span>${escapeHtml(audio?.streamState ?? 'Stopped')} · ${escapeHtml(inputName ?? 'default input')} → ${escapeHtml(outputName ?? 'default output')}</span><span>Worker failures: ${audio?.failures ?? current?.engine?.failures ?? 0}</span></div></article></section>
-    ${report ? `<section class="error-banner"><div class="error-icon">${icon('alert', 18)}</div><div><strong>${escapeHtml(report.code)}</strong><span>${escapeHtml(report.message)}</span></div>${report.recoverable ? button('clearError', 'Dismiss', 'close', 'ghost') : ''}</section>` : ''}<footer class="app-footer"><span>Audio stays in the Rust worker; this surface receives snapshots and metrics.</span><span>${icon('keyboard', 13)} <kbd>Space</kbd> session · <kbd>Ctrl R</kbd> refresh</span></footer></main></div>`;
+    ${bootMessage ? `<section class="boot-strip ${bootPending ? 'pending' : ''}"><span class="boot-strip-dot"></span><div><strong>${bootPending ? 'Starting vocal-fast' : 'Startup notice'}</strong><span>${escapeHtml(bootMessage)}</span></div></section>` : ''}${report ? `<section class="error-banner" role="alert"><div class="error-icon">${icon('alert', 18)}</div><div><strong>${escapeHtml(report.code)}</strong><span>${escapeHtml(report.message)}</span></div><div class="error-actions"><button id="showErrorDetails" class="button ghost">Details</button>${report.recoverable ? button('clearError', 'Dismiss', 'close', 'ghost') : ''}</div></section>` : ''}<footer class="app-footer"><span>Audio stays in the Rust worker; this surface receives snapshots and metrics.</span><span>${icon('keyboard', 13)} <kbd>Space</kbd> session · <kbd>Ctrl R</kbd> refresh</span></footer></main></div>${report && errorDialogOpen ? renderErrorDialog(report) : ''}`;
   const content = appRoot.querySelector<HTMLElement>('main.content');
   if (content) {
     content.classList.toggle('settings-route', activeSection === 'settings');
@@ -349,8 +368,33 @@ function wireHandlers(): void {
     runAction(() => call<Snapshot>('stop_session'), 'stop-session'),
   );
   byId<HTMLButtonElement>('clearError')?.addEventListener('click', () =>
-    runAction(() => call<Snapshot>('clear_error'), 'clear-error'),
+    runAction(async () => {
+      if (localError) {
+        localError = null;
+        errorDialogOpen = false;
+        render();
+        return snapshot;
+      }
+      errorDialogOpen = false;
+      return call<Snapshot>('clear_error');
+    }, 'clear-error'),
   );
+  byId<HTMLButtonElement>('showErrorDetails')?.addEventListener('click', () => {
+    errorDialogOpen = true;
+    render();
+  });
+  byId<HTMLButtonElement>('dismissError')?.addEventListener('click', () => {
+    errorDialogOpen = false;
+    if (localError) localError = null;
+    render();
+  });
+  byId<HTMLButtonElement>('copyError')?.addEventListener('click', () => {
+    const report = localError ?? snapshot?.lastError;
+    if (!report) return;
+    void navigator.clipboard
+      ?.writeText(`[${report.code}] ${report.message}`)
+      .catch(() => undefined);
+  });
   byId<HTMLButtonElement>('refreshDevices')?.addEventListener('click', () =>
     runAction(async () => {
       devices = await call<AudioDeviceCatalog>('list_audio_devices');
@@ -432,7 +476,12 @@ async function windowCommand(command: 'minimize' | 'maximize' | 'close'): Promis
     else if (command === 'maximize') {
       await current.toggleMaximize();
       await syncWindowState();
-    } else await current.close();
+    } else {
+      if (snapshot?.lifecycle === 'running') {
+        await runAction(() => call<Snapshot>('stop_session'), 'close-stop');
+      }
+      await current.hide();
+    }
   } catch (error) {
     localError = normalizeError(error);
     render();
@@ -443,28 +492,6 @@ async function syncWindowState(): Promise<void> {
     const current = getCurrentWindow();
     windowLabel = current.label;
     windowMaximized = await current.isMaximized();
-    if (!isPrimaryWindow()) {
-      render();
-      return;
-    }
-    if (!closeHookInstalled) {
-      closeHookInstalled = true;
-      await current.onCloseRequested(async (event) => {
-        if (closeInFlight || busy) {
-          event.preventDefault();
-          return;
-        }
-        if (snapshot?.lifecycle !== 'running') return;
-        event.preventDefault();
-        closeInFlight = true;
-        try {
-          await runAction(() => call<Snapshot>('stop_session'), 'close-stop');
-          if (snapshot?.lifecycle !== 'running') await current.close();
-        } finally {
-          closeInFlight = false;
-        }
-      });
-    }
     render();
   } catch {
     /* Browser preview has no native window. */
@@ -477,6 +504,7 @@ function applyTheme(): void {
 }
 
 async function connect(): Promise<void> {
+  if (isSplashWindow()) return;
   if (!runningInTauri()) {
     // Keep the Vite/Playwright preview useful without a native IPC bridge.
     render();
@@ -493,7 +521,10 @@ async function connect(): Promise<void> {
         if (!snapshot.lastError) localError = null;
       }
       if (event.type === 'metrics' && snapshot) snapshot.metrics = event.payload as Snapshot['metrics'];
-      if (event.type === 'error') localError = event.payload as ErrorReport;
+      if (event.type === 'error') {
+        localError = event.payload as ErrorReport;
+        errorDialogOpen = !localError.recoverable || localError.code === 'startup_timeout';
+      }
       scheduleRender();
     };
     snapshot = await call<Snapshot>('subscribe', { windowLabel, channel: events });
@@ -558,9 +589,16 @@ if (runningInTauri()) {
     if (event.payload === 'dark' || event.payload === 'light' || event.payload === 'system')
       setThemePreference(event.payload, false);
   });
+  void listen<string>('vocal-fast://open-route', (event) => {
+    if (event.payload === 'settings' || event.payload === 'diagnostics') {
+      void openAuxiliaryWindow(event.payload);
+    } else if (isWorkspaceRoute(event.payload)) {
+      navigateTo(event.payload as ViewRoute);
+    }
+  });
 }
 window.setInterval(async () => {
-  if (!channelConnected || busy || refreshInFlight) return;
+  if (isSplashWindow() || document.visibilityState !== 'visible' || !channelConnected || busy || refreshInFlight) return;
   refreshInFlight = true;
   try {
     snapshot = await call<Snapshot>('get_snapshot');
@@ -571,6 +609,9 @@ window.setInterval(async () => {
     refreshInFlight = false;
   }
 }, 1000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') void resyncSnapshot();
+});
 applyTheme();
 render();
 void syncWindowState();

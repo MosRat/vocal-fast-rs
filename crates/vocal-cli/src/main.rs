@@ -12,6 +12,12 @@ use vocal_model::{
 use vocal_runtime::{RuntimeBackend, RuntimeConfig, RuntimeContext};
 use vocal_types::{AudioChunk, AudioFormat, ModelDescriptor};
 
+// Keep allocation policy at the executable boundary. Library crates remain
+// allocator-neutral so embedders can choose their own heap implementation.
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cli_config;
 mod cli_error;
 mod cli_logging;

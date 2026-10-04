@@ -23,8 +23,29 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 half = "2.6"
+mimalloc = { version = "0.1.52", default-features = false }
 vocal-types = { path = "crates/vocal-types" }
 vocal-audio = { path = "crates/vocal-audio" }
 vocal-model = { path = "crates/vocal-model" }
 vocal-engine = { path = "crates/vocal-engine" }
 vocal-runtime = { path = "crates/vocal-runtime" }
+
+# Development builds prioritize fast relinks and usable backtraces. Release
+# builds keep thin LTO for cross-crate inlining without the link cost of fat
+# LTO; the audio hot path still gets a single optimized release code path.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+codegen-units = 256
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = "symbols"
+debug = false

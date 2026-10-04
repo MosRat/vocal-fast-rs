@@ -1,0 +1,7 @@
+[target.x86_64-pc-windows-msvc]
+# Rust ships a compatible lld-link implementation. It avoids VS environment
+# discovery and is cheaper for incremental links.
+linker = "rust-lld"
+# Keep Rust and native TensorRT/CUDA objects on the same dynamic MSVC CRT
+# (/MD), avoiding ownership crossing between independent CRT heaps.
+rustflags = ["-C", "target-feature=-crt-static"]

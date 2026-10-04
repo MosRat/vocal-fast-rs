@@ -27,4 +27,24 @@ vocal-audio = { path = "../../../crates/vocal-audio", features = ["cpal-backend"
 cpal = "0.18"
 
 [target.'cfg(windows)'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
+# This crate is an isolated Cargo workspace, so keep its profiles aligned
+# with the root workspace's fast relink and thin-LTO policy.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+codegen-units = 256
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = "symbols"
+debug = false

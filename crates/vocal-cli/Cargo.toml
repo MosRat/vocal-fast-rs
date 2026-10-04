@@ -22,3 +22,6 @@ vocal-model.workspace = true
 vocal-runtime.workspace = true
 vocal-types.workspace = true
 vocal-tensorrt = { path = "../vocal-tensorrt", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = { workspace = true, features = ["win_direct_tls"] }

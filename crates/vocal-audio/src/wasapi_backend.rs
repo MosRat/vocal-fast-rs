@@ -292,7 +292,8 @@ fn setup_capture(
     let max_samples = max_frames * config.format.channels as usize;
     let assembler = BlockAssembler::new(config).map_err(|e| e.to_string())?;
     client.start_stream().map_err(|e| e.to_string())?;
-    Ok((client, event, capture, assembler, vec![0.0; max_samples]))
+    let samples = crate::allocate_samples(max_samples).map_err(|e| e.to_string())?;
+    Ok((client, event, capture, assembler, samples))
 }
 
 fn setup_render(
@@ -331,7 +332,8 @@ fn setup_render(
     let max_samples = max_frames * config.format.channels as usize;
     let drainer = BlockDrainer::new(config).map_err(|e| e.to_string())?;
     client.start_stream().map_err(|e| e.to_string())?;
-    Ok((client, event, render, drainer, vec![0.0; max_samples]))
+    let samples = crate::allocate_samples(max_samples).map_err(|e| e.to_string())?;
+    Ok((client, event, render, drainer, samples))
 }
 
 fn f32_bytes(samples: &[f32]) -> &[u8] {

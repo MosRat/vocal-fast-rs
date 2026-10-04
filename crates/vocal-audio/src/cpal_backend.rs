@@ -240,27 +240,30 @@ fn build_duplex_inner(
                 );
                 // Silence is written on underflow so the native callback never
                 // blocks behind inference.
-                if let Ok(report) = drainer.drain(data, &mut output_consumer) {
-                    if let Some(latency) = output_latency.as_ref() {
-                        latency.record_underflow(report.underflow_samples);
-                        let stats = output_consumer.stats();
-                        latency.record_queue_state(
-                            stats.queued_blocks,
-                            stats.high_water_blocks,
-                            stats.dropped_full,
-                            stats.dropped_stale,
-                        );
-                        if let Some(clock) = output_clock.as_ref() {
-                            let age = report
-                                .source_timestamp
-                                .is_set()
-                                .then(|| clock.elapsed(report.source_timestamp))
-                                .flatten();
-                            if let Some(age) = age {
-                                latency.record(age);
+                match drainer.drain(data, &mut output_consumer) {
+                    Ok(report) => {
+                        if let Some(latency) = output_latency.as_ref() {
+                            latency.record_underflow(report.underflow_samples);
+                            let stats = output_consumer.stats();
+                            latency.record_queue_state(
+                                stats.queued_blocks,
+                                stats.high_water_blocks,
+                                stats.dropped_full,
+                                stats.dropped_stale,
+                            );
+                            if let Some(clock) = output_clock.as_ref() {
+                                let age = report
+                                    .source_timestamp
+                                    .is_set()
+                                    .then(|| clock.elapsed(report.source_timestamp))
+                                    .flatten();
+                                if let Some(age) = age {
+                                    latency.record(age);
+                                }
                             }
                         }
                     }
+                    Err(_) => data.fill(0.0),
                 }
             },
             move |error| output_error(error),

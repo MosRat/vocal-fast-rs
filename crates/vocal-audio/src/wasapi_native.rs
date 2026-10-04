@@ -514,8 +514,20 @@ fn run_capture(
             return;
         }
     };
+    let mut silence = match crate::allocate_samples(
+        endpoint_frames.saturating_mul(config.format.channels as usize),
+    ) {
+        Ok(samples) => samples,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = ready.send(Err(message.clone()));
+            record_error(&errors, message);
+            let _ = unsafe { client.Stop() };
+            unsafe { CoUninitialize() };
+            return;
+        }
+    };
     let _ = ready.send(Ok(()));
-    let mut silence = vec![0.0; endpoint_frames * config.format.channels as usize];
     let mut last_callback = None;
     let expected_period = period_duration(period_frames, config.format.sample_rate);
     while !stop.load(Ordering::Acquire) {
@@ -692,8 +704,20 @@ fn run_render(
             return;
         }
     };
+    let mut samples = match crate::allocate_samples(
+        endpoint_frames.saturating_mul(config.format.channels as usize),
+    ) {
+        Ok(samples) => samples,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = ready.send(Err(message.clone()));
+            record_error(&errors, message);
+            let _ = unsafe { client.Stop() };
+            unsafe { CoUninitialize() };
+            return;
+        }
+    };
     let _ = ready.send(Ok(()));
-    let mut samples = vec![0.0; endpoint_frames * config.format.channels as usize];
     let mut last_callback = None;
     let expected_period = period_duration(period_frames, config.format.sample_rate);
     while !stop.load(Ordering::Acquire) {

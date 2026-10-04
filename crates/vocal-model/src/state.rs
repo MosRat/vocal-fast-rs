@@ -1,18 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ModelLoadState {
-    Created,
-    Loading,
-    Ready,
-    Failed,
-}
-
-impl Default for ModelLoadState {
-    fn default() -> Self {
-        Self::Created
-    }
-}
+pub use vocal_types::LifecycleState as ModelLoadState;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ModelLoadStatus {

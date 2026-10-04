@@ -473,8 +473,8 @@ impl AudioWriteLease<'_> {
             *slot.timestamp.get() = self.timestamp;
         }
         inner.pushed.0.fetch_add(1, Ordering::Relaxed);
-        inner.write.0.store(next, Ordering::Release);
         inner.update_high_water(next);
+        inner.write.0.store(next, Ordering::Release);
         inner.wake.notify();
         self.producer.write = next;
         self.producer.next_sequence = sequence.wrapping_add(1);

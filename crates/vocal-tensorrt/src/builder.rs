@@ -120,6 +120,7 @@ impl NativeTensorRtBuilder {
                 synth_fp16_source = self.options.synth_fp16_source,
                 synth_fp16_noise = self.options.synth_fp16_noise,
                 synth_fp16_noise_stage_mask = format_args!("0x{:x}", self.options.synth_fp16_noise_stage_mask),
+                synth_fp16_post = self.options.synth_fp16_post,
                 "building native RVC Synth plan"
             );
         }
@@ -161,6 +162,7 @@ impl NativeTensorRtBuilder {
             synth_fp16_source: self.options.synth_fp16_source as i32,
             synth_fp16_noise: self.options.synth_fp16_noise as i32,
             synth_fp16_noise_stage_mask: self.options.synth_fp16_noise_stage_mask as i32,
+            synth_fp16_post: self.options.synth_fp16_post as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
             rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
@@ -303,6 +305,7 @@ impl NativeTensorRtBuilder {
             synth_fp16_source: self.options.synth_fp16_source as i32,
             synth_fp16_noise: self.options.synth_fp16_noise as i32,
             synth_fp16_noise_stage_mask: self.options.synth_fp16_noise_stage_mask as i32,
+            synth_fp16_post: self.options.synth_fp16_post as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
             rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
@@ -569,6 +572,7 @@ impl NativeTensorRtBuilder {
             synth_fp16_source: self.options.synth_fp16_source as i32,
             synth_fp16_noise: self.options.synth_fp16_noise as i32,
             synth_fp16_noise_stage_mask: self.options.synth_fp16_noise_stage_mask as i32,
+            synth_fp16_post: self.options.synth_fp16_post as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
             rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
             rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),

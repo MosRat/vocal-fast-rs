@@ -204,6 +204,14 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             active_type=decoder_type;
             pre=conv(post_input,"dec.conv_post",1,1,-1,false,
                      fuse_residual_scale?residual_scale:1.0f);
+        } else if(o.synth_fp16_post!=0) {
+            active_type=decoder_type;
+            pre=conv(post_input,"dec.conv_post",1,1,-1,false,
+                     fuse_residual_scale?residual_scale:1.0f);
+            // Keep the nonlinear output boundary in FP32 even when the
+            // small final projection is selected for FP16 execution.
+            active_type=DataType::kFLOAT;
+            pre=cast(pre,DataType::kFLOAT);
         } else {
             active_type=DataType::kFLOAT;
             pre=conv(cast(post_input,DataType::kFLOAT),"dec.conv_post",1,1,-1,false,

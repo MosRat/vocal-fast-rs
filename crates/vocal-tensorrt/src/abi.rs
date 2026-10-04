@@ -85,6 +85,7 @@ pub(crate) struct NativeOptions {
     pub synth_fp16_source: i32,
     pub synth_fp16_noise: i32,
     pub synth_fp16_noise_stage_mask: i32,
+    pub synth_fp16_post: i32,
     pub rmvpe_encoder_precision: i32,
     pub rmvpe_decoder_precision: i32,
     pub rmvpe_stft_precision: i32,

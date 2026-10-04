@@ -170,3 +170,9 @@ doubles in relative L2 even though cosine remains high, and TensorRT tactic
 selection can move absolute timings between builds.  Combining hot residual
 FP16 with noise mask `0x2` measured 28.89 ms at 44960 with cosine `0.9995346`,
 so the noise mask should only be added when a steady replay proves a benefit.
+
+`VOCAL_TRT_SYNTH_FP16_POST=1` is available for isolating the final projection.
+It casts the `conv_post` result to FP32 before tanh. On the native 44960 plan
+it measured `36.60 ms`, relative L2 `3.1618%`, and cosine `0.9995051` versus
+the mixed baseline `3.0643%` and `0.9995350`. The projection is too small to
+offset its accuracy cost, so keep it disabled.

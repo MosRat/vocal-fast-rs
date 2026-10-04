@@ -283,6 +283,7 @@ impl TensorRtConfig {
             "VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK",
             build.synth_fp16_noise_stage_mask,
         )?;
+        build.synth_fp16_post = bool_value("VOCAL_TRT_SYNTH_FP16_POST", false)?;
         build.log_build_options = bool_value("VOCAL_TRT_LOG_BUILD_OPTIONS", false)?;
         build.dispatch_tune = dispatch("VOCAL_TRT_DISPATCH_TUNE", DispatchTune::Auto)?;
         build.tactic_sources = mask("VOCAL_TRT_TACTIC_SOURCES", default_tactic_sources())?;
@@ -411,7 +412,8 @@ impl TensorRtConfig {
             || self.build.synth_fp16_residual_accum
             || self.build.synth_fp16_source
             || self.build.synth_fp16_noise
-            || self.build.synth_fp16_noise_stage_mask != 0)
+            || self.build.synth_fp16_noise_stage_mask != 0
+            || self.build.synth_fp16_post)
             && self.build.synth_precision != PrecisionMode::Fp16
         {
             return Err(ConfigError::InvalidCombination(
@@ -615,6 +617,7 @@ mod tests {
             "VOCAL_TRT_SYNTH_FP16_SOURCE",
             "VOCAL_TRT_SYNTH_FP16_NOISE",
             "VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK",
+            "VOCAL_TRT_SYNTH_FP16_POST",
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -653,6 +656,7 @@ mod tests {
             env::set_var("VOCAL_TRT_SYNTH_FP16_SOURCE", "1");
             env::set_var("VOCAL_TRT_SYNTH_FP16_NOISE", "1");
             env::set_var("VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK", "0x4");
+            env::set_var("VOCAL_TRT_SYNTH_FP16_POST", "1");
             env::set_var("VOCAL_TRT_GRAPH_CACHE_SIZE", "4");
             env::set_var("VOCAL_TRT_GRAPH_MODE", "hybrid");
         }
@@ -668,6 +672,7 @@ mod tests {
         assert!(config.build.synth_fp16_source);
         assert!(config.build.synth_fp16_noise);
         assert_eq!(config.build.synth_fp16_noise_stage_mask, 4);
+        assert!(config.build.synth_fp16_post);
         assert_eq!(config.profile.min_samples, 44_960);
         assert_eq!(config.runtime.graph_cache_size, 4);
         assert_eq!(

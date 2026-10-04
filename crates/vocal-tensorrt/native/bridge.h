@@ -136,6 +136,7 @@ struct Options {
     int32_t synth_fp16_source;
     int32_t synth_fp16_noise;
     int32_t synth_fp16_noise_stage_mask;
+    int32_t synth_fp16_post;
     // RMVPE mixed-precision regions. Public I/O remains FP32. STFT, GRU, and
     // logits are fixed to FP32 by the native graph; their fields document the
     // ABI contract and are reserved for future experiments.

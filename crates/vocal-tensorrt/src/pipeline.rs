@@ -407,6 +407,8 @@ pub struct RvcTrtPipelineArtifacts {
     #[serde(default)]
     pub synth_fp16_noise_stage_mask: u32,
     #[serde(default)]
+    pub synth_fp16_post: bool,
+    #[serde(default)]
     pub dispatch_tune: DispatchTune,
     #[serde(default = "default_tactic_sources")]
     pub tactic_sources: u32,
@@ -545,6 +547,7 @@ impl RvcTrtPipelineArtifacts {
         let synth_fp16_source = builder_options.synth_fp16_source;
         let synth_fp16_noise = builder_options.synth_fp16_noise;
         let synth_fp16_noise_stage_mask = builder_options.synth_fp16_noise_stage_mask;
+        let synth_fp16_post = builder_options.synth_fp16_post;
         let dispatch_tune = if builder_options.dispatch_tune == DispatchTune::Auto {
             if profile.min_samples == 11_200 && profile.max_samples == 11_200 {
                 DispatchTune::Realtime11200
@@ -657,6 +660,7 @@ impl RvcTrtPipelineArtifacts {
             synth_fp16_source,
             synth_fp16_noise,
             synth_fp16_noise_stage_mask,
+            synth_fp16_post,
             dispatch_tune,
             tactic_sources: builder_options.tactic_sources,
             weight_int8,

@@ -18,8 +18,17 @@ use crate::{
 pub struct PipelineRuntimeConfig {
     pub cuda_graph: bool,
     pub native_cuda_graph: bool,
+    /// Number of application-level CUDA Graph executables retained for
+    /// different dynamic shape keys. Native TensorRT graph replay has its own
+    /// SDK-managed cache; this value only applies to the Rust fallback path.
+    #[serde(default = "default_graph_cache_size")]
+    pub graph_cache_size: usize,
     pub parallel_acoustic: bool,
     pub async_audio_d2h: bool,
+}
+
+const fn default_graph_cache_size() -> usize {
+    2
 }
 
 impl Default for PipelineRuntimeConfig {
@@ -27,6 +36,7 @@ impl Default for PipelineRuntimeConfig {
         Self {
             cuda_graph: true,
             native_cuda_graph: true,
+            graph_cache_size: default_graph_cache_size(),
             parallel_acoustic: false,
             async_audio_d2h: true,
         }
@@ -197,6 +207,10 @@ impl TensorRtConfig {
         };
         config.runtime.cuda_graph = bool_value("VOCAL_TRT_CUDA_GRAPH", true)?;
         config.runtime.native_cuda_graph = bool_value("VOCAL_TRT_NATIVE_CUDA_GRAPH", true)?;
+        config.runtime.graph_cache_size = positive_usize(
+            "VOCAL_TRT_GRAPH_CACHE_SIZE",
+            config.runtime.graph_cache_size,
+        )?;
         config.runtime.parallel_acoustic = bool_value("VOCAL_TRT_PARALLEL_ACOUSTIC", false)?;
         config.runtime.async_audio_d2h = bool_value("VOCAL_TRT_ASYNC_AUDIO_D2H", true)?;
 
@@ -233,6 +247,11 @@ impl TensorRtConfig {
         {
             return Err(ConfigError::InvalidCombination(
                 "frame/sample profiles must be positive and min <= opt <= max; tactic sources must be 0..=3".into(),
+            ));
+        }
+        if self.runtime.graph_cache_size == 0 || self.runtime.graph_cache_size > 64 {
+            return Err(ConfigError::InvalidCombination(
+                "CUDA graph cache size must be in 1..=64".into(),
             ));
         }
         if self.build.rmvpe_fft_radix2 && self.build.rmvpe_fft_cufft {
@@ -364,6 +383,7 @@ mod tests {
     fn clear() {
         for name in [
             "VOCAL_TRT_PROFILE",
+            "VOCAL_TRT_GRAPH_CACHE_SIZE",
             "VOCAL_TRT_PRECISION",
             "VOCAL_TRT_TACTIC_SOURCES",
             "VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK",
@@ -380,6 +400,7 @@ mod tests {
         assert_eq!(config.profile.max_samples, 44_960);
         assert_eq!(config.build.tactic_sources, 3);
         assert!(config.runtime.cuda_graph);
+        assert_eq!(config.runtime.graph_cache_size, 2);
     }
 
     #[test]
@@ -391,12 +412,14 @@ mod tests {
             env::set_var("VOCAL_TRT_PRECISION", "half");
             env::set_var("VOCAL_TRT_TACTIC_SOURCES", "0x2");
             env::set_var("VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK", "0xc");
+            env::set_var("VOCAL_TRT_GRAPH_CACHE_SIZE", "4");
         }
         let config = TensorRtConfig::from_env().expect("aliased config");
         assert_eq!(config.build.precision, PrecisionMode::Fp16);
         assert_eq!(config.build.tactic_sources, 2);
         assert_eq!(config.build.synth_resblock_stage_mask, 12);
         assert_eq!(config.profile.min_samples, 44_960);
+        assert_eq!(config.runtime.graph_cache_size, 4);
         clear();
     }
 

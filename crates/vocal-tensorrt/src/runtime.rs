@@ -1,6 +1,14 @@
 //! Safe ownership wrappers for TensorRT runtime/context and CUDA resources.
 
-use std::{collections::HashMap, fs, os::raw::c_void, path::Path, ptr, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    os::raw::c_void,
+    path::{Path, PathBuf},
+    ptr,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{error::NativeBuildError, ffi};
 
@@ -10,12 +18,81 @@ pub struct Runtime {
     raw: *mut ffi::Runtime,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RuntimeCacheKey {
+    canonical_path: PathBuf,
+    file_size: u64,
+    modified: SystemTime,
+}
+
+impl RuntimeCacheKey {
+    fn from_path(path: impl AsRef<Path>) -> Result<Self, NativeBuildError> {
+        let canonical_path = fs::canonicalize(path)?;
+        let metadata = fs::metadata(&canonical_path)?;
+        Ok(Self {
+            canonical_path,
+            file_size: metadata.len(),
+            modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+        })
+    }
+}
+
+static SHARED_RUNTIME_CACHE: OnceLock<Mutex<HashMap<RuntimeCacheKey, Weak<Runtime>>>> =
+    OnceLock::new();
+
 unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
 
 impl Runtime {
     pub fn shared(path: impl AsRef<Path>) -> Result<Arc<Self>, NativeBuildError> {
-        Ok(Arc::new(Self::load(path)?))
+        let key = RuntimeCacheKey::from_path(path)?;
+        let cache = SHARED_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut entries = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            entries.retain(|_, runtime| runtime.strong_count() != 0);
+            if let Some(runtime) = entries.get(&key).and_then(Weak::upgrade) {
+                return Ok(runtime);
+            }
+        }
+
+        // Keep the cache mutex out of plan IO and TensorRT deserialization.
+        // A concurrent duplicate load is safe; the second insertion reuses the
+        // first live Arc when it observes it.
+        let runtime = Arc::new(Self::load(&key.canonical_path)?);
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, cached| cached.strong_count() != 0);
+        if let Some(existing) = entries.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        entries.insert(key, Arc::downgrade(&runtime));
+        Ok(runtime)
+    }
+
+    /// Remove dead and live entries from the process-wide plan cache. Existing
+    /// `Arc<Runtime>` values remain valid; subsequent calls deserialize fresh
+    /// engines when they are needed.
+    pub fn clear_shared_cache() {
+        if let Some(cache) = SHARED_RUNTIME_CACHE.get() {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+    }
+
+    pub fn shared_cache_len() -> usize {
+        let Some(cache) = SHARED_RUNTIME_CACHE.get() else {
+            return 0;
+        };
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, runtime| runtime.strong_count() != 0);
+        entries.len()
     }
     pub fn load(path: impl AsRef<Path>) -> Result<Self, NativeBuildError> {
         ffi::install_log_bridge();

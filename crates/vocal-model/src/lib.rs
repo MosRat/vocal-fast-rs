@@ -8,9 +8,11 @@ use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::Arc,
 };
 
 mod acoustic;
+mod cache;
 mod canonical;
 mod config;
 mod error;
@@ -24,6 +26,7 @@ mod state;
 pub use acoustic::{
     ACOUSTIC_TENSOR_SCHEMA, AcousticConfig, AcousticKind, AcousticPort, AcousticTensorMap,
 };
+pub use cache::{ModelPackageCache, shared_model_cache};
 pub use config::{
     CACHE_ALIGNMENT, CACHE_HEADER_BYTES, CACHE_MAGIC, DEFAULT_MAX_METADATA_BYTES,
     DEFAULT_MAX_TENSOR_BYTES, DEFAULT_MAX_TENSORS, ModelLoadConfig,
@@ -68,6 +71,16 @@ impl ModelLoader {
     pub fn load_cache(&mut self, path: impl AsRef<Path>) -> Result<ModelPackage, ModelError> {
         let config = self.config.clone();
         self.run("cache", || load_cache_with_config(path, &config))
+    }
+
+    /// Load a parsed package through the process-wide weak cache. The returned
+    /// `Arc` can be shared by multiple builders without cloning tensor bytes.
+    pub fn load_cache_shared(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<Arc<ModelPackage>, ModelError> {
+        let config = self.config.clone();
+        self.run("cache-shared", || shared_model_cache().load(path, &config))
     }
 
     pub fn load_directory(
@@ -526,6 +539,24 @@ pub fn load_cache_with_config(
     Ok(package)
 }
 
+/// Load a VFRM package through the process-wide weak cache.
+pub fn load_cache_shared(path: impl AsRef<Path>) -> Result<Arc<ModelPackage>, ModelError> {
+    load_cache_shared_with_config(path, &ModelLoadConfig::default())
+}
+
+pub fn load_cache_shared_with_config(
+    path: impl AsRef<Path>,
+    load_config: &ModelLoadConfig,
+) -> Result<Arc<ModelPackage>, ModelError> {
+    shared_model_cache().load(path, load_config)
+}
+
+/// Drop weak cache entries. Packages still held by callers remain valid and
+/// are released normally when their final `Arc` is dropped.
+pub fn clear_shared_model_cache() {
+    shared_model_cache().clear();
+}
+
 fn validate_canonical_package(package: &ModelPackage) -> Result<(), ModelError> {
     if package
         .metadata
@@ -640,6 +671,24 @@ mod tests {
         assert_eq!(restored.tensors[0].name, "enc.weight");
         assert_eq!(restored.tensors[0].shape, vec![2]);
         assert_eq!(restored.tensors[1].data, vec![4, 5]);
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn shared_cache_reuses_live_package_without_cloning_tensors() {
+        let package = fixture();
+        let path =
+            std::env::temp_dir().join(format!("vocal-fast-shared-{}.vfr", std::process::id()));
+        write_cache(&path, &package).unwrap();
+        clear_shared_model_cache();
+        let first = load_cache_shared_with_config(&path, &ModelLoadConfig::default()).unwrap();
+        let second = load_cache_shared_with_config(&path, &ModelLoadConfig::default()).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(shared_model_cache().len(), 1);
+        clear_shared_model_cache();
+        assert_eq!(shared_model_cache().len(), 0);
+        drop(first);
+        drop(second);
+        assert_eq!(shared_model_cache().len(), 0);
         let _ = fs::remove_file(path);
     }
     #[test]

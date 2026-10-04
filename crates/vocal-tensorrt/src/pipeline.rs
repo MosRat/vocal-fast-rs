@@ -447,14 +447,14 @@ impl RvcTrtPipelineArtifacts {
             let builder = NativeTensorRtBuilder::new(options);
             let result = match name {
                 "hubert" if hubert_onnx.as_ref().extension().is_some_and(|x| x == "vfr") => {
-                    let package = vocal_model::load_cache(hubert_onnx.as_ref())
+                    let package = vocal_model::load_cache_shared(hubert_onnx.as_ref())
                         .map_err(|e| NativeBuildError::Api(e.to_string()))?;
                     builder.compile_hubert_vfrm(&package)
                 }
                 "hubert" => builder
                     .compile_onnx_file_with_profile(hubert_onnx.as_ref(), OnnxProfileKind::Samples),
                 "rmvpe" if rmvpe_onnx.as_ref().extension().is_some_and(|x| x == "vfr") => {
-                    let package = vocal_model::load_cache(rmvpe_onnx.as_ref())
+                    let package = vocal_model::load_cache_shared(rmvpe_onnx.as_ref())
                         .map_err(|e| NativeBuildError::Api(e.to_string()))?;
                     builder.compile_rmvpe_vfrm(&package)
                 }
@@ -714,6 +714,29 @@ pub struct RvcCudaGraphStats {
     pub captures: u64,
     pub replays: u64,
     pub invalidations: u64,
+    /// Number of executable whole-pipeline graphs currently retained.
+    #[serde(default)]
+    pub graph_cache_entries: usize,
+    /// Configured upper bound for the application-level graph cache.
+    #[serde(default)]
+    pub graph_cache_capacity: usize,
+    /// Cache lookup counters for the application-level graph path.
+    #[serde(default)]
+    pub graph_cache_hits: u64,
+    #[serde(default)]
+    pub graph_cache_misses: u64,
+    #[serde(default)]
+    pub graph_evictions: u64,
+}
+
+/// A captured whole-pipeline graph is tied to the dynamic shape key and the
+/// fixed device buffer addresses installed during capture. Keeping the key
+/// beside the executable lets the fallback path retain both the 11200 and
+/// 44960 realtime graphs instead of throwing one away on every transition.
+struct ExternalGraphEntry {
+    key: PipelineShapeKey,
+    exec: CudaGraphExec,
+    last_used: u64,
 }
 
 pub struct RvcTrtPipeline {
@@ -777,11 +800,15 @@ pub struct RvcTrtPipeline {
     native_graph_invalidations: u64,
     cuda_graphs: bool,
     external_graph_capability_checked: bool,
-    graph_exec: Option<CudaGraphExec>,
-    graph_shape: Option<PipelineShapeKey>,
+    external_graph_cache: Vec<ExternalGraphEntry>,
+    external_graph_cache_capacity: usize,
+    external_graph_tick: u64,
     graph_captures: u64,
     graph_replays: u64,
     graph_invalidations: u64,
+    graph_cache_hits: u64,
+    graph_cache_misses: u64,
+    graph_evictions: u64,
 }
 
 impl RvcTrtPipeline {
@@ -853,6 +880,11 @@ impl RvcTrtPipeline {
         diagnostics: DiagnosticsConfig,
     ) -> Result<Self, NativeBuildError> {
         artifacts.profile.validate()?;
+        if runtime_config.graph_cache_size == 0 || runtime_config.graph_cache_size > 64 {
+            return Err(NativeBuildError::Argument(
+                "graph cache size must be in 1..=64".into(),
+            ));
+        }
         if config.feature_width != 768 {
             return Err(NativeBuildError::Argument(
                 "waveform HuBERT TensorRT pipeline requires a 768-wide RVC v2 model".into(),
@@ -902,6 +934,7 @@ impl RvcTrtPipeline {
         let parallel_acoustic =
             native_cuda_graphs && !external_cuda_graphs && runtime_config.parallel_acoustic;
         let rmvpe_external_stft = artifacts.rmvpe_external_stft;
+        let graph_cache_capacity = runtime_config.graph_cache_size.max(1);
         let mut cufft_frontends = Vec::new();
         if rmvpe_external_stft {
             let shapes = unique_shapes([
@@ -1006,11 +1039,15 @@ impl RvcTrtPipeline {
             native_graph_invalidations: 0,
             cuda_graphs: external_cuda_graphs,
             external_graph_capability_checked: false,
-            graph_exec: None,
-            graph_shape: None,
+            external_graph_cache: Vec::with_capacity(graph_cache_capacity),
+            external_graph_cache_capacity: graph_cache_capacity,
+            external_graph_tick: 0,
             graph_captures: 0,
             graph_replays: 0,
             graph_invalidations: 0,
+            graph_cache_hits: 0,
+            graph_cache_misses: 0,
+            graph_evictions: 0,
         };
         pipeline.seed_static_inputs(latent, up)?;
         pipeline.threshold.upload_f32(&[0.03_f32])?;
@@ -1049,8 +1086,7 @@ impl RvcTrtPipeline {
     /// eager path available for the next call.
     pub fn enable_cuda_graphs(&mut self, enabled: bool) {
         if self.cuda_graphs != enabled {
-            self.graph_exec = None;
-            self.graph_shape = None;
+            self.external_graph_cache.clear();
             self.graph_invalidations = self.graph_invalidations.saturating_add(1);
             self.external_graph_capability_checked = false;
         }
@@ -1073,6 +1109,11 @@ impl RvcTrtPipeline {
             captures: self.graph_captures,
             replays: self.graph_replays,
             invalidations: self.graph_invalidations,
+            graph_cache_entries: self.external_graph_cache.len(),
+            graph_cache_capacity: self.external_graph_cache_capacity,
+            graph_cache_hits: self.graph_cache_hits,
+            graph_cache_misses: self.graph_cache_misses,
+            graph_evictions: self.graph_evictions,
         }
     }
 
@@ -1087,8 +1128,7 @@ impl RvcTrtPipeline {
         self.shape_key = None;
         self.native_graph_shape = None;
         self.native_graph_invalidations = self.native_graph_invalidations.saturating_add(1);
-        self.graph_exec = None;
-        self.graph_shape = None;
+        self.external_graph_cache.clear();
         self.external_graph_capability_checked = false;
         self.graph_invalidations = self.graph_invalidations.saturating_add(1);
         Ok(())
@@ -1671,21 +1711,31 @@ impl RvcTrtPipeline {
                 self.native_cuda_graphs, self.cuda_graphs
             );
         }
-        if self.graph_shape.is_some_and(|key| key != graph_key) {
-            self.graph_exec = None;
-            self.graph_shape = None;
-            self.graph_invalidations = self.graph_invalidations.saturating_add(1);
-        }
-        let graph_replay = self.cuda_graphs
-            && self.graph_shape.is_some_and(|key| key == graph_key)
-            && self.graph_exec.is_some();
-        if graph_replay {
-            self.graph_exec
-                .as_ref()
-                .expect("graph shape implies executable")
-                .launch(&self.stream)?;
-            self.graph_replays = self.graph_replays.saturating_add(1);
+        // The external graph path uses a bounded LRU. A graph contains only
+        // device operations and fixed binding addresses; H2D/D2H and scalar
+        // shape bookkeeping remain outside the capture. Retaining multiple
+        // entries avoids recapture when a worker alternates its normal 11200
+        // and 44960 windows.
+        let graph_replay = if self.cuda_graphs {
+            self.external_graph_tick = self.external_graph_tick.wrapping_add(1);
+            if let Some(index) = self
+                .external_graph_cache
+                .iter()
+                .position(|entry| entry.key == graph_key)
+            {
+                self.external_graph_cache[index].last_used = self.external_graph_tick;
+                self.external_graph_cache[index].exec.launch(&self.stream)?;
+                self.graph_cache_hits = self.graph_cache_hits.saturating_add(1);
+                self.graph_replays = self.graph_replays.saturating_add(1);
+                true
+            } else {
+                self.graph_cache_misses = self.graph_cache_misses.saturating_add(1);
+                false
+            }
         } else {
+            false
+        };
+        if !graph_replay {
             let capture = if self.cuda_graphs {
                 match self.stream.begin_capture() {
                     Ok(capture) => Some(capture),
@@ -1707,8 +1757,23 @@ impl RvcTrtPipeline {
                 ) {
                     Ok(()) => match capture.finish() {
                         Ok(exec) => {
-                            self.graph_exec = Some(exec);
-                            self.graph_shape = Some(graph_key);
+                            if self.external_graph_cache.len() >= self.external_graph_cache_capacity
+                            {
+                                let oldest = self
+                                    .external_graph_cache
+                                    .iter()
+                                    .enumerate()
+                                    .min_by_key(|(_, entry)| entry.last_used)
+                                    .map(|(index, _)| index)
+                                    .expect("non-empty graph cache at capacity");
+                                self.external_graph_cache.remove(oldest);
+                                self.graph_evictions = self.graph_evictions.saturating_add(1);
+                            }
+                            self.external_graph_cache.push(ExternalGraphEntry {
+                                key: graph_key,
+                                exec,
+                                last_used: self.external_graph_tick,
+                            });
                             self.graph_captures = self.graph_captures.saturating_add(1);
                         }
                         Err(_) => {

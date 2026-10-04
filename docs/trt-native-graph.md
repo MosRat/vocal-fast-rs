@@ -178,6 +178,13 @@ CLI reports both modes under `cuda_graph`; `captures`, `replays`, and
 `invalidations` are the external fallback counters, while the `native_*`
 fields describe the TensorRT-managed path.
 
+The explicit fallback retains a bounded LRU of complete pipeline graphs keyed
+by waveform/RMVPE/RVC shape and streaming-F0 state. Its default capacity is
+two (`VOCAL_TRT_GRAPH_CACHE_SIZE=2`), which keeps the 11200 and 44960
+application windows ready when a worker alternates them. The graph cache,
+host-copy boundary, and model/plan loading cache are described in
+[`trt-graph-replay-cache.md`](trt-graph-replay-cache.md).
+
 ## Mixed precision and dispatch tuning
 
 The builder carries independent precision fields for HuBERT, RMVPE, and

@@ -98,6 +98,7 @@ let busy = false;
 let localError: ErrorReport | null = null;
 let refreshInFlight = false;
 let lastEventSequence = 0;
+let resyncInFlight = false;
 
 const call = <T>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
 
@@ -269,6 +270,9 @@ async function connect(): Promise<void> {
   const events = new Channel<BackendEvent>();
   events.onmessage = (event) => {
     if (event.sequence <= lastEventSequence) return;
+    if (lastEventSequence !== 0 && event.sequence > lastEventSequence + 1) {
+      void resyncSnapshot();
+    }
     lastEventSequence = event.sequence;
     if (event.type === 'snapshot') {
       snapshot = event.payload as Snapshot;
@@ -286,6 +290,19 @@ async function connect(): Promise<void> {
     localError = normalizeError(error);
   }
   render();
+}
+
+async function resyncSnapshot(): Promise<void> {
+  if (resyncInFlight) return;
+  resyncInFlight = true;
+  try {
+    snapshot = await call<Snapshot>('get_snapshot');
+    render();
+  } catch {
+    // The periodic refresh will retry while the control channel is alive.
+  } finally {
+    resyncInFlight = false;
+  }
 }
 
 window.setInterval(async () => {

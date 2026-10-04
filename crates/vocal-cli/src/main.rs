@@ -14,6 +14,15 @@ use vocal_model::{
 };
 use vocal_types::{AudioChunk, AudioFormat, ConversionConfig};
 
+mod cli_config;
+mod cli_error;
+mod cli_logging;
+mod cli_state;
+
+use cli_config::CliConfig;
+use cli_error::CliResult;
+use cli_state::CliStatus;
+
 fn usage() {
     eprintln!(
         "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
@@ -22,16 +31,32 @@ fn usage() {
 }
 
 fn main() -> ExitCode {
-    match run(env::args().skip(1).collect()) {
-        Ok(()) => ExitCode::SUCCESS,
+    let args: Vec<String> = env::args().skip(1).collect();
+    let command = args
+        .first()
+        .map(String::as_str)
+        .unwrap_or("help")
+        .to_owned();
+    let mut status = CliStatus::default();
+    status.start();
+    cli_logging::command_started(&command);
+    match run(args) {
+        Ok(()) => {
+            status.complete();
+            cli_logging::command_finished(&command);
+            ExitCode::SUCCESS
+        }
         Err(error) => {
+            status.fail();
+            cli_logging::command_failed(&command, &error);
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(args: Vec<String>) -> CliResult<()> {
+    let cli_config = CliConfig::default();
     match args.as_slice() {
         [command] if command == "doctor" => doctor(),
         [command, subcommand, manifest] if command == "model" && subcommand == "inspect" => {
@@ -122,7 +147,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         [command, subcommand, plan, input, output]
             if command == "model" && subcommand == "benchmark-trt" =>
         {
-            benchmark_trt(plan.into(), input.into(), output.into(), 30)
+            benchmark_trt(
+                plan.into(),
+                input.into(),
+                output.into(),
+                cli_config.default_benchmark_iterations,
+            )
         }
         [command, subcommand, plan, input, output, iterations]
             if command == "model" && subcommand == "benchmark-trt" =>
@@ -131,10 +161,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 plan.into(),
                 input.into(),
                 output.into(),
-                iterations.parse()?,
+                cli_config.benchmark_iterations(Some(iterations.parse()?)),
             )
         }
-        [command] if command == "demo" => demo(4),
+        [command] if command == "demo" => demo(cli_config.default_demo_blocks),
         [command, count] if command == "demo" => demo(count.parse()?),
         _ => {
             usage();
@@ -149,7 +179,7 @@ fn compile_trt_pipeline(
     hubert: PathBuf,
     rmvpe: PathBuf,
     output: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let package = load_cache(cache)?;
     let profile = vocal_tensorrt::RvcTrtProfile::from_env();
     let options = vocal_tensorrt::NativeBuildOptions::default();
@@ -188,7 +218,7 @@ fn compile_trt_pipeline(
     _hubert: PathBuf,
     _rmvpe: PathBuf,
     _output: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }
 
@@ -198,7 +228,7 @@ fn test_trt_pipeline(
     cache: PathBuf,
     input: PathBuf,
     nsight_profile: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let artifacts: vocal_tensorrt::RvcTrtPipelineArtifacts =
         serde_json::from_slice(&fs::read(&artifacts_path)?)?;
     let package = load_cache(cache)?;
@@ -297,11 +327,12 @@ fn test_trt_pipeline(
     _cache: PathBuf,
     _input: PathBuf,
     _nsight_profile: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }
 
-fn read_f32_audio(path: &PathBuf) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+#[cfg(feature = "tensorrt-rtx")]
+fn read_f32_audio(path: &PathBuf) -> CliResult<Vec<f32>> {
     let bytes = fs::read(path)?;
     if bytes.len() >= 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
         let channels = u16::from_le_bytes(bytes[22..24].try_into()?);
@@ -311,16 +342,36 @@ fn read_f32_audio(path: &PathBuf) -> Result<Vec<f32>, Box<dyn std::error::Error>
             .windows(4)
             .position(|w| w == b"data")
             .ok_or("WAV data chunk missing")?;
-        let data_pos = marker + 8;
-        let data_len = u32::from_le_bytes(bytes[marker + 4..marker + 8].try_into()?) as usize;
-        let data = &bytes[data_pos..data_pos + data_len.min(bytes.len().saturating_sub(data_pos))];
+        let data_pos = marker
+            .checked_add(8)
+            .ok_or("WAV data chunk offset overflow")?;
+        let data_header_end = marker
+            .checked_add(8)
+            .ok_or("WAV data chunk header overflow")?;
+        if data_header_end > bytes.len() {
+            return Err("WAV data chunk header is truncated".into());
+        }
+        let data_len = u32::from_le_bytes(bytes[marker + 4..data_header_end].try_into()?) as usize;
+        let data_end = data_pos
+            .checked_add(data_len)
+            .ok_or("WAV data chunk size overflow")?;
+        if data_end > bytes.len() {
+            return Err("WAV data chunk is truncated".into());
+        }
+        let data = &bytes[data_pos..data_end];
         if channels != 1 || format != 1 || bits != 16 {
             return Err("only mono PCM16 WAV is supported".into());
+        }
+        if !data.len().is_multiple_of(2) {
+            return Err("PCM16 WAV data has an incomplete sample".into());
         }
         return Ok(data
             .chunks_exact(2)
             .map(|x| i16::from_le_bytes([x[0], x[1]]) as f32 / 32768.0)
             .collect());
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return Err("raw f32 input size must be a multiple of four bytes".into());
     }
     Ok(bytes
         .chunks_exact(4)
@@ -328,7 +379,7 @@ fn read_f32_audio(path: &PathBuf) -> Result<Vec<f32>, Box<dyn std::error::Error>
         .collect())
 }
 
-fn doctor() -> Result<(), Box<dyn std::error::Error>> {
+fn doctor() -> CliResult<()> {
     let config = StreamConfig::default();
     let ring = AudioRing::new(config)?;
     println!(
@@ -342,7 +393,7 @@ fn doctor() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn inspect(path: PathBuf) -> CliResult<()> {
     let manifest = load_manifest(path)?;
     println!("{} ({})", manifest.display_name, manifest.id);
     println!(
@@ -357,11 +408,7 @@ fn inspect(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn pack(
-    model_dir: PathBuf,
-    manifest_path: PathBuf,
-    output: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn pack(model_dir: PathBuf, manifest_path: PathBuf, output: PathBuf) -> CliResult<()> {
     let manifest = load_manifest(&manifest_path)?;
     let package = load_directory(model_dir, manifest)?;
     write_cache(&output, &package)?;
@@ -373,11 +420,7 @@ fn pack(
     Ok(())
 }
 
-fn pack_rvc(
-    model_dir: PathBuf,
-    manifest_path: PathBuf,
-    output: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn pack_rvc(model_dir: PathBuf, manifest_path: PathBuf, output: PathBuf) -> CliResult<()> {
     let package = load_rvc_directory(model_dir, load_manifest(manifest_path)?)?;
     write_cache(&output, &package)?;
     println!(
@@ -388,7 +431,7 @@ fn pack_rvc(
     Ok(())
 }
 
-fn inspect_cache(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn inspect_cache(path: PathBuf) -> CliResult<()> {
     let package = load_cache(path)?;
     println!(
         "{} ({}) tensors={} bytes={}",
@@ -433,7 +476,7 @@ fn inspect_cache(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn inspect_acoustic(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn inspect_acoustic(path: PathBuf) -> CliResult<()> {
     let package = load_cache(path)?;
     let config = package.validate_acoustic(None)?;
     let nodes = package
@@ -479,7 +522,7 @@ fn convert_pth(
     manifest_path: PathBuf,
     checkpoint: PathBuf,
     output: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let package = load_rvc_pth(checkpoint, load_manifest(manifest_path)?)?;
     write_cache(&output, &package)?;
     println!(
@@ -496,7 +539,7 @@ fn convert_onnx(
     manifest_path: PathBuf,
     onnx: PathBuf,
     output: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let package = load_rvc_onnx(onnx, load_manifest(manifest_path)?)?;
     write_cache(&output, &package)?;
     println!(
@@ -508,7 +551,7 @@ fn convert_onnx(
     Ok(())
 }
 
-fn build_graph(cache: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn build_graph(cache: PathBuf, output: PathBuf) -> CliResult<()> {
     let package = load_cache(cache)?;
     let graph = build_rvc_graph(&package, TensorRtGraphOptions::default())?;
     graph.write_json(&output)?;
@@ -517,11 +560,7 @@ fn build_graph(cache: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error
 }
 
 #[allow(clippy::needless_return, clippy::field_reassign_with_default)]
-fn compile_trt(
-    cache: PathBuf,
-    output: PathBuf,
-    onnx: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn compile_trt(cache: PathBuf, output: PathBuf, onnx: Option<PathBuf>) -> CliResult<()> {
     #[cfg(feature = "tensorrt-rtx")]
     {
         let package = load_cache(cache)?;
@@ -562,7 +601,7 @@ fn compile_trt(
 }
 
 #[cfg(feature = "tensorrt-rtx")]
-fn compile_hubert_trt(cache: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn compile_hubert_trt(cache: PathBuf, output: PathBuf) -> CliResult<()> {
     let package = load_cache(cache)?;
     let mut options = vocal_tensorrt::NativeBuildOptions::default();
     options.output = output;
@@ -572,12 +611,12 @@ fn compile_hubert_trt(cache: PathBuf, output: PathBuf) -> Result<(), Box<dyn std
 }
 
 #[cfg(not(feature = "tensorrt-rtx"))]
-fn compile_hubert_trt(_cache: PathBuf, _output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn compile_hubert_trt(_cache: PathBuf, _output: PathBuf) -> CliResult<()> {
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }
 
 #[cfg(feature = "tensorrt-rtx")]
-fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> CliResult<()> {
     let samples = read_f32_audio(&input)?;
     let runtime = vocal_tensorrt::Runtime::load(&plan)?;
     let mut context = runtime.context()?;
@@ -606,8 +645,8 @@ fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> Result<(), Box<dyn std::err
     features.download_bytes(&mut raw)?;
     let values = raw
         .chunks_exact(4)
-        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
-        .collect::<Vec<_>>();
+        .map(|x| <[u8; 4]>::try_from(x).map(f32::from_le_bytes))
+        .collect::<Result<Vec<_>, _>>()?;
     if let Some(path) = env::var_os("VOCAL_TRT_DUMP_HUBERT") {
         fs::write(path, &raw)?;
     }
@@ -623,12 +662,12 @@ fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> Result<(), Box<dyn std::err
 }
 
 #[cfg(not(feature = "tensorrt-rtx"))]
-fn test_hubert_trt(_plan: PathBuf, _input: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn test_hubert_trt(_plan: PathBuf, _input: PathBuf) -> CliResult<()> {
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }
 
 #[cfg(feature = "tensorrt-rtx")]
-fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
     let runtime = vocal_tensorrt::Runtime::load(&plan)?;
     let mut context = runtime.context()?;
     let stream = vocal_tensorrt::CudaStream::new()?;
@@ -655,7 +694,7 @@ fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> Result<(), Box<dyn std::er
         .iter()
         .try_fold(1_i64, |value, rate| value.checked_mul(*rate as i64))
         .ok_or("upsample product overflow")?;
-    let alloc = |elements: i64| -> Result<vocal_tensorrt::CudaBuffer, Box<dyn std::error::Error>> {
+    let alloc = |elements: i64| -> CliResult<vocal_tensorrt::CudaBuffer> {
         let bytes = usize::try_from(elements.checked_mul(4).ok_or("buffer size overflow")?)?;
         let buffer = vocal_tensorrt::CudaBuffer::new(bytes)?;
         buffer.zero()?;
@@ -776,10 +815,7 @@ struct BenchmarkInput {
 }
 
 #[cfg(feature = "tensorrt-rtx")]
-fn take_bytes<'a>(
-    bytes: &mut &'a [u8],
-    count: usize,
-) -> Result<&'a [u8], Box<dyn std::error::Error>> {
+fn take_bytes<'a>(bytes: &mut &'a [u8], count: usize) -> CliResult<&'a [u8]> {
     if bytes.len() < count {
         return Err("benchmark input is truncated".into());
     }
@@ -789,14 +825,14 @@ fn take_bytes<'a>(
 }
 
 #[cfg(feature = "tensorrt-rtx")]
-fn read_benchmark_input(path: &PathBuf) -> Result<BenchmarkInput, Box<dyn std::error::Error>> {
+fn read_benchmark_input(path: &PathBuf) -> CliResult<BenchmarkInput> {
     let mut raw = Vec::new();
     fs::File::open(path)?.read_to_end(&mut raw)?;
     let mut bytes = raw.as_slice();
     if take_bytes(&mut bytes, 8)? != b"VFRTEST1" {
         return Err("invalid benchmark input magic".into());
     }
-    let read_u32 = |bytes: &mut &[u8]| -> Result<u32, Box<dyn std::error::Error>> {
+    let read_u32 = |bytes: &mut &[u8]| -> CliResult<u32> {
         Ok(u32::from_le_bytes(take_bytes(bytes, 4)?.try_into()?))
     };
     let frames = i64::from(read_u32(&mut bytes)?);
@@ -812,7 +848,7 @@ fn read_benchmark_input(path: &PathBuf) -> Result<BenchmarkInput, Box<dyn std::e
     {
         return Err("benchmark dimensions are outside supported bounds".into());
     }
-    let bytes_for = |elements: i64| -> Result<usize, Box<dyn std::error::Error>> {
+    let bytes_for = |elements: i64| -> CliResult<usize> {
         usize::try_from(elements.checked_mul(4).ok_or("benchmark size overflow")?)
             .map_err(|_| "benchmark size exceeds host usize".into())
     };
@@ -847,7 +883,7 @@ fn benchmark_trt(
     input: PathBuf,
     output: PathBuf,
     iterations: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     if iterations == 0 {
         return Err("benchmark iterations must be positive".into());
     }
@@ -855,7 +891,7 @@ fn benchmark_trt(
     let runtime = vocal_tensorrt::Runtime::load(&plan)?;
     let mut context = runtime.context()?;
     let stream = vocal_tensorrt::CudaStream::new()?;
-    let alloc = |bytes: usize| -> Result<vocal_tensorrt::CudaBuffer, Box<dyn std::error::Error>> {
+    let alloc = |bytes: usize| -> CliResult<vocal_tensorrt::CudaBuffer> {
         Ok(vocal_tensorrt::CudaBuffer::new(bytes.max(4))?)
     };
     let feats = alloc(input.feats.len())?;
@@ -971,6 +1007,10 @@ fn benchmark_trt(
         buffer.download_bytes(&mut values)?;
         fs::write(output.with_extension(format!("{name}.f32")), &values)?;
     }
+    let max_ms = sorted
+        .last()
+        .copied()
+        .ok_or("benchmark produced no timing samples")?;
     println!(
         "{}",
         serde_json::json!({
@@ -982,7 +1022,7 @@ fn benchmark_trt(
             "median_ms": percentile(0.50),
             "p95_ms": percentile(0.95),
             "min_ms": sorted[0],
-            "max_ms": *sorted.last().expect("timings are non-empty"),
+            "max_ms": max_ms,
             "debug_outputs": debug_outputs,
         })
     );
@@ -990,7 +1030,7 @@ fn benchmark_trt(
 }
 
 #[cfg(not(feature = "tensorrt-rtx"))]
-fn test_trt(_plan: PathBuf, _cache: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn test_trt(_plan: PathBuf, _cache: Option<PathBuf>) -> CliResult<()> {
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }
 
@@ -1000,11 +1040,11 @@ fn benchmark_trt(
     _input: PathBuf,
     _output: PathBuf,
     _iterations: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }
 
-fn demo(blocks: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn demo(blocks: usize) -> CliResult<()> {
     let format = AudioFormat::MONO_16K;
     let mut engine = create_engine(EngineConfig {
         backend: BackendKind::RvcCpuPipeline,

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json.workspace = true
+tracing.workspace = true
 thiserror.workspace = true
 vocal-audio.workspace = true
 vocal-engine.workspace = true

@@ -30,11 +30,12 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitFo
 use windows::core::Interface;
 
 use crate::backend_error::BackendErrorState;
+use crate::logging;
 use crate::threading::MmcssGuard;
 use crate::{
-    AudioClock, AudioDirection, AudioError, AudioLatencySnapshot, AudioLatencyStats,
-    AudioTimestamp, BlockAssembler, BlockDrainer, FrameSlip, StreamConfig, StreamQueueConfig,
-    WorkerIo,
+    AudioClock, AudioDirection, AudioError, AudioFault, AudioIoConfig, AudioLatencySnapshot,
+    AudioLatencyStats, AudioTimestamp, BlockAssembler, BlockDrainer, FrameSlip, StreamConfig,
+    StreamLifecycle, StreamQueueConfig, StreamState, StreamStatus, WorkerIo,
 };
 
 #[derive(Debug, Error)]
@@ -52,6 +53,7 @@ pub struct NativeWasapiStream {
     stop: Arc<AtomicBool>,
     stop_event: EventHandle,
     errors: Arc<BackendErrorState>,
+    state: Arc<StreamState>,
     latency: Option<Arc<AudioLatencyStats>>,
     joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
 }
@@ -59,6 +61,12 @@ pub struct NativeWasapiStream {
 impl NativeWasapiStream {
     pub fn open(config: StreamConfig) -> Result<(Self, WorkerIo), NativeWasapiError> {
         Self::open_with_queue_config(config, StreamQueueConfig::default())
+    }
+
+    pub fn open_with_io_config(
+        config: AudioIoConfig,
+    ) -> Result<(Self, WorkerIo), NativeWasapiError> {
+        Self::open_inner(config.stream, config.queues, None)
     }
 
     pub fn open_with_queue_config(
@@ -75,6 +83,13 @@ impl NativeWasapiStream {
         Self::open_profiled_with_queue_config(config, StreamQueueConfig::default(), clock)
     }
 
+    pub fn open_profiled_with_io_config(
+        config: AudioIoConfig,
+        clock: AudioClock,
+    ) -> Result<(Self, WorkerIo), NativeWasapiError> {
+        Self::open_inner(config.stream, config.queues, Some(clock))
+    }
+
     pub fn open_profiled_with_queue_config(
         config: StreamConfig,
         queues: StreamQueueConfig,
@@ -89,14 +104,16 @@ impl NativeWasapiStream {
         clock: Option<AudioClock>,
     ) -> Result<(Self, WorkerIo), NativeWasapiError> {
         let config = config.validate()?;
-        let io = crate::StreamIo::new_with_queue_config(config, queues)?;
+        let io = crate::StreamIo::new_with_io_config(AudioIoConfig::new(config, queues))?;
         let (device, worker) = io.split();
+        let state = Arc::new(StreamState::new());
+        state.set(StreamLifecycle::Starting);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_event = EventHandle(
             unsafe { CreateEventW(None, true, false, None) }
                 .map_err(|error| NativeWasapiError::Startup(error.to_string()))?,
         );
-        let errors = Arc::new(BackendErrorState::default());
+        let errors = Arc::new(BackendErrorState::new(Arc::clone(&state), "wasapi.native"));
         let latency = clock
             .as_ref()
             .map(|_| Arc::new(AudioLatencyStats::default()));
@@ -146,23 +163,40 @@ impl NativeWasapiStream {
             .recv()
             .unwrap_or_else(|_| Err("render thread exited before startup".into()));
         if let Err(error) = capture_result {
+            logging::fault(
+                "wasapi.native",
+                crate::AudioFaultKind::Startup,
+                Some(crate::AudioFaultDirection::Capture),
+                &error,
+            );
             signal_stop(&stop, stop_event.0);
             let _ = capture.join();
             let _ = render.join();
             return Err(NativeWasapiError::Startup(error));
         }
         if let Err(error) = render_result {
+            logging::fault(
+                "wasapi.native",
+                crate::AudioFaultKind::Startup,
+                Some(crate::AudioFaultDirection::Render),
+                &error,
+            );
             signal_stop(&stop, stop_event.0);
             let _ = capture.join();
             let _ = render.join();
             return Err(NativeWasapiError::Startup(error));
         }
 
+        state.set(StreamLifecycle::Running);
+        logging::state("wasapi.native", state.status());
+        logging::started("wasapi.native");
+
         Ok((
             Self {
                 stop,
                 stop_event,
                 errors,
+                state,
                 latency,
                 joins: Some((capture, render)),
             },
@@ -174,6 +208,14 @@ impl NativeWasapiStream {
         self.errors.take()
     }
 
+    pub fn take_faults(&self) -> Vec<AudioFault> {
+        self.errors.take_faults()
+    }
+
+    pub fn status(&self) -> StreamStatus {
+        self.state.status()
+    }
+
     pub fn latency(&self) -> Option<AudioLatencySnapshot> {
         self.latency.as_deref().map(AudioLatencyStats::snapshot)
     }
@@ -183,11 +225,21 @@ impl NativeWasapiStream {
     }
 
     pub(crate) fn shutdown(&mut self) {
+        if matches!(
+            self.state.lifecycle(),
+            StreamLifecycle::Created | StreamLifecycle::Stopped
+        ) {
+            return;
+        }
+        self.state.begin_shutdown();
         signal_stop(&self.stop, self.stop_event.0);
         if let Some((capture, render)) = self.joins.take() {
             let _ = capture.join();
             let _ = render.join();
         }
+        self.state.finish_shutdown();
+        logging::state("wasapi.native", self.state.status());
+        logging::stopped("wasapi.native");
     }
 }
 

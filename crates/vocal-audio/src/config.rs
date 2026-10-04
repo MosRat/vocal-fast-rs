@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use thiserror::Error;
 use vocal_types::AudioFormat;
+
+use super::error::AudioError;
 
 /// Fixed-size block configuration shared by the device and worker sides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +48,61 @@ impl StreamQueueConfig {
             ));
         }
         Ok(self)
+    }
+}
+
+/// Complete queue and stream configuration used to construct the IO core.
+/// Keeping this pair together prevents a backend from validating the stream
+/// and queue capacities in different orders.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioIoConfig {
+    pub stream: StreamConfig,
+    pub queues: StreamQueueConfig,
+}
+
+impl AudioIoConfig {
+    pub const fn new(stream: StreamConfig, queues: StreamQueueConfig) -> Self {
+        Self { stream, queues }
+    }
+
+    pub fn validate(self) -> Result<Self, AudioError> {
+        Ok(Self {
+            stream: self.stream.validate()?,
+            queues: self.queues.validate()?,
+        })
+    }
+}
+
+impl Default for AudioIoConfig {
+    fn default() -> Self {
+        let stream = StreamConfig::default();
+        Self::new(stream, StreamQueueConfig::default())
+    }
+}
+
+/// Input policy for the standard worker scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerInputPolicy {
+    /// Preserve every block in FIFO order.
+    Fifo,
+    /// Drop all but the newest queued block before processing.
+    Latest,
+}
+
+/// Blocking policy for one model step. Waiting is only performed by the
+/// worker thread; device callbacks continue to use non-blocking methods.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerSchedule {
+    pub input_policy: WorkerInputPolicy,
+    pub timeout: Option<Duration>,
+}
+
+impl Default for WorkerSchedule {
+    fn default() -> Self {
+        Self {
+            input_policy: WorkerInputPolicy::Fifo,
+            timeout: None,
+        }
     }
 }
 
@@ -125,22 +181,6 @@ impl StreamConfig {
             .min(u64::MAX as u128) as u64;
         Duration::from_micros(micros)
     }
-}
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum AudioError {
-    #[error("audio queue is full")]
-    QueueFull,
-    #[error("audio queue is empty")]
-    QueueEmpty,
-    #[error("invalid audio configuration: {0}")]
-    InvalidConfig(String),
-    #[error("audio block has the wrong number of samples: expected {expected}, got {actual}")]
-    BlockSizeMismatch { expected: usize, actual: usize },
-    #[error("audio callback data is not a whole number of frames")]
-    PartialFrame,
-    #[error("audio buffer allocation failed: {0}")]
-    AllocationFailed(String),
 }
 
 pub(crate) fn allocate_samples(samples: usize) -> Result<Vec<f32>, AudioError> {

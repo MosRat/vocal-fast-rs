@@ -10,9 +10,11 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use thiserror::Error;
 
+use crate::logging;
 use crate::{
-    AudioClock, AudioDirection, AudioError, AudioLatencySnapshot, AudioLatencyStats,
-    AudioTimestamp, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, WorkerIo,
+    AudioClock, AudioDirection, AudioError, AudioFault, AudioLatencySnapshot, AudioLatencyStats,
+    AudioTimestamp, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, StreamLifecycle,
+    StreamState, StreamStatus, WorkerIo,
 };
 
 #[derive(Debug, Error)]
@@ -54,6 +56,7 @@ pub struct CpalDuplexStream {
     input: cpal::Stream,
     output: cpal::Stream,
     latency: Option<Arc<AudioLatencyStats>>,
+    state: Arc<StreamState>,
 }
 
 impl CpalDuplexStream {
@@ -177,7 +180,18 @@ fn build_duplex_inner(
         sample_rate: config.format.sample_rate,
         buffer_size: cpal::BufferSize::Fixed(config.block_frames as u32),
     };
-    let callback_error = Arc::new(error_handler);
+    let state = Arc::new(StreamState::new());
+    state.set(StreamLifecycle::Starting);
+    let callback_state = Arc::clone(&state);
+    let callback_error = Arc::new(move |error: cpal::Error| {
+        let message = error.to_string();
+        let first =
+            callback_state.record_fault(crate::AudioFaultKind::Unknown, None, message.clone());
+        if first {
+            logging::fault("cpal", crate::AudioFaultKind::Unknown, None, &message);
+        }
+        error_handler(error);
+    });
     let latency = clock
         .as_ref()
         .map(|_| Arc::new(AudioLatencyStats::default()));
@@ -292,14 +306,59 @@ fn build_duplex_inner(
     input.play().map_err(CpalError::PlayInput)?;
     output.play().map_err(CpalError::PlayOutput)?;
 
+    state.set(StreamLifecycle::Running);
+    logging::state("cpal", state.status());
+    logging::started("cpal");
+
     Ok((
         CpalDuplexStream {
             input,
             output,
             latency,
+            state,
         },
         worker_io,
     ))
+}
+
+impl CpalDuplexStream {
+    pub fn status(&self) -> StreamStatus {
+        self.state.status()
+    }
+
+    pub fn take_faults(&self) -> Vec<AudioFault> {
+        self.state.take_faults()
+    }
+
+    pub fn take_errors(&self) -> Vec<String> {
+        self.take_faults()
+            .into_iter()
+            .flat_map(|fault| {
+                if fault.occurrences > 1 {
+                    vec![
+                        fault.message,
+                        format!(
+                            "{} backend errors occurred; first error shown above",
+                            fault.occurrences
+                        ),
+                    ]
+                } else {
+                    vec![fault.message]
+                }
+            })
+            .collect()
+    }
+}
+
+impl Drop for CpalDuplexStream {
+    fn drop(&mut self) {
+        if !matches!(self.state.lifecycle(), StreamLifecycle::Stopped) {
+            self.state.begin_shutdown();
+            self.state.finish_shutdown();
+            logging::state("cpal", self.state.status());
+            logging::stopped("cpal");
+        }
+    }
 }
 
 fn record_callback_tick(

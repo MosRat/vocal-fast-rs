@@ -10,7 +10,7 @@
 
 use vocal_types::AudioFormat;
 
-use super::config::AudioError;
+use super::error::AudioError;
 
 /// External conversion hook for non-native device formats.
 ///

@@ -11,6 +11,7 @@ wasapi-backend = ["dep:wasapi", "dep:windows"]
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
 vocal-types.workspace = true
 cpal = { version = "0.18", optional = true }
 

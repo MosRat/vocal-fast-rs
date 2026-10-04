@@ -19,7 +19,11 @@ use wasapi::{
 };
 
 use crate::backend_error::BackendErrorState;
-use crate::{AudioClock, AudioDirection, AudioLatencySnapshot, AudioLatencyStats, AudioTimestamp};
+use crate::logging;
+use crate::{
+    AudioClock, AudioDirection, AudioFault, AudioIoConfig, AudioLatencySnapshot, AudioLatencyStats,
+    AudioTimestamp, StreamLifecycle, StreamState, StreamStatus,
+};
 use crate::{
     AudioError, BlockAssembler, BlockDrainer, DeviceIo, StreamConfig, StreamQueueConfig, WorkerIo,
 };
@@ -79,6 +83,20 @@ impl WasapiStream {
         Self::open_with_queue_config(config, mode, StreamQueueConfig::default())
     }
 
+    pub fn open_with_io_config(
+        config: AudioIoConfig,
+        mode: WasapiMode,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        match mode {
+            WasapiMode::SharedEvent => NativeWasapiStream::open_with_io_config(config)
+                .map(|(stream, worker)| (Self::Native(stream), worker))
+                .map_err(WasapiBackendError::Native),
+            WasapiMode::ExclusiveEvent => {
+                Self::open_legacy_with_queue_config(config.stream, mode, config.queues)
+            }
+        }
+    }
+
     pub fn open_with_queue_config(
         config: StreamConfig,
         mode: WasapiMode,
@@ -98,6 +116,26 @@ impl WasapiStream {
         clock: AudioClock,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
         Self::open_profiled_with_queue_config(config, mode, StreamQueueConfig::default(), clock)
+    }
+
+    pub fn open_profiled_with_io_config(
+        config: AudioIoConfig,
+        mode: WasapiMode,
+        clock: AudioClock,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        match mode {
+            WasapiMode::SharedEvent => {
+                NativeWasapiStream::open_profiled_with_io_config(config, clock)
+                    .map(|(stream, worker)| (Self::Native(stream), worker))
+                    .map_err(WasapiBackendError::Native)
+            }
+            WasapiMode::ExclusiveEvent => Self::open_legacy_profiled_with_queue_config(
+                config.stream,
+                mode,
+                config.queues,
+                clock,
+            ),
+        }
     }
 
     pub fn open_profiled_with_queue_config(
@@ -166,6 +204,20 @@ impl WasapiStream {
         }
     }
 
+    pub fn take_faults(&self) -> Vec<AudioFault> {
+        match self {
+            Self::Native(stream) => stream.take_faults(),
+            Self::Legacy(stream) => stream.take_faults(),
+        }
+    }
+
+    pub fn status(&self) -> StreamStatus {
+        match self {
+            Self::Native(stream) => stream.status(),
+            Self::Legacy(stream) => stream.status(),
+        }
+    }
+
     pub fn latency(&self) -> Option<AudioLatencySnapshot> {
         match self {
             Self::Native(stream) => stream.latency(),
@@ -193,6 +245,7 @@ impl Drop for WasapiStream {
 pub struct LegacyWasapiStream {
     stop: Arc<AtomicBool>,
     errors: Arc<BackendErrorState>,
+    state: Arc<StreamState>,
     latency: Option<Arc<AudioLatencyStats>>,
     joins: Option<(JoinHandle<()>, JoinHandle<()>)>,
 }
@@ -207,10 +260,12 @@ impl LegacyWasapiStream {
         clock: Option<AudioClock>,
     ) -> Result<(Self, WorkerIo), WasapiBackendError> {
         let config = config.validate()?;
-        let io = crate::StreamIo::new_with_queue_config(config, queues)?;
+        let io = crate::StreamIo::new_with_io_config(AudioIoConfig::new(config, queues))?;
         let (device_io, worker_io) = io.split();
+        let state = Arc::new(StreamState::new());
+        state.set(StreamLifecycle::Starting);
         let stop = Arc::new(AtomicBool::new(false));
-        let errors = Arc::new(BackendErrorState::default());
+        let errors = Arc::new(BackendErrorState::new(Arc::clone(&state), "wasapi.legacy"));
         let (capture_ready_tx, capture_ready_rx) = mpsc::sync_channel(1);
         let (render_ready_tx, render_ready_rx) = mpsc::sync_channel(1);
         let latency = clock
@@ -276,22 +331,39 @@ impl LegacyWasapiStream {
             .recv()
             .unwrap_or_else(|_| Err("render thread exited before startup".into()));
         if let Err(error) = capture_result {
+            logging::fault(
+                "wasapi.legacy",
+                crate::AudioFaultKind::Startup,
+                Some(crate::AudioFaultDirection::Capture),
+                &error,
+            );
             stop.store(true, Ordering::Release);
             let _ = capture.join();
             let _ = render.join();
             return Err(WasapiBackendError::Startup(error));
         }
         if let Err(error) = render_result {
+            logging::fault(
+                "wasapi.legacy",
+                crate::AudioFaultKind::Startup,
+                Some(crate::AudioFaultDirection::Render),
+                &error,
+            );
             stop.store(true, Ordering::Release);
             let _ = capture.join();
             let _ = render.join();
             return Err(WasapiBackendError::Startup(error));
         }
 
+        state.set(StreamLifecycle::Running);
+        logging::state("wasapi.legacy", state.status());
+        logging::started("wasapi.legacy");
+
         Ok((
             Self {
                 stop,
                 errors,
+                state,
                 latency,
                 joins: Some((capture, render)),
             },
@@ -303,6 +375,14 @@ impl LegacyWasapiStream {
         self.errors.take()
     }
 
+    pub fn take_faults(&self) -> Vec<AudioFault> {
+        self.errors.take_faults()
+    }
+
+    pub fn status(&self) -> StreamStatus {
+        self.state.status()
+    }
+
     pub fn latency(&self) -> Option<AudioLatencySnapshot> {
         self.latency.as_deref().map(AudioLatencyStats::snapshot)
     }
@@ -312,11 +392,21 @@ impl LegacyWasapiStream {
     }
 
     fn shutdown(&mut self) {
+        if matches!(
+            self.state.lifecycle(),
+            StreamLifecycle::Created | StreamLifecycle::Stopped
+        ) {
+            return;
+        }
+        self.state.begin_shutdown();
         self.stop.store(true, Ordering::Release);
         if let Some((capture, render)) = self.joins.take() {
             let _ = capture.join();
             let _ = render.join();
         }
+        self.state.finish_shutdown();
+        logging::state("wasapi.legacy", self.state.status());
+        logging::stopped("wasapi.legacy");
     }
 }
 

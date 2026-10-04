@@ -1,4 +1,8 @@
-use super::config::{AudioError, StreamConfig, StreamQueueConfig, allocate_samples};
+use super::config::{
+    AudioIoConfig, StreamConfig, StreamQueueConfig, WorkerInputPolicy, WorkerSchedule,
+    allocate_samples,
+};
+use super::error::AudioError;
 use super::ring::{
     AudioConsumer, AudioIoStats, AudioProducer, AudioReadLease, AudioRing, AudioWriteLease,
 };
@@ -17,6 +21,17 @@ impl StreamIo {
         Self::new_with_queue_config(config, StreamQueueConfig::symmetric(config.queue_blocks))
     }
 
+    pub fn new_with_io_config(config: AudioIoConfig) -> Result<Self, AudioError> {
+        let config = config.validate()?;
+        let stream = config.stream;
+        let queues = config.queues;
+        Ok(Self {
+            config: stream,
+            input: AudioRing::new(stream.with_queue_blocks(queues.input_blocks))?,
+            output: AudioRing::new(stream.with_queue_blocks(queues.output_blocks))?,
+        })
+    }
+
     /// Construct a duplex stream with separate capture and render ring
     /// capacities. `StreamConfig::queue_blocks` remains the symmetric default
     /// used by [`Self::new`].
@@ -24,13 +39,7 @@ impl StreamIo {
         config: StreamConfig,
         queues: StreamQueueConfig,
     ) -> Result<Self, AudioError> {
-        let config = config.validate()?;
-        let queues = queues.validate()?;
-        Ok(Self {
-            config,
-            input: AudioRing::new(config.with_queue_blocks(queues.input_blocks))?,
-            output: AudioRing::new(config.with_queue_blocks(queues.output_blocks))?,
-        })
+        Self::new_with_io_config(AudioIoConfig::new(config, queues))
     }
 
     pub fn config(&self) -> StreamConfig {
@@ -79,34 +88,6 @@ pub struct WorkerIo {
     pub output: AudioProducer,
 }
 
-/// Input policy for the standard worker scheduler.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WorkerInputPolicy {
-    /// Preserve every block in FIFO order. This is appropriate when the model
-    /// must not skip source audio.
-    Fifo,
-    /// Drop all but the newest queued block before processing. This bounds
-    /// age after a transient model or scheduler stall.
-    Latest,
-}
-
-/// Blocking policy for one model step. The wait itself never runs on a device
-/// callback thread; callbacks only publish a generation and wake the worker.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WorkerSchedule {
-    pub input_policy: WorkerInputPolicy,
-    pub timeout: Option<Duration>,
-}
-
-impl Default for WorkerSchedule {
-    fn default() -> Self {
-        Self {
-            input_policy: WorkerInputPolicy::Fifo,
-            timeout: None,
-        }
-    }
-}
-
 impl WorkerIo {
     pub fn stats(&self) -> AudioIoStats {
         AudioIoStats {
@@ -139,7 +120,7 @@ impl WorkerIo {
         timeout: Option<Duration>,
     ) -> Result<AudioReadLease<'_>, AudioError> {
         if !self.input.wait_for_data(timeout) {
-            return Err(AudioError::QueueEmpty);
+            return Err(timeout.map_or(AudioError::QueueEmpty, |_| AudioError::Timeout));
         }
         self.input.try_acquire()
     }
@@ -152,7 +133,7 @@ impl WorkerIo {
         timeout: Option<Duration>,
     ) -> Result<AudioReadLease<'_>, AudioError> {
         if !self.input.wait_for_data(timeout) {
-            return Err(AudioError::QueueEmpty);
+            return Err(timeout.map_or(AudioError::QueueEmpty, |_| AudioError::Timeout));
         }
         self.input.discard_stale();
         self.input.try_acquire()
@@ -174,7 +155,7 @@ impl WorkerIo {
         timeout: Option<Duration>,
     ) -> Result<AudioWriteLease<'_>, AudioError> {
         if !self.output.wait_for_capacity(timeout) {
-            return Err(AudioError::QueueFull);
+            return Err(timeout.map_or(AudioError::QueueFull, |_| AudioError::Timeout));
         }
         self.output.try_acquire()
     }
@@ -204,12 +185,20 @@ impl WorkerIo {
         let remaining =
             || deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if !self.output.wait_for_capacity(remaining()) {
-            return Err(AudioError::QueueFull);
+            return Err(if schedule.timeout.is_some() {
+                AudioError::Timeout
+            } else {
+                AudioError::QueueFull
+            });
         }
         // Match `try_input_output`: reserve output capacity first so a full
         // render queue never consumes an input block that cannot be emitted.
         if !self.input.wait_for_data(remaining()) {
-            return Err(AudioError::QueueEmpty);
+            return Err(if schedule.timeout.is_some() {
+                AudioError::Timeout
+            } else {
+                AudioError::QueueEmpty
+            });
         }
         if schedule.input_policy == WorkerInputPolicy::Latest {
             self.input.discard_stale();

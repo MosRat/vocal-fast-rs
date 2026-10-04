@@ -1,35 +1,48 @@
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::{AudioFault, StreamState};
 
 /// Control-plane backend error storage. Audio callbacks never need a mutex or
 /// an ever-growing allocation list when a device starts returning the same
 /// fatal error repeatedly.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BackendErrorState {
-    first: OnceLock<String>,
-    count: AtomicU64,
+    state: std::sync::Arc<StreamState>,
+    component: &'static str,
 }
 
 impl BackendErrorState {
+    pub(crate) fn new(state: std::sync::Arc<StreamState>, component: &'static str) -> Self {
+        Self { state, component }
+    }
+
     pub(crate) fn record(&self, error: String) {
-        let _ = self.first.set(error);
-        self.count.fetch_add(1, Ordering::Release);
+        let first = self
+            .state
+            .record_fault(crate::AudioFaultKind::Unknown, None, error.clone());
+        if first {
+            crate::logging::fault(self.component, crate::AudioFaultKind::Unknown, None, &error);
+        }
     }
 
     pub(crate) fn take(&self) -> Vec<String> {
-        let count = self.count.swap(0, Ordering::AcqRel);
-        if count == 0 {
-            return Vec::new();
-        }
-        let Some(first) = self.first.get() else {
-            return Vec::new();
-        };
-        let mut errors = vec![first.clone()];
-        if count > 1 {
-            errors.push(format!(
-                "{count} backend errors occurred; first error shown above"
-            ));
-        }
-        errors
+        self.take_faults()
+            .into_iter()
+            .flat_map(|fault| {
+                if fault.occurrences > 1 {
+                    vec![
+                        fault.message,
+                        format!(
+                            "{} backend errors occurred; first error shown above",
+                            fault.occurrences
+                        ),
+                    ]
+                } else {
+                    vec![fault.message]
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn take_faults(&self) -> Vec<AudioFault> {
+        self.state.take_faults()
     }
 }

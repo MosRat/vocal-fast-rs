@@ -2,10 +2,16 @@
 
 #[path = "config.rs"]
 mod config;
+#[path = "error.rs"]
+mod error;
 #[path = "format.rs"]
 mod format;
+#[path = "logging.rs"]
+pub(crate) mod logging;
 #[path = "ring.rs"]
 mod ring;
+#[path = "state.rs"]
+mod state;
 #[path = "stream.rs"]
 mod stream;
 #[path = "timing.rs"]
@@ -14,8 +20,10 @@ mod timing;
 mod wake;
 
 pub use config::*;
+pub use error::*;
 pub use format::*;
 pub use ring::*;
+pub use state::*;
 pub use stream::*;
 pub use timing::*;
 
@@ -45,6 +53,43 @@ mod tests {
             invalid.validate(),
             Err(AudioError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn complete_io_config_validates_stream_and_directional_queues_once() {
+        let io_config = AudioIoConfig::new(config(), StreamQueueConfig::new(3, 2));
+        assert_eq!(io_config.validate().unwrap(), io_config);
+        assert!(matches!(
+            AudioIoConfig::new(config().with_queue_blocks(0), StreamQueueConfig::new(3, 2))
+                .validate(),
+            Err(AudioError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn stream_state_keeps_faults_visible_until_shutdown() {
+        let state = StreamState::new();
+        assert_eq!(state.status().lifecycle, StreamLifecycle::Created);
+        state.set(StreamLifecycle::Starting);
+        state.set(StreamLifecycle::Running);
+        assert!(state.record_fault(
+            AudioFaultKind::Render,
+            Some(AudioFaultDirection::Render),
+            "device stopped".into(),
+        ));
+        assert!(!state.record_fault(
+            AudioFaultKind::Render,
+            Some(AudioFaultDirection::Render),
+            "same device error".into(),
+        ));
+        assert_eq!(state.status().lifecycle, StreamLifecycle::Failed);
+        assert_eq!(state.status().faults, 2);
+        let faults = state.take_faults();
+        assert_eq!(faults[0].occurrences, 2);
+        assert_eq!(faults[0].message, "device stopped");
+        assert_eq!(state.status().faults, 2);
+        state.set(StreamLifecycle::Stopping);
+        assert_eq!(state.status().lifecycle, StreamLifecycle::Failed);
     }
 
     #[test]
@@ -379,6 +424,16 @@ mod tests {
         let mut rendered = [0.0; 2];
         device.output.try_copy_into(&mut rendered).unwrap();
         assert_eq!(rendered, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn worker_timeout_is_distinct_from_queue_state() {
+        let io = StreamIo::new(config()).unwrap();
+        let (_, mut worker) = io.split();
+        assert!(matches!(
+            worker.wait_input(Some(Duration::ZERO)),
+            Err(AudioError::Timeout)
+        ));
     }
 
     #[test]

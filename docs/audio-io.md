@@ -42,8 +42,12 @@ block at 48 kHz is 10 ms, so three queued input blocks plus three queued output
 blocks represent 60 ms of ring residency before device safety buffers and
 model execution are included.
 
-`StreamIo::new_with_queue_config` and the WASAPI `*_with_queue_config` open
-methods accept independent `StreamQueueConfig` capacities. The default
+`AudioIoConfig` is the canonical validated configuration object. It contains
+the stream format/block configuration and independent input/output queue
+capacities. `StreamIo::new_with_io_config` and the WASAPI
+`*_with_io_config` open methods consume it directly. The older
+`new_with_queue_config` forms remain thin constructors around the same
+validation path. The default
 `StreamIo::new` remains symmetric for simple callers; a low-latency duplex
 setup can use three input blocks and two output blocks so render backlog is
 bounded more tightly than capture scheduling slack. Both WASAPI `open` entry
@@ -180,9 +184,14 @@ reverted on exit. A model worker can call `WorkerIo::register_mmcss("Audio")`
 on its own inference thread when it must share the same scheduling policy; the
 guard must be retained until that loop exits.
 
-Backend errors are kept off the audio data path. The backend stores the first
-error with a one-time cell and increments an atomic count; `take_errors()`
-returns the first message plus a summary when repeated failures occurred.
+Backend errors are kept off the audio data path. `StreamState` stores an atomic
+lifecycle (`Created`, `Starting`, `Running`, `Stopping`, `Stopped`, `Failed`),
+a monotonic transition count, and a monotonic fault count. The first structured
+`AudioFault` is retained in a one-time cell while repeated reports only update
+atomics. `take_faults()` returns the structured record with its occurrence
+count; `take_errors()` remains a string presentation for simple callers.
+Control-plane transitions and first faults use the `vocal_audio` tracing target.
+No tracing call is made for normal audio samples, queue commits, or wakeups.
 
 ## Initial tuning
 

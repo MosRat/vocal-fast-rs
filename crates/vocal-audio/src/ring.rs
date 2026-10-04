@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use vocal_types::AudioChunk;
 
-use super::config::{AudioError, StreamConfig, allocate_samples};
+use super::config::StreamConfig;
+use super::config::allocate_samples;
+use super::error::AudioError;
 use super::timing::AudioTimestamp;
 use super::wake::AudioWake;
 

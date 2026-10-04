@@ -30,6 +30,7 @@ struct Layers {
     DataType real_type() const;
     T cast_real(T x);
     void use_low_precision();
+    bool w8a16_selected(std::string const& name) const;
     // Create a build-time INT8 per-output-channel weight followed by an
     // explicit dequantize node. This keeps the experiment isolated from the
     // public floating-point graph ABI; the builder may or may not fold the

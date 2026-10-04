@@ -1,4 +1,5 @@
 #include "layers.h"
+#include <cstdio>
 namespace vocal {
 Layers::Layers(INetworkDefinition& net,Config const& config,Options const& options,Weight const* w,size_t count):n(net),c(config),o(options) {
     for(size_t i=0;i<count;++i) require(weights.emplace(w[i].name,w+i).second,"duplicate native weight");
@@ -19,6 +20,15 @@ T Layers::cast_real(T x) {
 }
 void Layers::use_low_precision() {
     active_type=o.precision==1 ? DataType::kHALF : o.precision==2 ? DataType::kBF16 : DataType::kFLOAT;
+}
+bool Layers::w8a16_selected(std::string const& name) const {
+    if(o.synth_w8a16_conv2_mask==0 || o.precision!=1) return false;
+    int block=-1,suffix=-1;
+    auto const* text=name.c_str();
+    if(std::sscanf(text,"dec.resblocks.%d.convs2.%d",&block,&suffix)!=2) return false;
+    if(block<0 || block>=21 || suffix<0 || suffix>=3) return false;
+    uint64_t bit=uint64_t{1} << static_cast<unsigned>(block*3+suffix);
+    return (o.synth_w8a16_conv2_mask&bit)!=0;
 }
 Weights Layers::w(std::string const& name) {
     auto& p=weight(name);
@@ -48,7 +58,7 @@ T Layers::quantized_parameter(std::string const& name,Dims d,int axis) {
     // Keep biases, normalization affine terms and scalar lookup tables in
     // floating point. They are bandwidth-light and quantizing them makes
     // residual/normalization error accumulate without an INT8 MAC benefit.
-    bool eligible=o.quantize_weights && p.rank>=2 &&
+    bool eligible=(o.quantize_weights || w8a16_selected(name)) && p.rank>=2 &&
         name.find(".bias")==std::string::npos &&
         name.find(".gamma")==std::string::npos &&
         name.find(".beta")==std::string::npos;
@@ -150,7 +160,7 @@ T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool
     }
     auto x4=reshape(x,dims({1,x->getDimensions().d[1],1,-1}));
     IConvolutionLayer* l=nullptr;
-    if(o.quantize_weights && weight_scale==1.0f) {
+    if((o.quantize_weights || w8a16_selected(p)) && weight_scale==1.0f) {
         auto kernel_tensor=quantized_parameter(p+".weight",dims({channels,k.dims[1],1,kernel}),0);
         l=n.addConvolutionNd(*x4,channels,dims({1,kernel}),Weights{real_type(),nullptr,0},bias_weights);
         require(l,"conv "+p); l->setInput(1,*kernel_tensor);

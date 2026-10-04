@@ -112,8 +112,14 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
                 a=act(a,ActivationType::kLEAKY_RELU,0.1f);
                 a=conv(a,p+(c.resblock_type==1?".convs1.":".convs.")+suffix,1,c.res_dilations[dilation_index]);
                 if(c.resblock_type==1) {
-                    if(a->getType()!=conv2_type) a=cast(a,conv2_type);
-                    active_type=conv2_type;
+                    // The validated W8A16 mask is applied only to selected
+                    // Conv2 nodes.  Keep the surrounding residual sum in
+                    // FP32 unless the existing stage precision explicitly
+                    // requests low-precision accumulation.
+                    auto conv2_name=p+".convs2."+suffix;
+                    auto current_conv2_type=w8a16_selected(conv2_name)?DataType::kHALF:conv2_type;
+                    if(a->getType()!=current_conv2_type) a=cast(a,current_conv2_type);
+                    active_type=current_conv2_type;
                     a=conv(act(a,ActivationType::kLEAKY_RELU,0.1f),p+".convs2."+suffix);
                 }
                 if(a->getType()!=accum_type) a=cast(a,accum_type);

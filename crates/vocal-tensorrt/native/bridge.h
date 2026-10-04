@@ -97,6 +97,11 @@ struct Options {
     int32_t synth_resblock_conv1_stage_mask;
     int32_t synth_resblock_conv2_precision;
     int32_t synth_resblock_conv2_stage_mask;
+    // Selective Synth W8A16 Conv2 mask. Bit (resblock_index * 3 + conv2
+    // suffix) enables per-output-channel INT8 weights with FP16 activation.
+    // The mask is intentionally separate from the legacy global weight-only
+    // switch so only validated decoder hotspots are quantized.
+    uint64_t synth_w8a16_conv2_mask;
     // Fold residual average into the following decoder weights.
     int32_t synth_fuse_resblock_scale;
     // Replace ConvTranspose1d with polyphase Conv1d + shuffle.

@@ -87,10 +87,52 @@ enabled globally.
 ## What this does not establish
 
 The Python wrapper executes floating point convolutions around fake quantized
-values.  Its latency is useful for checking that the experiment is bounded, but
-it is not a TensorRT INT8 performance measurement.  The next implementation
-step is to add explicit scales only for the selected W8A16 residual nodes,
-build a fixed 11200/44960 TensorRT plan, and compare CUDA event latency and
-Nsight kernels.  A true W8A8 path should use per-channel or group activation
-scales for the outlier-heavy upsample inputs and must repeat this gate on real
-voices before being enabled.
+values. Its latency is useful for checking that the experiment is bounded, but
+it is not a TensorRT INT8 performance measurement. The native integration and
+fixed-profile measurements are recorded below. A true W8A8 path should use
+per-channel or group activation scales for the outlier-heavy upsample inputs
+and must repeat this gate on real voices before being enabled.
+
+## TensorRT-RTX W8A16 integration results
+
+The first native path is now available through the opt-in environment variable
+`VOCAL_TRT_SYNTH_W8A16_CONV2_MASK`. The mask uses
+`resblock_index * 3 + conv2_suffix`; `0x30000` selects:
+
+```text
+dec.resblocks.5.convs2.1
+dec.resblocks.5.convs2.2
+```
+
+Only those Conv2 kernels are represented as per-output-channel INT8 constants
+followed by an FP16 dequantize node. The activation and residual accumulation
+remain in the existing FP16/FP32 graph. The setting requires
+`VOCAL_TRT_SYNTH_PRECISION=fp16` and cannot be combined with the global
+`VOCAL_TRT_WEIGHT_INT8` path.
+
+The plans were built and run on an RTX 3060 with TensorRT-RTX 1.6.1.120,
+HuBERT FP16, RMVPE FP32 with cuFFT, Synth FP16, and native-subgraph CUDA Graph
+replay. Measurements use fixed profiles and CUDA event timings:
+
+| profile | Synth FP16 baseline | W8A16 selected | total baseline | total W8A16 |
+|---|---:|---:|---:|---:|
+| 11200 samples | 10.27 ms | 10.13 ms | 16.91 ms | 16.80 ms |
+| 44960 samples | 36.73 ms | 36.13 ms | 50.67 ms | 49.03 ms |
+
+These are close to tactic and clock noise; they do not establish an INT8
+throughput gain. TensorRT-RTX may retain the explicit Q/DQ pair instead of
+selecting a dedicated weight-only INT8 tactic for this graph.
+
+The native audio difference between W8A16 and the corresponding FP16 baseline
+was:
+
+| profile | max absolute | RMSE | relative L2 | cosine |
+|---|---:|---:|---:|---:|
+| 11200 samples | 0.0024925 | 0.0007430 | 0.0032388 | 0.9999972 |
+| 44960 samples | 0.0020577 | 0.0004851 | 0.0036909 | 0.9999964 |
+
+Against the FP32 Applio Synth while feeding the native frontend tensors, the
+W8A16 Synth-only cosine was `0.9999977` at 11200 and `0.9999966` at 44960.
+The complete Applio end-to-end cosine was about `0.971` at 11200 and `0.969` at
+44960; that larger gap is dominated by HuBERT/RMVPE implementation differences,
+not by the selected Synth quantization.

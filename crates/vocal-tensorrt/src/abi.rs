@@ -68,6 +68,7 @@ pub(crate) struct NativeOptions {
     pub synth_resblock_conv1_stage_mask: i32,
     pub synth_resblock_conv2_precision: i32,
     pub synth_resblock_conv2_stage_mask: i32,
+    pub synth_w8a16_conv2_mask: u64,
     pub synth_fuse_resblock_scale: i32,
     pub synth_polyphase_upsample: i32,
     pub rmvpe_encoder_precision: i32,

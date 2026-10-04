@@ -186,6 +186,11 @@ pub struct NativeBuildOptions {
     pub synth_resblock_conv2_precision: PrecisionMode,
     #[serde(default)]
     pub synth_resblock_conv2_stage_mask: u32,
+    /// Selective W8A16 mask for Synth `convs2`: bit
+    /// `(resblock_index * 3 + conv2_suffix)`. This is intended for measured
+    /// decoder hotspots and requires `synth_precision = Fp16`.
+    #[serde(default)]
+    pub synth_w8a16_conv2_mask: u64,
     /// Fold the residual-block average into the following decoder weights.
     /// This removes four elementwise scale kernels while keeping the same
     /// FP32 operation order. It is opt-in because low-precision constants are
@@ -263,6 +268,7 @@ impl Default for NativeBuildOptions {
             synth_resblock_conv1_stage_mask: 0,
             synth_resblock_conv2_precision: PrecisionMode::Fp32,
             synth_resblock_conv2_stage_mask: 0,
+            synth_w8a16_conv2_mask: 0,
             synth_fuse_resblock_scale: false,
             synth_polyphase_upsample: false,
             log_build_options: false,

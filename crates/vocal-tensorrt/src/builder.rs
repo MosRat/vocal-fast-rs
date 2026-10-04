@@ -111,6 +111,7 @@ impl NativeTensorRtBuilder {
                 tactic_sources = format_args!("0x{:x}", self.options.tactic_sources),
                 resblock_precision = ?self.options.synth_resblock_precision,
                 resblock_mask = format_args!("0x{:x}", self.options.synth_resblock_stage_mask),
+                w8a16_conv2_mask = format_args!("0x{:x}", self.options.synth_w8a16_conv2_mask),
                 "building native RVC Synth plan"
             );
         }
@@ -140,6 +141,7 @@ impl NativeTensorRtBuilder {
             synth_resblock_conv1_stage_mask: self.options.synth_resblock_conv1_stage_mask as i32,
             synth_resblock_conv2_precision: self.options.synth_resblock_conv2_precision.code(),
             synth_resblock_conv2_stage_mask: self.options.synth_resblock_conv2_stage_mask as i32,
+            synth_w8a16_conv2_mask: self.options.synth_w8a16_conv2_mask,
             synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
             synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
@@ -262,6 +264,7 @@ impl NativeTensorRtBuilder {
             synth_resblock_conv1_stage_mask: self.options.synth_resblock_conv1_stage_mask as i32,
             synth_resblock_conv2_precision: self.options.synth_resblock_conv2_precision.code(),
             synth_resblock_conv2_stage_mask: self.options.synth_resblock_conv2_stage_mask as i32,
+            synth_w8a16_conv2_mask: self.options.synth_w8a16_conv2_mask,
             synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
             synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
@@ -498,6 +501,7 @@ impl NativeTensorRtBuilder {
             synth_resblock_conv1_stage_mask: self.options.synth_resblock_conv1_stage_mask as i32,
             synth_resblock_conv2_precision: self.options.synth_resblock_conv2_precision.code(),
             synth_resblock_conv2_stage_mask: self.options.synth_resblock_conv2_stage_mask as i32,
+            synth_w8a16_conv2_mask: self.options.synth_w8a16_conv2_mask,
             synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
             synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
             rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),

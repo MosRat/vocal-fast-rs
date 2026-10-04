@@ -440,11 +440,11 @@ fn capture_loop(
         );
     }
     let mut last_callback = None;
-    while !stop.load(Ordering::Acquire) {
+    'capture_loop: while !stop.load(Ordering::Acquire) {
         if let Err(error) = event.wait_for_event(1000) {
             if !matches!(error, wasapi::WasapiError::EventTimeout) {
                 record_error(&errors, error.to_string());
-                break;
+                break 'capture_loop;
             }
             continue;
         }
@@ -459,7 +459,7 @@ fn capture_loop(
                 Ok(None) => client.get_current_padding().unwrap_or(0) as usize,
                 Err(error) => {
                     record_error(&errors, error.to_string());
-                    break;
+                    break 'capture_loop;
                 }
             };
             if packet_frames == 0 {
@@ -473,7 +473,7 @@ fn capture_loop(
                     &errors,
                     "WASAPI capture packet exceeds endpoint buffer".into(),
                 );
-                break;
+                break 'capture_loop;
             }
 
             // With a fixed engine period the endpoint packet is already one
@@ -537,7 +537,14 @@ fn capture_loop(
                     continue;
                 }
                 Ok(Some((false, sample_count, timestamp))) => {
-                    let _ = assembler.push_at(&samples[..sample_count], &mut input, timestamp);
+                    if let Err(error) =
+                        assembler.push_at(&samples[..sample_count], &mut input, timestamp)
+                    {
+                        if !matches!(error, AudioError::QueueFull) {
+                            record_error(&errors, error.to_string());
+                            break 'capture_loop;
+                        }
+                    }
                     if let Some(latency) = latency.as_ref() {
                         let stats = input.stats();
                         latency.record_queue_state(
@@ -552,7 +559,7 @@ fn capture_loop(
                 Ok(None) => {}
                 Err(error) => {
                     record_error(&errors, error);
-                    break;
+                    break 'capture_loop;
                 }
             }
 
@@ -561,7 +568,7 @@ fn capture_loop(
                     Ok(value) => value,
                     Err(error) => {
                         record_error(&errors, error.to_string());
-                        break;
+                        break 'capture_loop;
                     }
                 };
             let sample_count = frames as usize * config.format.channels as usize;
@@ -572,7 +579,12 @@ fn capture_loop(
                 samples[..sample_count].fill(0.0);
             }
             let timestamp = packet_timestamp(clock.as_ref(), latency.as_deref(), &info);
-            let _ = assembler.push_at(&samples[..sample_count], &mut input, timestamp);
+            if let Err(error) = assembler.push_at(&samples[..sample_count], &mut input, timestamp) {
+                if !matches!(error, AudioError::QueueFull) {
+                    record_error(&errors, error.to_string());
+                    break 'capture_loop;
+                }
+            }
             if let Some(latency) = latency.as_ref() {
                 let stats = input.stats();
                 latency.record_queue_state(

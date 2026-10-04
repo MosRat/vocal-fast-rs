@@ -530,7 +530,7 @@ fn run_capture(
     let _ = ready.send(Ok(()));
     let mut last_callback = None;
     let expected_period = period_duration(period_frames, config.format.sample_rate);
-    while !stop.load(Ordering::Acquire) {
+    'capture_loop: while !stop.load(Ordering::Acquire) {
         let wait = wait_for_audio(stop_event, event.0);
         if wait == WaitResult::Stop {
             break;
@@ -545,7 +545,7 @@ fn run_capture(
                 Ok(frames) => frames as usize,
                 Err(error) => {
                     record_error(&errors, error.to_string());
-                    break;
+                    break 'capture_loop;
                 }
             };
             if packet_frames == 0 {
@@ -566,7 +566,7 @@ fn run_capture(
                 )
             } {
                 record_error(&errors, error.to_string());
-                break;
+                break 'capture_loop;
             }
             let sample_count = frames as usize * config.format.channels as usize;
             if sample_count > silence.len() {
@@ -611,7 +611,7 @@ fn run_capture(
             if direct {
                 if let Err(error) = unsafe { capture.ReleaseBuffer(frames) } {
                     record_error(&errors, error.to_string());
-                    break;
+                    break 'capture_loop;
                 }
                 if let Some(latency) = latency.as_ref() {
                     let stats = input.stats();
@@ -633,11 +633,12 @@ fn run_capture(
             };
             if let Err(error) = unsafe { capture.ReleaseBuffer(frames) } {
                 record_error(&errors, error.to_string());
-                break;
+                break 'capture_loop;
             }
             if let Err(error) = read_result {
                 if !matches!(error, AudioError::QueueFull) {
                     record_error(&errors, error.to_string());
+                    break 'capture_loop;
                 }
             }
             if let Some(latency) = latency.as_ref() {

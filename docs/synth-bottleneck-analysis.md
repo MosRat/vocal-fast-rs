@@ -177,6 +177,13 @@ cosine `0.99999917`, F0 RMSE `0.00681 Hz`, and coarse F0 agreement `99.644%`.
 This is the current throughput candidate; the FP32-accumulation stage-2 plan
 remains the safer default until real voices pass the same gate.
 
+An accumulation sweep on the next upsample stage (`mask 0x4`) was slower: the
+44960 profile measured `50.91 ms` CUDA-event total and `54.15 ms` host mean,
+versus `45.94 ms` and `47.59 ms` for `mask 0x2`. Its Synth-only cosine was
+`0.99999952`, so the arithmetic is numerically safe on the fixture but does not
+produce a useful throughput tradeoff. This reinforces that the stage-1 gain is
+tactic-specific rather than a general rule to lower every residual stage.
+
 ### Combined RMVPE decoder FP16 experiment
 
 The combined 44960 plan used RMVPE decoder FP16 together with stage-1 FP16

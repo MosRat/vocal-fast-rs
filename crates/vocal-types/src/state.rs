@@ -24,7 +24,10 @@ impl LifecycleState {
             (self, next),
             (Self::Created, Self::Loading | Self::Failed)
                 | (Self::Loading, Self::Ready | Self::Failed)
-                | (Self::Ready, Self::Running | Self::Stopping | Self::Failed)
+                | (
+                    Self::Ready,
+                    Self::Loading | Self::Running | Self::Stopping | Self::Failed
+                )
                 | (Self::Running, Self::Stopping | Self::Failed)
                 | (Self::Stopping, Self::Stopped | Self::Failed)
                 | (Self::Stopped, Self::Loading | Self::Ready)
@@ -59,5 +62,16 @@ impl ProcessingStatus {
     pub fn record_failure(&mut self) {
         self.failures = self.failures.saturating_add(1);
         self.state = LifecycleState::Failed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LifecycleState;
+
+    #[test]
+    fn ready_can_reload_without_unloading_first() {
+        assert!(LifecycleState::Ready.can_transition_to(LifecycleState::Loading));
+        assert!(!LifecycleState::Running.can_transition_to(LifecycleState::Loading));
     }
 }

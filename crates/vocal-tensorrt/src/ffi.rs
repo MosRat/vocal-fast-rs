@@ -255,6 +255,15 @@ unsafe extern "C" {
         stream: *mut Stream,
         error: *mut *mut c_char,
     ) -> i32;
+    pub(crate) fn vocal_cuda_download_async(
+        source: *mut Memory,
+        source_offset: usize,
+        destination: *mut HostMemory,
+        destination_offset: usize,
+        bytes: usize,
+        stream: *mut Stream,
+        error: *mut *mut c_char,
+    ) -> i32;
     pub(crate) fn vocal_cuda_memset(
         handle: *mut Memory,
         value: i32,

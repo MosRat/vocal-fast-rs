@@ -648,6 +648,22 @@ impl PinnedHostBuffer {
     fn raw(&self) -> *mut ffi::HostMemory {
         self.raw
     }
+
+    fn copy_to_bytes(&self, destination: &mut [u8]) -> Result<(), NativeBuildError> {
+        if destination.len() > self.bytes {
+            return Err(NativeBuildError::Argument(
+                "pinned host copy exceeds allocation".into(),
+            ));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ffi::vocal_cuda_host_ptr(self.raw) as *const u8,
+                destination.as_mut_ptr(),
+                destination.len(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PinnedHostBuffer {
@@ -689,6 +705,35 @@ impl PinnedHostRing {
         let slot = &mut self.slots[index];
         slot.copy_from_f32(data)?;
         destination.upload_async_pinned(slot, std::mem::size_of_val(data), stream)
+    }
+
+    /// Queue a device-to-host copy into the next pinned slot. The caller must
+    /// wait for `stream` before copying the slot into pageable output memory;
+    /// the pipeline does that once for the complete graph and the final D2H.
+    pub fn download_bytes_async(
+        &mut self,
+        source: &CudaBuffer,
+        bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<usize, NativeBuildError> {
+        let index = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        let slot = &self.slots[index];
+        if bytes > slot.bytes {
+            return Err(NativeBuildError::Argument(
+                "pinned host download exceeds allocation".into(),
+            ));
+        }
+        source.download_async_pinned(slot, bytes, stream)?;
+        Ok(index)
+    }
+
+    /// Copy a completed pinned slot into the caller's owned output buffer.
+    pub fn copy_bytes(&self, index: usize, destination: &mut [u8]) -> Result<(), NativeBuildError> {
+        let slot = self.slots.get(index).ok_or_else(|| {
+            NativeBuildError::Argument("pinned host ring slot index out of range".into())
+        })?;
+        slot.copy_to_bytes(destination)
     }
 }
 
@@ -819,6 +864,39 @@ impl CudaBuffer {
             Err(NativeBuildError::Api(ffi::native_message(
                 error,
                 "async pinned CUDA upload failed",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn download_async_pinned(
+        &self,
+        destination: &PinnedHostBuffer,
+        bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<(), NativeBuildError> {
+        if bytes > self.bytes || bytes > destination.bytes {
+            return Err(NativeBuildError::Argument(
+                "async pinned download exceeds allocation".into(),
+            ));
+        }
+        let mut error = ptr::null_mut();
+        let code = unsafe {
+            ffi::vocal_cuda_download_async(
+                self.raw,
+                0,
+                destination.raw,
+                0,
+                bytes,
+                stream.raw,
+                &mut error,
+            )
+        };
+        if code != 0 {
+            Err(NativeBuildError::Api(ffi::native_message(
+                error,
+                "async pinned CUDA download failed",
             )))
         } else {
             Ok(())

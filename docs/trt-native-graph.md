@@ -208,6 +208,9 @@ remain FP32 in all supported profiles.
 `VOCAL_TRT_DISPATCH_TUNE=11200` or `44960` records the measured realtime
 shape policy in the native ABI; the actual TensorRT tactic remains
 SDK-selected, leaving a stable hook for timing-cache or dispatch additions.
+The TensorRT-RTX tactic source bitset is now also recorded in the manifest;
+see `docs/trt-tactic-stability.md` for the fixed 44960 A/B and the recommended
+`VOCAL_TRT_TACTIC_SOURCES=0x1` reproducibility preset.
 
 ```powershell
 rtk cargo run -p vocal-fast --features tensorrt-rtx -- model compile-trt-pipeline \

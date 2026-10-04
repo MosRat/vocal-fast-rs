@@ -121,6 +121,9 @@ struct Options {
     // 1 = RMVPE receives [1,513,T] cuFFT magnitude from the external CUDA
     // frontend. TensorRT still owns mel projection and all learned layers.
     int32_t rmvpe_external_stft;
+    // TensorRT tactic-source bitset: bit 0 edge-mask convolutions, bit 1 JIT
+    // convolutions. The Rust manifest records this for reproducible builds.
+    int32_t tactic_sources;
 };
 
 inline uint16_t float_to_half_bits(float value) noexcept {
@@ -187,4 +190,7 @@ extern "C" void* vocal_cuda_host_ptr(HostMemory* memory) noexcept;
 extern "C" int vocal_cuda_upload_async(
     Memory* memory, size_t destination_offset, HostMemory* source,
     size_t source_offset, size_t bytes, Stream* stream, char** error) noexcept;
+extern "C" int vocal_cuda_download_async(
+    Memory* memory, size_t source_offset, HostMemory* destination,
+    size_t destination_offset, size_t bytes, Stream* stream, char** error) noexcept;
 }

@@ -96,7 +96,7 @@ impl NativeTensorRtBuilder {
     pub fn compile_vfrm(&self, package: &ModelPackage) -> Result<PathBuf, NativeBuildError> {
         if std::env::var("VOCAL_TRT_LOG_BUILD_OPTIONS").ok().as_deref() == Some("1") {
             eprintln!(
-                "[RVC-RUST] synth output={} frames={}/{}/{} precision={:?} fp16={} debug={} fused_hubert_qkv={} fused_rvc_qkv={} dispatch={} resblock={:?} mask=0x{:x} conv1={:?}/0x{:x} conv2={:?}/0x{:x} fuse_scale={} polyphase={} workspace={}",
+                "[RVC-RUST] synth output={} frames={}/{}/{} precision={:?} fp16={} debug={} fused_hubert_qkv={} fused_rvc_qkv={} dispatch={} tactics=0x{:x} resblock={:?} mask=0x{:x} conv1={:?}/0x{:x} conv2={:?}/0x{:x} fuse_scale={} polyphase={} workspace={}",
                 self.options.output.display(),
                 self.options.min_frames,
                 self.options.opt_frames,
@@ -107,6 +107,7 @@ impl NativeTensorRtBuilder {
                 self.options.fused_qkv,
                 self.options.fused_rvc_qkv,
                 self.options.dispatch_tune.code(),
+                self.options.tactic_sources,
                 self.options.synth_resblock_precision,
                 self.options.synth_resblock_stage_mask,
                 self.options.synth_resblock_conv1_precision,
@@ -155,6 +156,7 @@ impl NativeTensorRtBuilder {
             fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
             rmvpe_external_stft: 0,
+            tactic_sources: self.options.tactic_sources as i32,
         };
 
         let canonical = package
@@ -272,6 +274,7 @@ impl NativeTensorRtBuilder {
             fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
             rmvpe_external_stft: 0,
+            tactic_sources: self.options.tactic_sources as i32,
         };
         options.min_frames = self.options.min_samples;
         options.opt_frames = self.options.opt_samples;
@@ -503,6 +506,7 @@ impl NativeTensorRtBuilder {
             fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
             rmvpe_external_stft: self.options.rmvpe_fft_cufft as i32,
+            tactic_sources: self.options.tactic_sources as i32,
         };
         // RMVPE's waveform binding is profiled in complete 160-sample hops.
         // Keep the measured application sample points exact; the graph itself

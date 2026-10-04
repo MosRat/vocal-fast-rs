@@ -211,10 +211,20 @@ pub struct NativeBuildOptions {
     pub synth_polyphase_upsample: bool,
     #[serde(default)]
     pub dispatch_tune: DispatchTune,
+    /// Bitset of TensorRT tactic sources. Bit 0 enables edge-mask
+    /// convolutions and bit 1 enables JIT convolutions. Keeping this in the
+    /// manifest makes fixed-profile engine builds reproducible when one of
+    /// the RTX tactics is numerically unstable for a voice model.
+    #[serde(default = "default_tactic_sources")]
+    pub tactic_sources: u32,
 }
 
 fn default_fused_qkv() -> bool {
     true
+}
+
+pub(crate) fn default_tactic_sources() -> u32 {
+    0b11
 }
 
 impl Default for NativeBuildOptions {
@@ -339,6 +349,20 @@ impl Default for NativeBuildOptions {
                 .ok()
                 .is_some_and(|v| v.eq_ignore_ascii_case("polyphase")),
             dispatch_tune: DispatchTune::from_env(),
+            tactic_sources: env::var("VOCAL_TRT_TACTIC_SOURCES")
+                .ok()
+                .and_then(|value| {
+                    let value = value.trim();
+                    if let Some(hex) = value
+                        .strip_prefix("0x")
+                        .or_else(|| value.strip_prefix("0X"))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        value.parse::<u32>().ok()
+                    }
+                })
+                .unwrap_or_else(default_tactic_sources),
         }
     }
 }

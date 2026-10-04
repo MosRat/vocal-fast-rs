@@ -183,6 +183,27 @@ extern "C" int vocal_cuda_upload_async(
     });
 }
 
+extern "C" int vocal_cuda_download_async(
+    vocal::Memory* memory, size_t source_offset,
+    vocal::HostMemory* destination, size_t destination_offset, size_t bytes,
+    vocal::Stream* stream, char** error) noexcept {
+    return vocal::guarded(error, [&] {
+        vocal::require(memory && destination && stream && stream->stream,
+                       "invalid async CUDA download arguments");
+        vocal::require(source_offset <= memory->bytes &&
+                           bytes <= memory->bytes - source_offset,
+                       "CUDA async source range exceeds allocation");
+        vocal::require(destination_offset <= destination->bytes &&
+                           bytes <= destination->bytes - destination_offset,
+                       "CUDA async host destination range exceeds allocation");
+        auto* src = static_cast<unsigned char*>(memory->ptr) + source_offset;
+        auto* dst = static_cast<unsigned char*>(destination->ptr) + destination_offset;
+        nvtx3::scoped_range range{"rvc.d2h.async"};
+        vocal::cuda_check(cudaMemcpyAsync(dst, src, bytes,
+                                          cudaMemcpyDeviceToHost, stream->stream));
+    });
+}
+
 extern "C" int vocal_cuda_memset(
     vocal::Memory* memory, int value, size_t bytes, char** error) noexcept {
     return vocal::guarded(error, [&] {

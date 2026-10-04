@@ -15,11 +15,13 @@ use vocal_model::{ModelPackage, RvcSynthConfig};
 
 use crate::timing::CudaEvent;
 use crate::{
-    builder::NativeTensorRtBuilder,
-    cufft::{unique_shapes, CufftFrontend},
-    error::NativeBuildError,
-    options::{DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode},
     CudaBuffer, CudaGraphExec, CudaStream, OwnedContext, PinnedHostRing, Runtime,
+    builder::NativeTensorRtBuilder,
+    cufft::{CufftFrontend, unique_shapes},
+    error::NativeBuildError,
+    options::{
+        DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode, default_tactic_sources,
+    },
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -385,6 +387,8 @@ pub struct RvcTrtPipelineArtifacts {
     pub synth_polyphase_upsample: bool,
     #[serde(default)]
     pub dispatch_tune: DispatchTune,
+    #[serde(default = "default_tactic_sources")]
+    pub tactic_sources: u32,
     /// Whether the Synth graph was built with experimental static INT8
     /// weight Q/DQ nodes. This is recorded for reproducible benchmarking;
     /// runtime execution does not consult an environment variable.
@@ -580,6 +584,7 @@ impl RvcTrtPipelineArtifacts {
             synth_fuse_resblock_scale,
             synth_polyphase_upsample,
             dispatch_tune,
+            tactic_sources: builder_options.tactic_sources,
             weight_int8,
             fused_qkv,
             fused_rvc_qkv,
@@ -694,6 +699,7 @@ pub struct RvcTrtPipeline {
     stage_events: StageEvents,
     waveform: CudaBuffer,
     waveform_host_ring: PinnedHostRing,
+    audio_host_ring: PinnedHostRing,
     threshold: CudaBuffer,
     hubert_features: CudaBuffer,
     pitchf_raw: CudaBuffer,
@@ -888,6 +894,7 @@ impl RvcTrtPipeline {
             stage_events,
             waveform: alloc(p.max_samples as usize * 4)?,
             waveform_host_ring: PinnedHostRing::new(3, p.max_samples as usize * 4)?,
+            audio_host_ring: PinnedHostRing::new(3, p.max_rvc_frames as usize * up * 4)?,
             threshold: alloc(4)?,
             hubert_features: alloc(p.max_hubert_frames as usize * 768 * 4)?,
             pitchf_raw: alloc(p.max_pitch_frames as usize * 4)?,
@@ -1668,6 +1675,26 @@ impl RvcTrtPipeline {
                 )?;
             }
         }
+        // Queue the final audio copy on the same stream before synchronizing.
+        // Pageable cudaMemcpy after synchronization adds a second host-side
+        // synchronization point on every callback.  A pinned ring keeps the
+        // copy ordered with the graph while retaining an owned Vec API.
+        let audio_bytes_len = rvc_frames
+            .checked_mul(up)
+            .and_then(|samples| samples.checked_mul(4))
+            .ok_or_else(|| NativeBuildError::Argument("audio byte length overflow".into()))?;
+        let async_audio_d2h = std::env::var("VOCAL_TRT_ASYNC_AUDIO_D2H")
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let audio_host_slot = if self.debug_intermediates || !async_audio_d2h {
+            None
+        } else {
+            Some(self.audio_host_ring.download_bytes_async(
+                &self.audio,
+                audio_bytes_len,
+                &self.stream,
+            )?)
+        };
         self.stream.synchronize()?;
         self.shape_key = Some(graph_key);
         let hubert_enqueue_ms = self
@@ -1686,8 +1713,12 @@ impl RvcTrtPipeline {
             .stage_events
             .synth_start
             .elapsed(&self.stage_events.synth_end)?;
-        let mut audio_bytes = vec![0_u8; rvc_frames * up * 4];
-        self.audio.download_bytes(&mut audio_bytes)?;
+        let mut audio_bytes = vec![0_u8; audio_bytes_len];
+        if let Some(slot) = audio_host_slot {
+            self.audio_host_ring.copy_bytes(slot, &mut audio_bytes)?;
+        } else {
+            self.audio.download_bytes(&mut audio_bytes)?;
+        }
         let audio = audio_bytes
             .chunks_exact(4)
             .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
@@ -1879,7 +1910,7 @@ fn pitch_frames_for_samples(samples: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_shape, RvcRealtimeConfig, RvcTrtProfile};
+    use super::{RvcRealtimeConfig, RvcTrtProfile, frame_shape};
 
     #[test]
     fn reference_profile_matches_real_application_windows() {

@@ -7,6 +7,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         require(c&&weights&&options&&out&&c->abi_version==2,"invalid RVC build ABI");
         require(options->min_frames>0&&options->min_frames<=options->opt_frames&&options->opt_frames<=options->max_frames,"invalid frame profile");
         require(options->synth_resblock_stage_mask>=0,"invalid Synth residual stage mask");
+        require(options->tactic_sources>=0 && options->tactic_sources<=3,
+                "invalid TensorRT tactic source mask");
         require(options->synth_resblock_conv1_precision>=0 && options->synth_resblock_conv1_precision<=2,
                 "invalid Synth conv1 precision");
         require(options->synth_resblock_conv2_precision>=0 && options->synth_resblock_conv2_precision<=2,
@@ -33,6 +35,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         auto bc=std::unique_ptr<IBuilderConfig>(b->createBuilderConfig());require(bool(bc),"builder config");
         bc->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE,options->workspace);
         bc->clearFlag(BuilderFlag::kTF32); // keep the baseline deterministic
+        require(bc->setTacticSources(static_cast<TacticSources>(options->tactic_sources)),
+                "set TensorRT tactic sources failed");
         bc->setProfilingVerbosity(ProfilingVerbosity::kDETAILED);
         // TensorRT-RTX 1.6 exposes the standard timing-cache ABI but marks it
         // deprecated/no-op. Keep the file contract anyway: on SDKs that

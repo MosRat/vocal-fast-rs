@@ -1,14 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub enum EngineLifecycle {
-    #[default]
-    Created,
-    Ready,
-    Running,
-    Failed,
-    Stopped,
-}
+pub use vocal_types::LifecycleState as EngineLifecycle;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EngineStatus {
@@ -29,9 +21,11 @@ impl EngineStatus {
                 self.state = EngineLifecycle::Running;
                 Ok(())
             }
-            EngineLifecycle::Created => Err("engine has not completed initialization"),
+            EngineLifecycle::Created | EngineLifecycle::Loading => {
+                Err("engine has not completed initialization")
+            }
             EngineLifecycle::Failed => Err("engine is failed"),
-            EngineLifecycle::Stopped => Err("engine is stopped"),
+            EngineLifecycle::Stopping | EngineLifecycle::Stopped => Err("engine is stopped"),
         }
     }
 

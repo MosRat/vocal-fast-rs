@@ -6,6 +6,7 @@ use vocal_model::{ModelLoader, RvcModelManifest};
 use vocal_types::{AudioChunk, AudioFormat, LatencyMetrics, LifecycleState, ModelDescriptor};
 
 use crate::{
+    audio::{AudioDeviceCatalog, AudioSession, AudioTelemetry},
     config::{ConfigStore, GuiBackend, GuiConfig},
     error::{GuiError, GuiResult},
     events::{BackendEvent, ErrorReport, EventSink},
@@ -49,6 +50,7 @@ pub struct UiSnapshot {
     pub metrics: UiMetrics,
     pub engine: Option<UiEngineStatus>,
     pub last_error: Option<ErrorReport>,
+    pub audio: AudioTelemetry,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -96,6 +98,7 @@ struct RuntimeState {
     model: Option<ModelSummary>,
     descriptor: Option<ModelDescriptor>,
     engine: Option<Box<dyn InferenceEngine>>,
+    audio: Option<AudioSession>,
     metrics: LatencyMetrics,
     last_error: Option<ErrorReport>,
     config_store: Option<ConfigStore>,
@@ -118,6 +121,7 @@ impl AppState {
                 model: None,
                 descriptor: None,
                 engine: None,
+                audio: None,
                 metrics: LatencyMetrics::default(),
                 last_error: None,
                 config_store: None,
@@ -140,6 +144,14 @@ impl AppState {
 
     pub fn snapshot(&self) -> GuiResult<UiSnapshot> {
         Ok(self.lock()?.snapshot())
+    }
+
+    pub fn list_audio_devices(&self) -> GuiResult<AudioDeviceCatalog> {
+        AudioSession::enumerate().map_err(GuiError::AudioDiscovery)
+    }
+
+    pub fn persisted_model_path(&self) -> GuiResult<Option<String>> {
+        Ok(self.lock()?.config.model_path.clone())
     }
 
     pub fn attach_channel(
@@ -174,6 +186,12 @@ impl AppState {
             ) {
                 return Err(GuiError::InvalidState {
                     state: format!("{:?}", state.lifecycle),
+                    action: "update_config".into(),
+                });
+            }
+            if state.audio.is_some() {
+                return Err(GuiError::InvalidState {
+                    state: "audio_session_active".into(),
                     action: "update_config".into(),
                 });
             }
@@ -219,6 +237,41 @@ impl AppState {
                 Err(error)
             }
         }
+    }
+
+    pub fn unload_model(&self) -> GuiResult<UiSnapshot> {
+        let _operation = self.operation()?;
+        let session = {
+            let mut state = self.lock()?;
+            if matches!(
+                state.lifecycle,
+                LifecycleState::Loading | LifecycleState::Running | LifecycleState::Stopping
+            ) {
+                return Err(GuiError::InvalidState {
+                    state: format!("{:?}", state.lifecycle),
+                    action: "unload_model".into(),
+                });
+            }
+            state.audio.take()
+        };
+        drop(session);
+        let snapshot = {
+            let mut state = self.lock()?;
+            state.engine = None;
+            state.model = None;
+            state.descriptor = None;
+            state.config.model_path = None;
+            state.metrics = LatencyMetrics::default();
+            state.config_revision = state.config_revision.saturating_add(1);
+            if let Some(store) = &state.config_store {
+                store.save(&state.config)?;
+            }
+            state.lifecycle = LifecycleState::Created;
+            state.last_error = None;
+            state.snapshot()
+        };
+        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        Ok(snapshot)
     }
 
     fn load_model_inner(&self, path: String) -> GuiResult<UiSnapshot> {
@@ -268,9 +321,9 @@ impl AppState {
 
     pub fn start(&self) -> GuiResult<UiSnapshot> {
         let _operation = self.operation()?;
-        let snapshot = {
+        let (config, descriptor, engine) = {
             let mut state = self.lock()?;
-            if state.engine.is_none() {
+            if state.audio.is_some() {
                 return Err(GuiError::InvalidState {
                     state: format!("{:?}", state.lifecycle),
                     action: "start".into(),
@@ -285,6 +338,37 @@ impl AppState {
                     action: "start".into(),
                 });
             }
+            let descriptor = state
+                .descriptor
+                .clone()
+                .ok_or_else(|| GuiError::InvalidState {
+                    state: format!("{:?}", state.lifecycle),
+                    action: "start_without_model".into(),
+                })?;
+            let engine = state
+                .engine
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| Self::create_engine(&state.config, &descriptor))?;
+            (state.config.clone(), descriptor, engine)
+        };
+        let reporter: Arc<dyn Fn(String) + Send + Sync> = Arc::new({
+            let state = self.clone();
+            move |message| state.report(&GuiError::Audio(message))
+        });
+        let session = match AudioSession::start(&config, engine, reporter) {
+            Ok(session) => session,
+            Err(error) => {
+                let replacement = Self::create_engine(&config, &descriptor).ok();
+                if let Ok(mut state) = self.lock() {
+                    state.engine = replacement;
+                }
+                return Err(GuiError::Audio(error));
+            }
+        };
+        let snapshot = {
+            let mut state = self.lock()?;
+            state.audio = Some(session);
             state.lifecycle = LifecycleState::Running;
             state.last_error = None;
             state.snapshot()
@@ -295,7 +379,7 @@ impl AppState {
 
     pub fn stop(&self) -> GuiResult<UiSnapshot> {
         let _operation = self.operation()?;
-        let (stopping, snapshot) = {
+        let (stopping, session) = {
             let mut state = self.lock()?;
             if !matches!(
                 state.lifecycle,
@@ -314,8 +398,13 @@ impl AppState {
             }
             state.lifecycle = LifecycleState::Stopping;
             let stopping = state.snapshot();
+            (stopping, state.audio.take())
+        };
+        drop(session);
+        let snapshot = {
+            let mut state = self.lock()?;
             state.lifecycle = LifecycleState::Stopped;
-            (stopping, state.snapshot())
+            state.snapshot()
         };
         self.events.send(BackendEvent::Snapshot(stopping))?;
         self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
@@ -350,6 +439,12 @@ impl AppState {
                     action: "process".into(),
                 });
             }
+            if state.audio.is_some() {
+                return Err(GuiError::InvalidState {
+                    state: "audio_session_active".into(),
+                    action: "process_block".into(),
+                });
+            }
             let engine = state.engine.take().ok_or_else(|| GuiError::InvalidState {
                 state: "no_engine".into(),
                 action: "process".into(),
@@ -374,6 +469,11 @@ impl AppState {
 
     pub fn clear_error(&self) -> GuiResult<UiSnapshot> {
         let _operation = self.operation()?;
+        let session = {
+            let mut state = self.lock()?;
+            state.audio.take()
+        };
+        drop(session);
         let replacement = {
             let state = self.lock()?;
             if state.lifecycle == LifecycleState::Failed {
@@ -408,6 +508,12 @@ impl AppState {
     fn transition(&self, next: LifecycleState, action: &str) -> GuiResult<()> {
         let snapshot = {
             let mut state = self.lock()?;
+            if next == LifecycleState::Loading && state.audio.is_some() {
+                return Err(GuiError::InvalidState {
+                    state: "audio_session_active".into(),
+                    action: action.into(),
+                });
+            }
             if !state.lifecycle.can_transition_to(next) {
                 return Err(GuiError::InvalidState {
                     state: format!("{:?}", state.lifecycle),
@@ -440,7 +546,10 @@ impl AppState {
     pub fn report(&self, error: &GuiError) {
         let snapshot = if let Ok(mut state) = self.lock() {
             state.last_error = Some(ErrorReport::from_error(error));
-            if matches!(error, GuiError::Engine(_) | GuiError::Internal(_)) {
+            if matches!(
+                error,
+                GuiError::Engine(_) | GuiError::Audio(_) | GuiError::Internal(_)
+            ) {
                 state.lifecycle = LifecycleState::Failed;
             }
             Some(state.snapshot())
@@ -488,18 +597,33 @@ fn descriptor_clone(state: &RuntimeState) -> Option<ModelDescriptor> {
 
 impl RuntimeState {
     fn snapshot(&self) -> UiSnapshot {
+        let audio = self
+            .audio
+            .as_ref()
+            .map(AudioSession::snapshot)
+            .unwrap_or_default();
+        let metrics = if audio.active {
+            UiMetrics {
+                input_frames: audio.input_frames,
+                processing_micros: audio.processing_micros,
+                output_frames: audio.output_frames,
+            }
+        } else {
+            self.metrics.into()
+        };
         UiSnapshot {
             lifecycle: self.lifecycle,
             config: self.config.clone(),
             config_revision: self.config_revision,
             model: self.model.clone(),
-            metrics: self.metrics.into(),
+            metrics,
             engine: self.engine.as_ref().map(|engine| {
                 let mut status = engine.status();
                 status.state = self.lifecycle;
                 status.into()
             }),
             last_error: self.last_error.clone(),
+            audio,
         }
     }
 }
@@ -526,5 +650,15 @@ mod tests {
         let state = AppState::new(GuiConfig::default());
         let error = state.start().expect_err("missing model must fail");
         assert!(matches!(error, GuiError::InvalidState { .. }));
+    }
+
+    #[test]
+    fn unload_clears_model_state_and_advances_revision() {
+        let state = AppState::new(GuiConfig::default());
+        let snapshot = state.unload_model().expect("unload without model");
+        assert_eq!(snapshot.lifecycle, LifecycleState::Created);
+        assert_eq!(snapshot.config_revision, 1);
+        assert!(snapshot.model.is_none());
+        assert!(snapshot.config.model_path.is_none());
     }
 }

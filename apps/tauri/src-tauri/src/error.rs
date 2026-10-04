@@ -19,6 +19,10 @@ pub enum GuiError {
     Engine(String),
     #[error("invalid audio input: {0}")]
     InvalidAudio(String),
+    #[error("audio device error: {0}")]
+    Audio(String),
+    #[error("audio device discovery error: {0}")]
+    AudioDiscovery(String),
     #[error("I/O error at {path}: {message}")]
     Io { path: String, message: String },
     #[error("channel error: {0}")]
@@ -40,6 +44,8 @@ impl GuiError {
             Self::Model(_) => "model_error",
             Self::Engine(_) => "engine_error",
             Self::InvalidAudio(_) => "invalid_audio",
+            Self::Audio(_) => "audio_error",
+            Self::AudioDiscovery(_) => "audio_discovery_error",
             Self::Io { .. } => "io_error",
             Self::Channel(_) => "channel_error",
             Self::Binary(_) => "binary_error",

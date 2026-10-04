@@ -15,22 +15,31 @@ pub enum GuiBackend {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct GuiConfig {
     pub input_format: AudioFormat,
     pub output_format: AudioFormat,
     pub conversion: ConversionConfig,
     pub backend: GuiBackend,
     pub model_path: Option<String>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub block_frames: usize,
+    pub queue_blocks: usize,
 }
 
 impl Default for GuiConfig {
     fn default() -> Self {
         Self {
-            input_format: AudioFormat::MONO_16K,
-            output_format: AudioFormat::MONO_16K,
+            input_format: AudioFormat::MONO_48K,
+            output_format: AudioFormat::MONO_48K,
             conversion: ConversionConfig::default(),
             backend: GuiBackend::Passthrough,
             model_path: None,
+            input_device: None,
+            output_device: None,
+            block_frames: 480,
+            queue_blocks: 3,
         }
     }
 }
@@ -43,7 +52,23 @@ impl GuiConfig {
             conversion: self.conversion,
         }
         .validate()
-        .map_err(|error: TypesError| GuiError::InvalidConfig(error.to_string()))
+        .map_err(|error: TypesError| GuiError::InvalidConfig(error.to_string()))?;
+        if self.block_frames == 0 || self.queue_blocks == 0 {
+            return Err(GuiError::InvalidConfig(
+                "block_frames and queue_blocks must be non-zero".into(),
+            ));
+        }
+        if self.block_frames > 8192 || self.queue_blocks > 64 {
+            return Err(GuiError::InvalidConfig(
+                "block_frames must be <= 8192 and queue_blocks must be <= 64".into(),
+            ));
+        }
+        if self.input_format != self.output_format {
+            return Err(GuiError::InvalidConfig(
+                "input and output formats must match for duplex streaming".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

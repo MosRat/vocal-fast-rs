@@ -9,6 +9,13 @@ use crate::{
 };
 
 #[tauri::command]
+pub fn list_audio_devices(
+    state: State<'_, AppState>,
+) -> GuiResult<crate::audio::AudioDeviceCatalog> {
+    report(state.inner(), state.list_audio_devices())
+}
+
+#[tauri::command]
 pub fn get_snapshot(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
     report(state.inner(), state.snapshot())
 }
@@ -39,6 +46,11 @@ pub async fn load_model(state: State<'_, AppState>, path: String) -> GuiResult<U
     tauri::async_runtime::spawn_blocking(move || state.load_model(path))
         .await
         .map_err(|error| crate::error::GuiError::Internal(error.to_string()))?
+}
+
+#[tauri::command]
+pub fn unload_model(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
+    report(state.inner(), state.unload_model())
 }
 
 #[tauri::command]

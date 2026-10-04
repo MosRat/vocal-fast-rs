@@ -22,3 +22,5 @@ tracing = "0.1"
 tauri = { version = "2", features = [] }
 vocal-engine = { path = "../../../crates/vocal-engine" }
 vocal-model = { path = "../../../crates/vocal-model" }
+vocal-audio = { path = "../../../crates/vocal-audio", features = ["cpal-backend"] }
+cpal = "0.18"

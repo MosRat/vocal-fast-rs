@@ -315,6 +315,7 @@ struct CaptureSetup {
     capture: IAudioCaptureClient,
     event: EventHandle,
     endpoint_frames: usize,
+    period_frames: usize,
 }
 
 struct RenderSetup {
@@ -323,12 +324,13 @@ struct RenderSetup {
     event: EventHandle,
     block_align: usize,
     endpoint_frames: usize,
+    period_frames: usize,
 }
 
 fn setup_client(
     config: StreamConfig,
     flow: EDataFlow,
-) -> Result<(IAudioClient, EventHandle, usize, usize), String> {
+) -> Result<(IAudioClient, EventHandle, usize, usize, usize), String> {
     let enumerator: windows::Win32::Media::Audio::IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|error| error.to_string())?;
@@ -409,7 +411,13 @@ fn setup_client(
             .map_err(|error| error.to_string())?;
     }
     let endpoint_frames = unsafe { client.GetBufferSize() }.map_err(|error| error.to_string())?;
-    Ok((client, event, block_align, endpoint_frames as usize))
+    Ok((
+        client,
+        event,
+        block_align,
+        endpoint_frames as usize,
+        period as usize,
+    ))
 }
 
 fn choose_period(target: usize, fundamental: u32, min: u32, max: u32) -> Option<u32> {
@@ -428,7 +436,8 @@ fn choose_period(target: usize, fundamental: u32, min: u32, max: u32) -> Option<
 }
 
 fn setup_capture(config: StreamConfig) -> Result<CaptureSetup, String> {
-    let (client, event, _block_align, endpoint_frames) = setup_client(config, eCapture)?;
+    let (client, event, _block_align, endpoint_frames, period_frames) =
+        setup_client(config, eCapture)?;
     let capture =
         unsafe { client.GetService::<IAudioCaptureClient>() }.map_err(|error| error.to_string())?;
     unsafe { client.Start() }.map_err(|error| error.to_string())?;
@@ -437,11 +446,13 @@ fn setup_capture(config: StreamConfig) -> Result<CaptureSetup, String> {
         capture,
         event,
         endpoint_frames,
+        period_frames,
     })
 }
 
 fn setup_render(config: StreamConfig) -> Result<RenderSetup, String> {
-    let (client, event, block_align, endpoint_frames) = setup_client(config, eRender)?;
+    let (client, event, block_align, endpoint_frames, period_frames) =
+        setup_client(config, eRender)?;
     let render =
         unsafe { client.GetService::<IAudioRenderClient>() }.map_err(|error| error.to_string())?;
     unsafe { client.Start() }.map_err(|error| error.to_string())?;
@@ -451,6 +462,7 @@ fn setup_render(config: StreamConfig) -> Result<RenderSetup, String> {
         event,
         block_align,
         endpoint_frames,
+        period_frames,
     })
 }
 
@@ -478,6 +490,7 @@ fn run_capture(
         capture,
         event,
         endpoint_frames,
+        period_frames,
     } = match setup {
         Ok(setup) => {
             let _ = ready.send(Ok(()));
@@ -504,6 +517,7 @@ fn run_capture(
     };
     let mut silence = vec![0.0; endpoint_frames * config.format.channels as usize];
     let mut last_callback = None;
+    let expected_period = period_duration(period_frames, config.format.sample_rate);
     while !stop.load(Ordering::Acquire) {
         let wait = wait_for_audio(stop_event, event.0);
         if wait == WaitResult::Stop {
@@ -513,11 +527,7 @@ fn run_capture(
             record_error(&errors, "native WASAPI capture event wait failed".into());
             break;
         }
-        record_callback_tick(
-            latency.as_deref(),
-            &mut last_callback,
-            config.block_duration(),
-        );
+        record_callback_tick(latency.as_deref(), &mut last_callback, expected_period);
         loop {
             let packet_frames = match unsafe { capture.GetNextPacketSize() } {
                 Ok(frames) => frames as usize,
@@ -653,6 +663,7 @@ fn run_render(
         event,
         block_align,
         endpoint_frames,
+        period_frames,
     } = match setup {
         Ok(setup) => {
             let _ = ready.send(Ok(()));
@@ -679,6 +690,7 @@ fn run_render(
     };
     let mut samples = vec![0.0; endpoint_frames * config.format.channels as usize];
     let mut last_callback = None;
+    let expected_period = period_duration(period_frames, config.format.sample_rate);
     while !stop.load(Ordering::Acquire) {
         let wait = wait_for_audio(stop_event, event.0);
         if wait == WaitResult::Stop {
@@ -688,11 +700,7 @@ fn run_render(
             record_error(&errors, "native WASAPI render event wait failed".into());
             break;
         }
-        record_callback_tick(
-            latency.as_deref(),
-            &mut last_callback,
-            config.block_duration(),
-        );
+        record_callback_tick(latency.as_deref(), &mut last_callback, expected_period);
         let available = match unsafe { client.GetCurrentPadding() } {
             Ok(padding) => endpoint_frames.saturating_sub(padding as usize),
             Err(error) => {
@@ -850,6 +858,16 @@ fn record_callback_tick(
     if let Some(previous) = last_callback.replace(now) {
         latency.record_callback_period(now.saturating_duration_since(previous), expected);
     }
+}
+
+fn period_duration(frames: usize, sample_rate: u32) -> Duration {
+    if frames == 0 || sample_rate == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = ((frames as u128) * 1_000_000_000)
+        .div_ceil(u128::from(sample_rate))
+        .min(u128::from(u64::MAX)) as u64;
+    Duration::from_nanos(nanos)
 }
 
 fn record_error(errors: &Mutex<Vec<String>>, error: String) {

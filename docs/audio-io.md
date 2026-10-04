@@ -84,7 +84,9 @@ snapshot also reports underflow samples, packet timestamp validity,
 discontinuities, queue high-water, overflow/stale-drop counts, and maximum
 endpoint padding. Profiled device callbacks also expose callback period
 count/mean and callback jitter percentiles, so scheduling jitter can be
-distinguished from queue residency. A zero sample count means the inference worker did not
+distinguished from queue residency. Native WASAPI compares callback intervals
+with the actual period selected from `IAudioClient3`, rather than assuming the
+model block size. A zero sample count means the inference worker did not
 propagate timestamps, rather than that the device measured zero latency.
 The default methods write `AudioTimestamp::ZERO`, so production streams do not
 pay for a clock read on every callback.

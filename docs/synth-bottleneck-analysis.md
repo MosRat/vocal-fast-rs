@@ -176,3 +176,15 @@ against the FP32 Applio reference remained final cosine `0.99888755`, Synth-only
 cosine `0.99999917`, F0 RMSE `0.00681 Hz`, and coarse F0 agreement `99.644%`.
 This is the current throughput candidate; the FP32-accumulation stage-2 plan
 remains the safer default until real voices pass the same gate.
+
+### Combined RMVPE decoder FP16 experiment
+
+The combined 44960 plan used RMVPE decoder FP16 together with stage-1 FP16
+residual accumulation. Against the FP32 Applio reference it produced F0 RMSE
+`0.002846 Hz`, 100% coarse-F0 agreement, final cosine `0.99984818`, and
+Synth-only cosine `0.99999919`. The RMVPE CUDA-event median in the fresh
+Nsight capture was `6.91 ms` (about 1--1.5 ms below the FP32 decoder), but Synth
+was `30.47 ms` in that capture. Repeated application profiles ranged from
+`48.8` to `54.5 ms` event total, overlapping the FP32-decoder stage-1 plan once
+GPU clock and tactic variance are included. Keep decoder FP16 opt-in; it is a
+useful RMVPE-only saving, but it is not yet a proven end-to-end speed win.

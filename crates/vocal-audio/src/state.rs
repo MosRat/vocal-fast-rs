@@ -28,6 +28,21 @@ impl StreamLifecycle {
             _ => Self::Created,
         }
     }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Created, Self::Starting | Self::Failed)
+                | (
+                    Self::Starting,
+                    Self::Running | Self::Stopping | Self::Failed
+                )
+                | (Self::Running, Self::Stopping | Self::Failed)
+                | (Self::Stopping, Self::Stopped | Self::Failed)
+                | (Self::Stopped, Self::Starting)
+                | (Self::Failed, Self::Failed)
+        ) || self == next
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,23 +81,29 @@ impl StreamState {
     }
 
     pub fn set(&self, lifecycle: StreamLifecycle) {
+        let _ = self.transition(lifecycle);
+    }
+
+    /// Attempt an atomic, validated lifecycle transition.
+    pub fn transition(&self, lifecycle: StreamLifecycle) -> bool {
         let requested = lifecycle as u8;
         loop {
             let previous = self.lifecycle.load(Ordering::Acquire);
-            if previous == StreamLifecycle::Failed as u8 && lifecycle != StreamLifecycle::Failed {
-                return;
+            let previous = StreamLifecycle::from_raw(previous);
+            if !previous.can_transition_to(lifecycle) {
+                return false;
             }
             match self.lifecycle.compare_exchange(
-                previous,
+                previous as u8,
                 requested,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if previous != requested {
+                    if previous as u8 != requested {
                         self.transitions.fetch_add(1, Ordering::Relaxed);
                     }
-                    return;
+                    return true;
                 }
                 Err(_) => continue,
             }
@@ -123,16 +144,10 @@ impl StreamState {
     }
 
     pub fn begin_shutdown(&self) -> bool {
-        if self.lifecycle() == StreamLifecycle::Failed {
-            return false;
-        }
-        self.set(StreamLifecycle::Stopping);
-        true
+        self.transition(StreamLifecycle::Stopping)
     }
 
     pub fn finish_shutdown(&self) {
-        if self.lifecycle() != StreamLifecycle::Failed {
-            self.set(StreamLifecycle::Stopped);
-        }
+        let _ = self.transition(StreamLifecycle::Stopped);
     }
 }

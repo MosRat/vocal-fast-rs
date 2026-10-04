@@ -70,6 +70,8 @@ mod tests {
     fn stream_state_keeps_faults_visible_until_shutdown() {
         let state = StreamState::new();
         assert_eq!(state.status().lifecycle, StreamLifecycle::Created);
+        assert!(!state.transition(StreamLifecycle::Running));
+        assert_eq!(state.status().lifecycle, StreamLifecycle::Created);
         state.set(StreamLifecycle::Starting);
         state.set(StreamLifecycle::Running);
         assert!(state.record_fault(

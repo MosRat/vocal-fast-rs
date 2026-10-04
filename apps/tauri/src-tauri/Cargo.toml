@@ -24,3 +24,6 @@ vocal-engine = { path = "../../../crates/vocal-engine" }
 vocal-model = { path = "../../../crates/vocal-model" }
 vocal-audio = { path = "../../../crates/vocal-audio", features = ["cpal-backend"] }
 cpal = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

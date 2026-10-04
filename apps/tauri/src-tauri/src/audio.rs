@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ use vocal_audio::{
     WorkerSchedule,
 };
 use vocal_engine::InferenceEngine;
-use vocal_types::AudioChunk;
+use vocal_types::{AudioChunk, LifecycleState};
 
 use crate::config::GuiConfig;
 
@@ -42,6 +42,7 @@ pub struct AudioDeviceCatalog {
 #[serde(rename_all = "camelCase")]
 pub struct AudioTelemetry {
     pub active: bool,
+    pub state: LifecycleState,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub input_frames: u64,
@@ -54,19 +55,30 @@ pub struct AudioTelemetry {
     pub stream_state: String,
 }
 
-#[derive(Default)]
+impl AudioTelemetry {
+    pub fn stopped() -> Self {
+        Self {
+            state: LifecycleState::Stopped,
+            stream_state: "Stopped".into(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct WorkerTelemetry {
-    input_frames: u64,
-    output_frames: u64,
-    processing_micros: u64,
-    failures: u64,
+    input_frames: AtomicU64,
+    output_frames: AtomicU64,
+    processing_micros: AtomicU64,
+    failures: AtomicU64,
 }
 
 pub struct AudioSession {
     stream: Option<CpalDuplexStream>,
     stop: Arc<AtomicBool>,
+    worker_alive: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
-    telemetry: Arc<Mutex<WorkerTelemetry>>,
+    telemetry: Arc<WorkerTelemetry>,
     input_device: String,
     output_device: String,
 }
@@ -163,7 +175,9 @@ impl AudioSession {
         .map_err(|error| error.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let telemetry = Arc::new(Mutex::new(WorkerTelemetry::default()));
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let worker_alive_flag = Arc::clone(&worker_alive);
+        let telemetry = Arc::new(WorkerTelemetry::default());
         let worker_telemetry = Arc::clone(&telemetry);
         let conversion = config.conversion;
         let format = config.input_format;
@@ -195,17 +209,16 @@ impl AudioSession {
                             });
                         }
                         output.copy_from_slice(&converted.samples);
-                        let mut stats = worker_telemetry.lock().map_err(|_| {
-                            AudioError::InvalidConfig("worker telemetry lock poisoned".into())
-                        })?;
-                        stats.input_frames =
-                            stats.input_frames.saturating_add(chunk.frames() as u64);
-                        stats.output_frames = stats
+                        worker_telemetry
+                            .input_frames
+                            .fetch_add(chunk.frames() as u64, Ordering::Relaxed);
+                        worker_telemetry
                             .output_frames
-                            .saturating_add(converted.frames() as u64);
-                        stats.processing_micros = stats
-                            .processing_micros
-                            .saturating_add(started.elapsed().as_micros() as u64);
+                            .fetch_add(converted.frames() as u64, Ordering::Relaxed);
+                        worker_telemetry.processing_micros.fetch_add(
+                            started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
                         sequence = sequence.wrapping_add(1);
                         Ok(())
                     });
@@ -215,21 +228,21 @@ impl AudioSession {
                             AudioError::Timeout | AudioError::QueueEmpty | AudioError::QueueFull,
                         ) => {}
                         Err(error) => {
-                            if let Ok(mut stats) = worker_telemetry.lock() {
-                                stats.failures = stats.failures.saturating_add(1);
-                            }
+                            worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
                             worker_report(error.to_string());
                             worker_stop.store(true, Ordering::Release);
                             break;
                         }
                     }
                 }
+                worker_alive_flag.store(false, Ordering::Release);
             })
             .map_err(|error| error.to_string())?;
 
         Ok(Self {
             stream: Some(stream),
             stop,
+            worker_alive,
             join: Some(join),
             telemetry,
             input_device: input_name,
@@ -238,16 +251,7 @@ impl AudioSession {
     }
 
     pub fn snapshot(&self) -> AudioTelemetry {
-        let stats = self
-            .telemetry
-            .lock()
-            .map(|stats| WorkerTelemetry {
-                input_frames: stats.input_frames,
-                output_frames: stats.output_frames,
-                processing_micros: stats.processing_micros,
-                failures: stats.failures,
-            })
-            .unwrap_or_default();
+        let stats = &self.telemetry;
         let (underflow_samples, queue_overflows, latency_p95_micros, stream_state) = self
             .stream
             .as_ref()
@@ -263,19 +267,44 @@ impl AudioSession {
                 )
             })
             .unwrap_or_else(|| (0, 0, None, "Stopped".into()));
+        let worker_alive = self.worker_alive.load(Ordering::Acquire);
+        let state = self
+            .stream
+            .as_ref()
+            .map(|stream| map_stream_state(stream.status().lifecycle))
+            .map(|state| {
+                if !worker_alive && state == LifecycleState::Running {
+                    LifecycleState::Failed
+                } else {
+                    state
+                }
+            })
+            .unwrap_or(LifecycleState::Stopped);
         AudioTelemetry {
-            active: self.stream.is_some(),
+            active: self.stream.is_some() && worker_alive,
+            state,
             input_device: Some(self.input_device.clone()),
             output_device: Some(self.output_device.clone()),
-            input_frames: stats.input_frames,
-            output_frames: stats.output_frames,
-            processing_micros: stats.processing_micros,
-            failures: stats.failures,
+            input_frames: stats.input_frames.load(Ordering::Relaxed),
+            output_frames: stats.output_frames.load(Ordering::Relaxed),
+            processing_micros: stats.processing_micros.load(Ordering::Relaxed),
+            failures: stats.failures.load(Ordering::Relaxed),
             underflow_samples,
             queue_overflows,
             latency_p95_micros,
             stream_state,
         }
+    }
+}
+
+fn map_stream_state(state: vocal_audio::StreamLifecycle) -> LifecycleState {
+    match state {
+        vocal_audio::StreamLifecycle::Created => LifecycleState::Created,
+        vocal_audio::StreamLifecycle::Starting => LifecycleState::Loading,
+        vocal_audio::StreamLifecycle::Running => LifecycleState::Running,
+        vocal_audio::StreamLifecycle::Stopping => LifecycleState::Stopping,
+        vocal_audio::StreamLifecycle::Stopped => LifecycleState::Stopped,
+        vocal_audio::StreamLifecycle::Failed => LifecycleState::Failed,
     }
 }
 

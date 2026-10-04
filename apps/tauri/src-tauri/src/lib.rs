@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod error;
 mod events;
+mod snapshot;
 mod state;
 
 use std::path::PathBuf;

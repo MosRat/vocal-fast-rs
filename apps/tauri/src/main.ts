@@ -41,6 +41,7 @@ interface AudioDeviceCatalog {
 
 interface AudioTelemetry {
   active: boolean;
+  state: Lifecycle;
   inputDevice: string | null;
   outputDevice: string | null;
   inputFrames: number;
@@ -61,6 +62,7 @@ interface ErrorReport {
 
 interface Snapshot {
   lifecycle: Lifecycle;
+  status: { session: Lifecycle; model: Lifecycle; engine: Lifecycle; audio: Lifecycle };
   config: GuiConfig;
   configRevision: number;
   model: {
@@ -80,6 +82,7 @@ interface Snapshot {
 
 interface BackendEvent {
   type: 'snapshot' | 'metrics' | 'error';
+  sequence: number;
   payload: Snapshot | Snapshot['metrics'] | ErrorReport;
 }
 
@@ -93,6 +96,7 @@ let channelConnected = false;
 let busy = false;
 let localError: ErrorReport | null = null;
 let refreshInFlight = false;
+let lastEventSequence = 0;
 
 const call = <T>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
 
@@ -262,6 +266,8 @@ function wireHandlers(): void {
 async function connect(): Promise<void> {
   const events = new Channel<BackendEvent>();
   events.onmessage = (event) => {
+    if (event.sequence <= lastEventSequence) return;
+    lastEventSequence = event.sequence;
     if (event.type === 'snapshot') {
       snapshot = event.payload as Snapshot;
       if (!snapshot.lastError) localError = null;

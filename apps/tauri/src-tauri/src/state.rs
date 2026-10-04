@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
-use vocal_engine::{BackendKind, EngineConfig, EngineStatus, InferenceEngine, create_engine};
-use vocal_model::{ModelLoader, RvcModelManifest};
+use vocal_engine::{BackendKind, EngineConfig, InferenceEngine, create_engine};
+use vocal_model::ModelLoader;
 use vocal_types::{AudioChunk, AudioFormat, LatencyMetrics, LifecycleState, ModelDescriptor};
 
 use crate::{
@@ -10,86 +9,12 @@ use crate::{
     config::{ConfigStore, GuiBackend, GuiConfig},
     error::{GuiError, GuiResult},
     events::{BackendEvent, ErrorReport, EventSink},
+    snapshot::{ModelSummary, UiStatus},
 };
 
+pub use crate::snapshot::{UiMetrics, UiSnapshot};
+
 const MAX_CONTROL_BLOCK_SAMPLES: usize = 1_048_576;
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelSummary {
-    pub id: String,
-    pub display_name: String,
-    pub architecture: String,
-    pub version: String,
-    pub sample_rate: u32,
-    pub feature_dims: usize,
-    pub uses_f0: bool,
-}
-
-impl From<&RvcModelManifest> for ModelSummary {
-    fn from(manifest: &RvcModelManifest) -> Self {
-        Self {
-            id: manifest.id.clone(),
-            display_name: manifest.display_name.clone(),
-            architecture: manifest.architecture.clone(),
-            version: manifest.version.clone(),
-            sample_rate: manifest.sample_rate,
-            feature_dims: manifest.feature_dims(),
-            uses_f0: manifest.uses_f0(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UiSnapshot {
-    pub lifecycle: LifecycleState,
-    pub config: GuiConfig,
-    pub config_revision: u64,
-    pub model: Option<ModelSummary>,
-    pub metrics: UiMetrics,
-    pub engine: Option<UiEngineStatus>,
-    pub last_error: Option<ErrorReport>,
-    pub audio: AudioTelemetry,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UiMetrics {
-    pub input_frames: u64,
-    pub processing_micros: u64,
-    pub output_frames: u64,
-}
-
-impl From<LatencyMetrics> for UiMetrics {
-    fn from(metrics: LatencyMetrics) -> Self {
-        Self {
-            input_frames: metrics.input_frames,
-            processing_micros: metrics.processing_micros,
-            output_frames: metrics.output_frames,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UiEngineStatus {
-    pub state: LifecycleState,
-    pub processed_chunks: u64,
-    pub failures: u64,
-    pub last_error: Option<String>,
-}
-
-impl From<EngineStatus> for UiEngineStatus {
-    fn from(status: EngineStatus) -> Self {
-        Self {
-            state: status.state,
-            processed_chunks: status.processed_chunks,
-            failures: status.failures,
-            last_error: status.last_error,
-        }
-    }
-}
 
 struct RuntimeState {
     lifecycle: LifecycleState,
@@ -161,7 +86,7 @@ impl AppState {
         let _operation = self.operation()?;
         self.events.attach(channel)?;
         let snapshot = self.snapshot()?;
-        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
         Ok(snapshot)
     }
 
@@ -219,7 +144,7 @@ impl AppState {
             }
             state.snapshot()
         };
-        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
         Ok(snapshot)
     }
 
@@ -229,7 +154,7 @@ impl AppState {
         let result = self.load_model_inner(path);
         match result {
             Ok(snapshot) => {
-                self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+                self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
                 Ok(snapshot)
             }
             Err(error) => {
@@ -270,7 +195,7 @@ impl AppState {
             state.last_error = None;
             state.snapshot()
         };
-        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
         Ok(snapshot)
     }
 
@@ -373,7 +298,7 @@ impl AppState {
             state.last_error = None;
             state.snapshot()
         };
-        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
         Ok(snapshot)
     }
 
@@ -406,8 +331,8 @@ impl AppState {
             state.lifecycle = LifecycleState::Stopped;
             state.snapshot()
         };
-        self.events.send(BackendEvent::Snapshot(stopping))?;
-        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        self.events.send(BackendEvent::snapshot(stopping))?;
+        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
         Ok(snapshot)
     }
 
@@ -462,8 +387,8 @@ impl AppState {
             .unwrap_or_default();
         let snapshot = state.snapshot();
         drop(state);
-        self.events.send(BackendEvent::Metrics(snapshot.metrics))?;
-        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        self.events.send(BackendEvent::metrics(snapshot.metrics))?;
+        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
         Ok(snapshot)
     }
 
@@ -501,7 +426,7 @@ impl AppState {
             }
             state.snapshot()
         };
-        self.events.send(BackendEvent::Snapshot(snapshot.clone()))?;
+        self.events.send(BackendEvent::snapshot(snapshot.clone()))?;
         Ok(snapshot)
     }
 
@@ -523,7 +448,7 @@ impl AppState {
             state.lifecycle = next;
             state.snapshot()
         };
-        self.events.send(BackendEvent::Snapshot(snapshot))?;
+        self.events.send(BackendEvent::snapshot(snapshot))?;
         Ok(())
     }
 
@@ -537,9 +462,9 @@ impl AppState {
         };
         let _ = self
             .events
-            .send(BackendEvent::Error(ErrorReport::from_error(&error)));
+            .send(BackendEvent::error(ErrorReport::from_error(&error)));
         if let Some(snapshot) = snapshot {
-            let _ = self.events.send(BackendEvent::Snapshot(snapshot));
+            let _ = self.events.send(BackendEvent::snapshot(snapshot));
         }
     }
 
@@ -558,9 +483,9 @@ impl AppState {
         };
         let _ = self
             .events
-            .send(BackendEvent::Error(ErrorReport::from_error(error)));
+            .send(BackendEvent::error(ErrorReport::from_error(error)));
         if let Some(snapshot) = snapshot {
-            let _ = self.events.send(BackendEvent::Snapshot(snapshot));
+            let _ = self.events.send(BackendEvent::snapshot(snapshot));
         }
     }
 
@@ -601,7 +526,7 @@ impl RuntimeState {
             .audio
             .as_ref()
             .map(AudioSession::snapshot)
-            .unwrap_or_default();
+            .unwrap_or_else(AudioTelemetry::stopped);
         let metrics = if audio.active {
             UiMetrics {
                 input_frames: audio.input_frames,
@@ -613,6 +538,20 @@ impl RuntimeState {
         };
         UiSnapshot {
             lifecycle: self.lifecycle,
+            status: UiStatus {
+                session: self.lifecycle,
+                model: if self.model.is_some() {
+                    LifecycleState::Ready
+                } else {
+                    LifecycleState::Created
+                },
+                engine: self
+                    .engine
+                    .as_ref()
+                    .map(|engine| engine.status().state)
+                    .unwrap_or(LifecycleState::Created),
+                audio: audio.state,
+            },
             config: self.config.clone(),
             config_revision: self.config_revision,
             model: self.model.clone(),
@@ -660,5 +599,16 @@ mod tests {
         assert_eq!(snapshot.config_revision, 1);
         assert!(snapshot.model.is_none());
         assert!(snapshot.config.model_path.is_none());
+    }
+
+    #[test]
+    fn snapshot_exposes_independent_subsystem_states() {
+        let state = AppState::new(GuiConfig::default());
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.status.session, LifecycleState::Created);
+        assert_eq!(snapshot.status.model, LifecycleState::Created);
+        assert_eq!(snapshot.status.engine, LifecycleState::Created);
+        assert_eq!(snapshot.status.audio, LifecycleState::Stopped);
+        assert_eq!(snapshot.audio.state, LifecycleState::Stopped);
     }
 }

@@ -7,7 +7,7 @@
 use std::f32::consts::PI;
 use std::time::Instant;
 
-use crate::EngineError;
+use crate::{EngineError, config::validate_conversion};
 use vocal_types::ConversionConfig;
 
 pub const HUBERT_SAMPLE_RATE: u32 = 16_000;
@@ -223,15 +223,7 @@ impl RvcPipeline {
         index: Option<Box<dyn FeatureIndex>>,
         synthesizer: Box<dyn Synthesizer>,
     ) -> Result<Self, EngineError> {
-        if config.target_sample_rate == 0
-            || config.output_sample_rate == 0
-            || config.feature_hop_samples == 0
-            || config.feature_dims == 0
-        {
-            return Err(EngineError::InvalidInput(
-                "invalid RVC pipeline configuration".into(),
-            ));
-        }
+        config.validate()?;
         Ok(Self {
             config,
             encoder,
@@ -255,6 +247,8 @@ impl RvcPipeline {
         input_sample_rate: u32,
         conversion: ConversionConfig,
     ) -> Result<PipelineOutput, EngineError> {
+        self.config.validate()?;
+        validate_conversion(conversion)?;
         if input.is_empty()
             || input_sample_rate == 0
             || input.iter().any(|sample| !sample.is_finite())

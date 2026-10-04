@@ -2,32 +2,19 @@
 //! the portable baseline so the SDK can be linked only on RTX build machines.
 
 use std::time::Instant;
-use thiserror::Error;
 use vocal_types::{AudioChunk, ConversionConfig, LatencyMetrics, ModelDescriptor};
+
+mod config;
+mod error;
+mod logging;
+mod state;
 
 pub mod pipeline;
 pub mod tensorrt;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendKind {
-    Passthrough,
-    RvcCpuPipeline,
-    TensorRtRtx,
-}
-
-#[derive(Clone, Debug)]
-pub struct EngineConfig {
-    pub backend: BackendKind,
-    pub model: ModelDescriptor,
-}
-
-#[derive(Debug, Error)]
-pub enum EngineError {
-    #[error("engine backend is unavailable: {0}")]
-    BackendUnavailable(String),
-    #[error("invalid audio chunk: {0}")]
-    InvalidInput(String),
-}
+pub use config::{BackendKind, EngineConfig, validate_conversion};
+pub use error::EngineError;
+pub use state::{EngineLifecycle, EngineStatus};
 
 pub trait InferenceEngine: Send {
     fn process(
@@ -36,12 +23,22 @@ pub trait InferenceEngine: Send {
         config: ConversionConfig,
     ) -> Result<AudioChunk, EngineError>;
     fn metrics(&self) -> LatencyMetrics;
+    fn status(&self) -> EngineStatus {
+        EngineStatus::default()
+    }
 }
 
 pub fn create_engine(config: EngineConfig) -> Result<Box<dyn InferenceEngine>, EngineError> {
+    config.validate()?;
     match config.backend {
-        BackendKind::Passthrough => Ok(Box::new(PassthroughEngine::new(config.model))),
-        BackendKind::RvcCpuPipeline => Ok(Box::new(PipelineEngine::new(config.model)?)),
+        BackendKind::Passthrough => {
+            logging::created("passthrough");
+            Ok(Box::new(PassthroughEngine::new(config.model)))
+        }
+        BackendKind::RvcCpuPipeline => {
+            logging::created("rvc-cpu");
+            Ok(Box::new(PipelineEngine::new(config.model)?))
+        }
         BackendKind::TensorRtRtx => Err(EngineError::BackendUnavailable(
             "TensorRT RTX adapter is a build-time integration point; enable the SDK adapter on an RTX host".into(),
         )),
@@ -53,6 +50,7 @@ pub struct PipelineEngine {
     metrics: LatencyMetrics,
     history: Vec<f32>,
     last_timings: pipeline::PipelineTimings,
+    status: EngineStatus,
 }
 
 impl PipelineEngine {
@@ -77,6 +75,10 @@ impl PipelineEngine {
             metrics: LatencyMetrics::default(),
             history: Vec::new(),
             last_timings: pipeline::PipelineTimings::default(),
+            status: EngineStatus {
+                state: EngineLifecycle::Ready,
+                ..Default::default()
+            },
         })
     }
 
@@ -86,6 +88,10 @@ impl PipelineEngine {
             metrics: LatencyMetrics::default(),
             history: Vec::new(),
             last_timings: pipeline::PipelineTimings::default(),
+            status: EngineStatus {
+                state: EngineLifecycle::Ready,
+                ..Default::default()
+            },
         }
     }
 
@@ -104,15 +110,17 @@ impl InferenceEngine for PipelineEngine {
         input: &AudioChunk,
         config: ConversionConfig,
     ) -> Result<AudioChunk, EngineError> {
-        if input.format.channels == 0
-            || !input
-                .samples
-                .len()
-                .is_multiple_of(input.format.channels as usize)
+        self.status
+            .begin()
+            .map_err(|error| EngineError::InvalidState(error.into()))?;
+        if let Err(error) = input
+            .validate()
+            .map_err(|error| EngineError::InvalidInput(error.to_string()))
+            .and_then(|_| validate_conversion(config))
         {
-            return Err(EngineError::InvalidInput(
-                "interleaved audio does not match channel count".into(),
-            ));
+            self.status.failure(error.to_string());
+            logging::failed(&error);
+            return Err(error);
         }
         let started = Instant::now();
         let channels = input.format.channels as usize;
@@ -130,9 +138,17 @@ impl InferenceEngine for PipelineEngine {
             self.history.resize(context, 0.0);
         }
         self.history.extend_from_slice(&mono);
-        let output = self
+        let output = match self
             .pipeline
-            .run(&self.history, input.format.sample_rate, config)?;
+            .run(&self.history, input.format.sample_rate, config)
+        {
+            Ok(output) => output,
+            Err(error) => {
+                self.status.failure(error.to_string());
+                logging::failed(&error);
+                return Err(error);
+            }
+        };
         self.last_timings = output.timings;
         let output_mono = pipeline::resample_linear(
             &output.samples,
@@ -157,6 +173,7 @@ impl InferenceEngine for PipelineEngine {
         self.metrics.input_frames += input.frames() as u64;
         self.metrics.output_frames += output_frames as u64;
         self.metrics.processing_micros += started.elapsed().as_micros() as u64;
+        self.status.success();
         Ok(AudioChunk {
             format: input.format,
             samples,
@@ -167,6 +184,10 @@ impl InferenceEngine for PipelineEngine {
     fn metrics(&self) -> LatencyMetrics {
         self.metrics
     }
+
+    fn status(&self) -> EngineStatus {
+        self.status.clone()
+    }
 }
 
 pub fn create_pipeline_engine(pipeline: pipeline::RvcPipeline) -> Box<dyn InferenceEngine> {
@@ -175,12 +196,17 @@ pub fn create_pipeline_engine(pipeline: pipeline::RvcPipeline) -> Box<dyn Infere
 
 struct PassthroughEngine {
     metrics: LatencyMetrics,
+    status: EngineStatus,
 }
 
 impl PassthroughEngine {
     fn new(_model: ModelDescriptor) -> Self {
         Self {
             metrics: LatencyMetrics::default(),
+            status: EngineStatus {
+                state: EngineLifecycle::Ready,
+                ..Default::default()
+            },
         }
     }
 }
@@ -191,10 +217,17 @@ impl InferenceEngine for PassthroughEngine {
         input: &AudioChunk,
         _config: ConversionConfig,
     ) -> Result<AudioChunk, EngineError> {
-        if input.format.channels == 0 {
-            return Err(EngineError::InvalidInput(
-                "channel count must be non-zero".into(),
-            ));
+        self.status
+            .begin()
+            .map_err(|error| EngineError::InvalidState(error.into()))?;
+        if let Err(error) = input
+            .validate()
+            .map_err(|error| EngineError::InvalidInput(error.to_string()))
+            .and_then(|_| validate_conversion(_config))
+        {
+            self.status.failure(error.to_string());
+            logging::failed(&error);
+            return Err(error);
         }
         let start = Instant::now();
         let mut output = input.clone();
@@ -202,11 +235,16 @@ impl InferenceEngine for PassthroughEngine {
         self.metrics.input_frames += input.frames() as u64;
         self.metrics.output_frames += output.frames() as u64;
         self.metrics.processing_micros += start.elapsed().as_micros() as u64;
+        self.status.success();
         Ok(output)
     }
 
     fn metrics(&self) -> LatencyMetrics {
         self.metrics
+    }
+
+    fn status(&self) -> EngineStatus {
+        self.status.clone()
     }
 }
 

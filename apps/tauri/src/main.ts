@@ -12,6 +12,7 @@ interface ConversionConfig {
 }
 
 interface GuiConfig {
+  schemaVersion: number;
   inputFormat: { sampleRate: number; channels: number };
   outputFormat: { sampleRate: number; channels: number };
   conversion: ConversionConfig;
@@ -106,6 +107,7 @@ function escapeHtml(value: string): string {
 
 function defaultConfig(): GuiConfig {
   return {
+    schemaVersion: 1,
     inputFormat: { sampleRate: 48000, channels: 1 },
     outputFormat: { sampleRate: 48000, channels: 1 },
     conversion: { pitchSemitones: 0, indexRatio: 0, protect: 0.33, rmsMixRate: 1 },

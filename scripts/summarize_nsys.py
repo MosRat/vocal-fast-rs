@@ -147,7 +147,7 @@ def show_cuda_event_stage_pairs() -> None:
     groups = []
     for event_id, count, first in c.execute(
         "select eventId, count(*), min(timestamp) "
-        "from CUPTI_ACTIVITY_KIND_CUDA_EVENT group by eventId order by min(timestamp)"
+        "from CUPTI_ACTIVITY_KIND_CUDA_EVENT group by eventId order by eventId"
     ):
         if count < 4:
             continue
@@ -159,14 +159,17 @@ def show_cuda_event_stage_pairs() -> None:
                 [event_id],
             )
         ]
-        groups.append(timestamps)
+        groups.append((event_id, timestamps))
     if len(groups) < 8:
         return
     labels = ("hubert", "rmvpe", "frontend", "synth")
     print("-- CUDA event stage summary (device time, last steady ranges, ms)")
     for index, label in enumerate(labels):
-        starts = groups[index * 2]
-        ends = groups[index * 2 + 1]
+        # CUDA streams can overlap, so timestamp order is not event creation
+        # order. The pipeline creates its reusable start/end events in the
+        # HuBERT/RMVPE/frontend/Synth order; preserve eventId order here.
+        starts = groups[index * 2][1]
+        ends = groups[index * 2 + 1][1]
         values = [ns(end - start) for start, end in zip(starts, ends)]
         values = values[-args.steady :]
         if values:

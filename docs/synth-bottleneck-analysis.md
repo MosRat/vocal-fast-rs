@@ -195,3 +195,19 @@ was `30.47 ms` in that capture. Repeated application profiles ranged from
 `48.8` to `54.5 ms` event total, overlapping the FP32-decoder stage-1 plan once
 GPU clock and tactic variance are included. Keep decoder FP16 opt-in; it is a
 useful RMVPE-only saving, but it is not yet a proven end-to-end speed win.
+
+### Parallel acoustic stream experiment
+
+`VOCAL_TRT_PARALLEL_ACOUSTIC=1` provides an opt-in two-stream path. After the
+waveform upload, HuBERT runs on one CUDA stream and RMVPE/cuFFT on another;
+frontend and Synth wait until both acoustic streams finish. It is restricted
+to TensorRT-RTX native graph mode and disabled by default.
+
+On the RTX 3060 44960 profile, a fresh Nsight capture measured median device
+durations of HuBERT `5.49 ms`, RMVPE `12.08 ms`, frontend `0.118 ms`, and Synth
+`31.26 ms`. The critical path is about `43.5 ms`, slightly slower than the
+serial stage-1 accumulation capture (`42.4 ms` median), because the two
+convolution-heavy acoustic graphs contend for memory bandwidth and reduce Synth
+throughput. Parallel output matched the serial path bit-for-bit for audio,
+HuBERT features, RVC features, pitch and coarse pitch. Keep the switch for GPUs
+with more headroom, but do not enable it on RTX 3060.

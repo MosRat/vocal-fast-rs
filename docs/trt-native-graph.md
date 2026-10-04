@@ -327,6 +327,10 @@ rtk powershell -NoProfile -File scripts/profile-trt-nsight.ps1 `
 `VOCAL_TRT_WARMUP` and `VOCAL_TRT_PIPELINE_ITERATIONS` override the defaults
 (10 and 100 for the profile command). Nsight Compute can then attach to the
 same executable with `ncu --set full` to inspect the kernels selected by each
+plan. `VOCAL_TRT_PARALLEL_ACOUSTIC=1` is an experimental native-graph mode
+that launches HuBERT and RMVPE/cuFFT on separate streams before the frontend;
+it is disabled by default because the two graphs can contend for memory
+bandwidth on smaller GPUs.
 plan. The TensorRT layer profiler remains an opt-in diagnostic
 (`VOCAL_TRT_LAYER_PROFILE=1`) and is not the primary profile path.
 

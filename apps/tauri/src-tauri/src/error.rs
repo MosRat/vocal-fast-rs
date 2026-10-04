@@ -25,8 +25,6 @@ pub enum GuiError {
     AudioDiscovery(String),
     #[error("I/O error at {path}: {message}")]
     Io { path: String, message: String },
-    #[error("channel error: {0}")]
-    Channel(String),
     #[error("invalid binary payload: {0}")]
     Binary(String),
     #[error("numeric value is out of range: {0}")]
@@ -47,7 +45,6 @@ impl GuiError {
             Self::Audio(_) => "audio_error",
             Self::AudioDiscovery(_) => "audio_discovery_error",
             Self::Io { .. } => "io_error",
-            Self::Channel(_) => "channel_error",
             Self::Binary(_) => "binary_error",
             Self::IntegerRange(_) => "integer_range",
             Self::Internal(_) => "internal_error",

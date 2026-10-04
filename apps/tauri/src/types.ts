@@ -1,6 +1,13 @@
 export type Lifecycle = 'created' | 'loading' | 'ready' | 'running' | 'stopping' | 'stopped' | 'failed';
 export type Backend = 'passthrough' | 'rvcCpu';
 export type ThemePreference = 'system' | 'light' | 'dark';
+export type WorkspaceRoute = 'studio' | 'audio' | 'tuning' | 'diagnostics';
+
+export const WORKSPACE_ROUTES: readonly WorkspaceRoute[] = ['studio', 'audio', 'tuning', 'diagnostics'];
+
+export function isWorkspaceRoute(value: string): value is WorkspaceRoute {
+  return WORKSPACE_ROUTES.includes(value as WorkspaceRoute);
+}
 
 export interface ConversionConfig {
   pitchSemitones: number;

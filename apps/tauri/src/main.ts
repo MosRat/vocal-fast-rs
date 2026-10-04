@@ -1,6 +1,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { setTheme as setNativeTheme } from '@tauri-apps/api/app';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import './style.css';
 import './effects.css';
 import { icon, type IconName } from './icons';
@@ -15,6 +16,8 @@ import {
   type Lifecycle,
   type Snapshot,
   type ThemePreference,
+  type WorkspaceRoute,
+  isWorkspaceRoute,
 } from './types';
 
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -30,9 +33,11 @@ let lastEventSequence = 0;
 let resyncInFlight = false;
 let themePreference: ThemePreference = 'system';
 let windowMaximized = false;
-let activeSection = 'studio';
+type ViewRoute = WorkspaceRoute | 'settings';
+let activeSection: ViewRoute = routeFromLocation();
 let closeInFlight = false;
 let closeHookInstalled = false;
+let windowLabel = 'main';
 let draftConfig: GuiConfig | null = null;
 let renderTimer: number | undefined;
 const lastActionAt = new Map<string, number>();
@@ -41,6 +46,60 @@ const systemTheme = window.matchMedia?.('(prefers-color-scheme: dark)');
 const call = <T>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
 function runningInTauri(): boolean {
   return '__TAURI_INTERNALS__' in window;
+}
+
+function routeFromLocation(): ViewRoute {
+  const route = window.location.hash.replace(/^#\/?/, '');
+  return route === 'settings' || isWorkspaceRoute(route) ? route : 'studio';
+}
+
+function isPrimaryWindow(): boolean {
+  return !runningInTauri() || windowLabel === 'main';
+}
+
+function navigate(route: ViewRoute): void {
+  activeSection = route;
+  const nextHash = `#/${route}`;
+  if (window.location.hash !== nextHash) window.history.pushState({ route }, '', nextHash);
+  render();
+  requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+}
+
+type AuxiliaryWindow = 'settings' | 'diagnostics';
+
+async function openAuxiliaryWindow(kind: AuxiliaryWindow): Promise<void> {
+  const label = `vocal-${kind}`;
+  if (!runningInTauri()) {
+    window.open(`/#/${kind}`, `${label}-preview`, 'noopener,noreferrer');
+    return;
+  }
+  try {
+    const existing = await WebviewWindow.getByLabel(label);
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    const child = new WebviewWindow(label, {
+      url: `/#/${kind}`,
+      title: kind === 'settings' ? 'vocal-fast · Settings' : 'vocal-fast · Diagnostics',
+      width: kind === 'settings' ? 760 : 980,
+      height: kind === 'settings' ? 680 : 720,
+      minWidth: kind === 'settings' ? 560 : 760,
+      minHeight: 520,
+      resizable: true,
+      decorations: false,
+      shadow: true,
+      center: true,
+    });
+    await child.once('tauri://error', (event) => {
+      localError = { code: 'window_error', message: String(event.payload ?? 'Unable to open window'), recoverable: true };
+      render();
+    });
+  } catch (error) {
+    localError = normalizeError(error);
+    render();
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -100,7 +159,31 @@ function scheduleRender(delay = 70): void {
 }
 
 function renderTitlebar(): string {
-  return `<header class="titlebar" data-tauri-drag-region><div class="titlebar-brand"><div class="app-glyph">${icon('waveform', 17)}</div><span>vocal-fast</span><span class="titlebar-divider"></span><span class="titlebar-context">Studio</span></div><div class="titlebar-actions"><button id="minimizeWindow" class="window-button" title="Minimize">${icon('minimize', 15)}</button><button id="maximizeWindow" class="window-button" title="Maximize">${icon(windowMaximized ? 'restore' : 'maximize', 14)}</button><button id="closeWindow" class="window-button close" title="Close">${icon('close', 15)}</button></div></header>`;
+  return `<header class="titlebar" data-tauri-drag-region><div class="titlebar-brand"><div class="app-glyph">${icon('waveform', 17)}</div><span>vocal-fast</span><span class="titlebar-divider"></span><span class="titlebar-context">${activeSection === 'settings' ? 'Settings' : activeSection === 'diagnostics' ? 'Diagnostics' : 'Studio'}</span></div><div class="titlebar-tools"><button id="openDiagnostics" class="titlebar-tool" title="Open diagnostics window">${icon('chart', 15)}<span>Diagnostics</span></button><button id="openSettings" class="titlebar-tool" title="Open settings window">${icon('settings', 15)}<span>Settings</span></button></div><div class="titlebar-actions"><button id="minimizeWindow" class="window-button" title="Minimize">${icon('minimize', 15)}</button><button id="maximizeWindow" class="window-button" title="Maximize">${icon(windowMaximized ? 'restore' : 'maximize', 14)}</button><button id="closeWindow" class="window-button close" title="Close">${icon('close', 15)}</button></div></header>`;
+}
+
+function renderTabs(): string {
+  const tabs: ReadonlyArray<readonly [WorkspaceRoute, string, IconName]> = [
+    ['studio', 'Studio', 'waveform'],
+    ['audio', 'Audio routing', 'speaker'],
+    ['tuning', 'Voice controls', 'sliders'],
+    ['diagnostics', 'Diagnostics', 'chart'],
+  ];
+  return `<div class="workspace-tabs" role="tablist" aria-label="Workspace views">${tabs.map(([route, label, iconName]) => `<button id="${route}-tab" class="workspace-tab ${activeSection === route ? 'active' : ''}" data-route="${route}" role="tab" aria-selected="${activeSection === route}" aria-controls="${route}-view">${icon(iconName, 15)}<span>${label}</span></button>`).join('')}</div>`;
+}
+
+function renderSettingsPanel(config: GuiConfig): string {
+  return `<section class="settings-panel panel ${activeSection === 'settings' ? 'is-active' : ''}" aria-labelledby="settings-title"><div class="settings-heading"><div class="kicker">APPLICATION SETTINGS</div><h2 id="settings-title">Personalize your workspace</h2><p>These controls apply to the current desktop session. Audio state remains shared with the Studio window.</p></div><div class="settings-grid"><article class="settings-card"><div class="settings-card-icon">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 18)}</div><div><h3>Appearance</h3><p>${themeLabel(themePreference)} with Fluent surfaces and motion-aware effects.</p></div><button id="settingsTheme" class="button secondary">Change theme</button></article><article class="settings-card"><div class="settings-card-icon">${icon('waveform', 18)}</div><div><h3>Audio defaults</h3><p>${config.inputFormat.sampleRate.toLocaleString()} Hz · ${config.inputFormat.channels} channel · ${config.blockFrames} frame blocks</p></div><button id="settingsStudio" class="button secondary">Back to Studio</button></article><article class="settings-card"><div class="settings-card-icon">${icon('keyboard', 18)}</div><div><h3>Keyboard</h3><p><kbd>Space</kbd> starts or stops a session. <kbd>Ctrl R</kbd> refreshes the snapshot.</p></div></article></div></section>`;
+}
+
+function routeCopy(route: ViewRoute): { title: string; description: string } {
+  return {
+    studio: { title: 'Make every take sound like you.', description: 'Configure your voice chain, start the stream, and keep an eye on the audio path.' },
+    audio: { title: 'Route sound with confidence.', description: 'Choose the capture and render endpoints that keep your live path stable.' },
+    tuning: { title: 'Shape the voice in real time.', description: 'Tune the conversion controls while keeping the stream safe to adjust.' },
+    diagnostics: { title: 'See every edge of the audio path.', description: 'Track processing age, queue health, and device activity as the session runs.' },
+    settings: { title: 'Make the workspace yours.', description: 'Manage appearance, defaults, and the windows that stay close to your session.' },
+  }[route];
 }
 
 function renderSidebar(): string {
@@ -137,6 +220,31 @@ function render(): void {
     <article class="panel config-panel" data-section-target="studio">${panelHeader('ENGINE & STREAM', 'Session configuration', '<span class="panel-badge subtle">Optimistic sync</span>')}<label class="field-label">Backend<select id="backend" ${running ? 'disabled' : ''}><option value="passthrough" ${config.backend === 'passthrough' ? 'selected' : ''}>Passthrough</option><option value="rvcCpu" ${config.backend === 'rvcCpu' ? 'selected' : ''}>RVC CPU</option></select></label><div class="form-grid"><label class="field-label">Sample rate<input id="inputRate" type="number" min="1" value="${config.inputFormat.sampleRate}" ${running ? 'disabled' : ''}/></label><label class="field-label">Channels<input id="channels" type="number" min="1" max="8" value="${config.inputFormat.channels}" ${running ? 'disabled' : ''}/></label><label class="field-label">Block frames<input id="blockFrames" type="number" min="1" max="8192" value="${config.blockFrames}" ${running ? 'disabled' : ''}/></label><label class="field-label">Queue depth<input id="queueBlocks" type="number" min="1" max="64" value="${config.queueBlocks}" ${running ? 'disabled' : ''}/></label></div>${button('save', 'Save configuration', 'check', 'primary full', busy || running)}</article>
     <article class="panel telemetry-panel span-2" data-section-target="diagnostics">${panelHeader('RUNTIME HEALTH', 'Audio telemetry', `<span class="stream-state ${audio?.active ? 'active' : ''}"><span class="status-dot"></span>${audio?.active ? 'Streaming' : 'Idle'}</span>`)}<div class="metrics-grid">${metric('Input frames', formatNumber(current?.metrics.inputFrames ?? 0), 'waveform')}${metric('Output frames', formatNumber(current?.metrics.outputFrames ?? 0), 'speaker')}${metric('Processing', current ? `${(current.metrics.processingMicros / 1000).toFixed(2)} ms` : '0.00 ms', 'cpu')}${metric('p95 audio age', latency, 'chart', audio?.latencyP95Micros ? 'positive' : '')}${metric('Underflows', formatNumber(audio?.underflowSamples ?? 0), 'alert', audio?.underflowSamples ? 'critical' : '')}${metric('Queue drops', formatNumber(audio?.queueOverflows ?? 0), 'database', audio?.queueOverflows ? 'critical' : '')}</div><div class="telemetry-footer"><span>${escapeHtml(audio?.streamState ?? 'Stopped')} · ${escapeHtml(inputName ?? 'default input')} → ${escapeHtml(outputName ?? 'default output')}</span><span>Worker failures: ${audio?.failures ?? current?.engine?.failures ?? 0}</span></div></article></section>
     ${report ? `<section class="error-banner"><div class="error-icon">${icon('alert', 18)}</div><div><strong>${escapeHtml(report.code)}</strong><span>${escapeHtml(report.message)}</span></div>${report.recoverable ? button('clearError', 'Dismiss', 'close', 'ghost') : ''}</section>` : ''}<footer class="app-footer"><span>Audio stays in the Rust worker; this surface receives snapshots and metrics.</span><span>${icon('keyboard', 13)} <kbd>Space</kbd> session · <kbd>Ctrl R</kbd> refresh</span></footer></main></div>`;
+  const content = appRoot.querySelector<HTMLElement>('main.content');
+  if (content) {
+    content.classList.toggle('settings-route', activeSection === 'settings');
+    const copy = routeCopy(activeSection);
+    const pageTitle = content.querySelector<HTMLElement>('.page-heading h1');
+    const pageDescription = content.querySelector<HTMLElement>('.page-heading p');
+    if (pageTitle) pageTitle.textContent = copy.title;
+    if (pageDescription) pageDescription.textContent = copy.description;
+    const heading = content.querySelector('.page-heading');
+    heading?.insertAdjacentHTML('afterend', `${renderTabs()}${renderSettingsPanel(config)}`);
+    const workspace = content.querySelector<HTMLElement>('.workspace-grid');
+    workspace?.classList.add(`route-${activeSection}`);
+    const seenTargets = new Set<string>();
+    content.querySelectorAll<HTMLElement>('[data-section-target]').forEach((panel) => {
+      const target = panel.dataset.sectionTarget;
+      if (target && !seenTargets.has(target)) {
+        panel.id = `${target}-view`;
+        seenTargets.add(target);
+      }
+      panel.classList.add('route-panel');
+      panel.setAttribute('role', 'tabpanel');
+      if (target) panel.setAttribute('aria-labelledby', `${target}-tab`);
+      panel.classList.toggle('is-active', target === activeSection);
+    });
+  }
   wireHandlers();
 }
 
@@ -275,21 +383,27 @@ function wireHandlers(): void {
   );
   document.querySelectorAll<HTMLButtonElement>('[data-section]').forEach((item) =>
     item.addEventListener('click', () => {
-      activeSection = item.dataset.section ?? 'studio';
-      render();
-      requestAnimationFrame(() =>
-        document
-          .querySelector(`[data-section-target="${activeSection}"]`)
-          ?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
-      );
+      const route = item.dataset.section;
+      if (route && isWorkspaceRoute(route)) navigate(route);
     }),
   );
-  byId<HTMLButtonElement>('themeButton')?.addEventListener('click', () => {
+  document.querySelectorAll<HTMLButtonElement>('[data-route]').forEach((item) =>
+    item.addEventListener('click', () => {
+      const route = item.dataset.route;
+      if (route && isWorkspaceRoute(route)) navigate(route);
+    }),
+  );
+  const cycleTheme = () => {
     themePreference = themePreference === 'system' ? 'dark' : themePreference === 'dark' ? 'light' : 'system';
     applyTheme();
     void setNativeTheme(themePreference === 'system' ? null : themePreference).catch(() => undefined);
     render();
-  });
+  };
+  byId<HTMLButtonElement>('themeButton')?.addEventListener('click', cycleTheme);
+  byId<HTMLButtonElement>('settingsTheme')?.addEventListener('click', cycleTheme);
+  byId<HTMLButtonElement>('settingsStudio')?.addEventListener('click', () => navigate('studio'));
+  byId<HTMLButtonElement>('openDiagnostics')?.addEventListener('click', () => void openAuxiliaryWindow('diagnostics'));
+  byId<HTMLButtonElement>('openSettings')?.addEventListener('click', () => void openAuxiliaryWindow('settings'));
   byId<HTMLButtonElement>('minimizeWindow')?.addEventListener('click', () => void windowCommand('minimize'));
   byId<HTMLButtonElement>('maximizeWindow')?.addEventListener('click', () => void windowCommand('maximize'));
   byId<HTMLButtonElement>('closeWindow')?.addEventListener('click', () => void windowCommand('close'));
@@ -311,7 +425,12 @@ async function windowCommand(command: 'minimize' | 'maximize' | 'close'): Promis
 async function syncWindowState(): Promise<void> {
   try {
     const current = getCurrentWindow();
+    windowLabel = current.label;
     windowMaximized = await current.isMaximized();
+    if (!isPrimaryWindow()) {
+      render();
+      return;
+    }
     if (!closeHookInstalled) {
       closeHookInstalled = true;
       await current.onCloseRequested(async (event) => {
@@ -377,6 +496,15 @@ async function resyncSnapshot(): Promise<void> {
     resyncInFlight = false;
   }
 }
+
+window.addEventListener('hashchange', () => {
+  activeSection = routeFromLocation();
+  render();
+});
+window.addEventListener('popstate', () => {
+  activeSection = routeFromLocation();
+  render();
+});
 
 window.addEventListener('keydown', (event) => {
   const target = event.target as HTMLElement | null;

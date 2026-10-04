@@ -64,44 +64,55 @@ impl ErrorReport {
         Self {
             code: error.code().into(),
             message: error.to_string(),
-            recoverable: !matches!(error, GuiError::Internal(_) | GuiError::Channel(_)),
+            recoverable: !matches!(error, GuiError::Internal(_)),
         }
     }
 }
 
 #[derive(Default)]
 pub struct EventSink {
-    channel: std::sync::Mutex<Option<Channel<BackendEvent>>>,
+    channels: std::sync::Mutex<Vec<(u64, Channel<BackendEvent>)>>,
+    subscriber_id: AtomicU64,
     sequence: AtomicU64,
 }
 
 impl EventSink {
     pub fn attach(&self, channel: Channel<BackendEvent>) -> GuiResult<()> {
-        let mut current = self
-            .channel
+        let mut channels = self
+            .channels
             .lock()
             .map_err(|_| GuiError::Internal("event channel lock poisoned".into()))?;
-        *current = Some(channel);
+        let id = self.subscriber_id.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        channels.push((id, channel));
         Ok(())
     }
 
     pub fn send(&self, event: BackendEvent) -> GuiResult<()> {
-        let channel = self
-            .channel
+        let channels = self
+            .channels
             .lock()
             .map_err(|_| GuiError::Internal("event channel lock poisoned".into()))?
             .clone();
-        if let Some(channel) = channel {
-            let sequence = self.next_sequence();
-            if let Err(error) = channel.send(event.with_sequence(sequence)) {
-                // A closed webview channel must not poison future reconnects.
-                // Clear it only after the send fails; a new `subscribe` call
-                // can then install a fresh channel without restarting audio.
-                if let Ok(mut current) = self.channel.lock() {
-                    *current = None;
-                }
-                return Err(GuiError::Channel(error.to_string()));
+        if channels.is_empty() {
+            return Ok(());
+        }
+
+        let sequence = self.next_sequence();
+        let event = event.with_sequence(sequence);
+        let mut failed = Vec::new();
+        for (id, channel) in channels {
+            if let Err(error) = channel.send(event.clone()) {
+                tracing::debug!(target: "vocal.gui", subscriber = id, error = %error, "removing closed event channel");
+                failed.push(id);
             }
+        }
+
+        if !failed.is_empty() {
+            let mut current = self
+                .channels
+                .lock()
+                .map_err(|_| GuiError::Internal("event channel lock poisoned".into()))?;
+            current.retain(|(id, _)| !failed.contains(id));
         }
         Ok(())
     }

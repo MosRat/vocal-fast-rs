@@ -21,7 +21,7 @@
         "decorations": false
       }
     ],
-    "security": { "csp": null }
+    "security": { "csp": null, "capabilities": ["default"] }
   },
   "bundle": { "active": false }
 }

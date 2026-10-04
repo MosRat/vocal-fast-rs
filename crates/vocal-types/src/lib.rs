@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+mod config;
+mod error;
+mod state;
+
+pub use config::{AudioProcessingConfig, ConversionConfig};
+pub use error::TypesError;
+pub use state::{LifecycleState, ProcessingStatus};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AudioFormat {
     pub sample_rate: u32,
@@ -25,6 +33,24 @@ impl AudioFormat {
     pub const fn frame_samples(self) -> usize {
         self.channels as usize
     }
+
+    pub fn validate(self) -> Result<(), TypesError> {
+        if self.sample_rate == 0 {
+            return Err(TypesError::InvalidAudioFormat {
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+                reason: "sample rate must be non-zero",
+            });
+        }
+        if self.channels == 0 {
+            return Err(TypesError::InvalidAudioFormat {
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+                reason: "channel count must be non-zero",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,28 +65,25 @@ impl AudioChunk {
     pub fn frames(&self) -> usize {
         self.samples.len() / self.format.channels.max(1) as usize
     }
-}
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct ConversionConfig {
-    /// Pitch shift applied before coarse/continuous F0 generation.
-    pub pitch_semitones: f32,
-    /// Blend ratio for the optional added index, in [0, 1].
-    pub index_ratio: f32,
-    /// Unvoiced feature protection ratio, in [0, 1].
-    pub protect: f32,
-    /// Output RMS mix ratio; 1 keeps synthesizer loudness, 0 follows input.
-    pub rms_mix_rate: f32,
-}
-
-impl Default for ConversionConfig {
-    fn default() -> Self {
-        Self {
-            pitch_semitones: 0.0,
-            index_ratio: 0.0,
-            protect: 0.33,
-            rms_mix_rate: 1.0,
+    pub fn validate(&self) -> Result<(), TypesError> {
+        self.format.validate()?;
+        if self.samples.is_empty() {
+            return Err(TypesError::InvalidChunk("audio chunk is empty"));
         }
+        if !self
+            .samples
+            .len()
+            .is_multiple_of(self.format.channels as usize)
+        {
+            return Err(TypesError::InvalidChunk(
+                "interleaved samples do not match channel count",
+            ));
+        }
+        if self.samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(TypesError::InvalidChunk("audio samples must be finite"));
+        }
+        Ok(())
     }
 }
 
@@ -71,6 +94,21 @@ pub struct ModelDescriptor {
     pub architecture: String,
     pub sample_rate: u32,
     pub version: String,
+}
+
+impl ModelDescriptor {
+    pub fn validate(&self) -> Result<(), TypesError> {
+        if self.id.trim().is_empty() {
+            return Err(TypesError::InvalidDescriptor("model id is empty"));
+        }
+        if self.display_name.trim().is_empty() {
+            return Err(TypesError::InvalidDescriptor("model display name is empty"));
+        }
+        if self.sample_rate == 0 {
+            return Err(TypesError::InvalidDescriptor("model sample rate is zero"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]

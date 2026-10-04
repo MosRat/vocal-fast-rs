@@ -171,6 +171,19 @@ selection can move absolute timings between builds.  Combining hot residual
 FP16 with noise mask `0x2` measured 28.89 ms at 44960 with cosine `0.9995346`,
 so the noise mask should only be added when a steady replay proves a benefit.
 
+For a shorter 11200 callback, lowering only one operation family is a more
+conservative point.  The current fixture measured:
+
+| policy | median | relative L2 | cosine |
+| --- | ---: | ---: | ---: |
+| Conv1 only, stage `0x2` | 11.11 ms | 0.2348% | 0.9999975 |
+| Conv2 only, stage `0x2` | 10.14 ms | 0.2416% | 0.9999973 |
+| Conv1 + Conv2, stage `0x2` | 10.20 ms | 0.3017% | 0.9999958 |
+
+The Conv2-only setting is the current short-window candidate. These timings
+come from separate TensorRT builds and should be confirmed with a steady
+CUDA-event replay before selecting a deployment profile.
+
 `VOCAL_TRT_SYNTH_FP16_POST=1` is available for isolating the final projection.
 It casts the `conv_post` result to FP32 before tanh. On the native 44960 plan
 it measured `36.60 ms`, relative L2 `3.1618%`, and cosine `0.9995051` versus

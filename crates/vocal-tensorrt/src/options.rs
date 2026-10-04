@@ -169,7 +169,8 @@ pub struct NativeBuildOptions {
     #[serde(default)]
     pub synth_resblock_precision: PrecisionMode,
     /// Bit mask of upsample stages whose residual blocks use the selected
-    /// low precision. Bit 0 is the first (highest temporal resolution) stage.
+    /// low precision. Bit 0 is the first decoder stage; the last bit is the
+    /// highest temporal-resolution stage after all preceding upsampling.
     /// Zero keeps all residual stages in FP32; the mask is ignored for an
     /// FP32 Synth graph.
     #[serde(default)]

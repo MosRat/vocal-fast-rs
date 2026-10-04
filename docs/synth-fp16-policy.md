@@ -44,6 +44,24 @@ without folding.  Because low-precision weight rounding makes this transform
 slightly less accurate and slower in this build, it remains opt-in rather than
 being used as the default FP16 boundary fix.
 
+## Selective residual blocks
+
+The residual stage masks can remove part of the FP32 round-trip traffic, but
+they are voice and shape dependent.  On the same fixed 44960 fixture:
+
+| policy | mean | relative L2 | cosine |
+| --- | ---: | ---: | ---: |
+| mixed baseline, all residual FP32 | 39.99 ms | 3.0637% | 0.9995356 |
+| residual mask `0x4`, low accumulation | 36.90 ms | 3.1598% | 0.9995055 |
+| residual mask `0x8`, low accumulation | 37.18 ms | 4.5340% | 0.9990005 |
+| Conv1/Conv2 mask `0x4`, FP32 accumulation | 36.04 ms | 3.1490% | 0.9995094 |
+
+Bit `0x4` is the third decoder stage for this four-stage Synth; `0x8` is the
+final, highest-rate stage.  The final stage is much more sensitive because its
+error is applied directly at the waveform sample rate.  These options remain
+experimental and should be gated against several real voice models before
+deployment.
+
 ## Build
 
 ```powershell

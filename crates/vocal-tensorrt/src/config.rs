@@ -272,8 +272,17 @@ impl TensorRtConfig {
             Err(_) => false,
         };
         build.synth_full_fp16 = bool_value("VOCAL_TRT_SYNTH_FULL_FP16", false)?;
+        build.synth_fp16_input_scale = positive_float(
+            "VOCAL_TRT_SYNTH_FP16_INPUT_SCALE",
+            build.synth_fp16_input_scale,
+        )?;
         build.synth_fp16_residual_accum = bool_value("VOCAL_TRT_SYNTH_FP16_RESIDUAL_ACCUM", false)?;
         build.synth_fp16_source = bool_value("VOCAL_TRT_SYNTH_FP16_SOURCE", false)?;
+        build.synth_fp16_noise = bool_value("VOCAL_TRT_SYNTH_FP16_NOISE", false)?;
+        build.synth_fp16_noise_stage_mask = mask(
+            "VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK",
+            build.synth_fp16_noise_stage_mask,
+        )?;
         build.log_build_options = bool_value("VOCAL_TRT_LOG_BUILD_OPTIONS", false)?;
         build.dispatch_tune = dispatch("VOCAL_TRT_DISPATCH_TUNE", DispatchTune::Auto)?;
         build.tactic_sources = mask("VOCAL_TRT_TACTIC_SOURCES", default_tactic_sources())?;
@@ -400,7 +409,9 @@ impl TensorRtConfig {
         }
         if (self.build.synth_full_fp16
             || self.build.synth_fp16_residual_accum
-            || self.build.synth_fp16_source)
+            || self.build.synth_fp16_source
+            || self.build.synth_fp16_noise
+            || self.build.synth_fp16_noise_stage_mask != 0)
             && self.build.synth_precision != PrecisionMode::Fp16
         {
             return Err(ConfigError::InvalidCombination(
@@ -410,6 +421,18 @@ impl TensorRtConfig {
         if self.build.synth_fp16_residual_accum && !self.build.synth_full_fp16 {
             return Err(ConfigError::InvalidCombination(
                 "VOCAL_TRT_SYNTH_FP16_RESIDUAL_ACCUM requires VOCAL_TRT_SYNTH_FULL_FP16=1".into(),
+            ));
+        }
+        if self.build.synth_fp16_noise_stage_mask & !0x0f != 0 {
+            return Err(ConfigError::InvalidCombination(
+                "Synth FP16 noise stage mask must select only upsample stages 0..=3".into(),
+            ));
+        }
+        if !self.build.synth_fp16_input_scale.is_finite()
+            || self.build.synth_fp16_input_scale <= 0.0
+        {
+            return Err(ConfigError::InvalidCombination(
+                "Synth FP16 input scale must be finite and positive".into(),
             ));
         }
         self.profile
@@ -587,8 +610,11 @@ mod tests {
             "VOCAL_TRT_SYNTH_W8A8_CONV2_MASK",
             "VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE",
             "VOCAL_TRT_SYNTH_FULL_FP16",
+            "VOCAL_TRT_SYNTH_FP16_INPUT_SCALE",
             "VOCAL_TRT_SYNTH_FP16_RESIDUAL_ACCUM",
             "VOCAL_TRT_SYNTH_FP16_SOURCE",
+            "VOCAL_TRT_SYNTH_FP16_NOISE",
+            "VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK",
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -623,7 +649,10 @@ mod tests {
             env::set_var("VOCAL_TRT_SYNTH_W8A8_CONV1_MASK", "0x1000");
             env::set_var("VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE", "0.0079044188");
             env::set_var("VOCAL_TRT_SYNTH_FULL_FP16", "1");
+            env::set_var("VOCAL_TRT_SYNTH_FP16_INPUT_SCALE", "0.0078125");
             env::set_var("VOCAL_TRT_SYNTH_FP16_SOURCE", "1");
+            env::set_var("VOCAL_TRT_SYNTH_FP16_NOISE", "1");
+            env::set_var("VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK", "0x4");
             env::set_var("VOCAL_TRT_GRAPH_CACHE_SIZE", "4");
             env::set_var("VOCAL_TRT_GRAPH_MODE", "hybrid");
         }
@@ -635,7 +664,10 @@ mod tests {
         assert_eq!(config.build.synth_w8a8_conv1_mask, 0x1000);
         assert!((config.build.synth_w8a8_activation_scale - 0.0079044).abs() < 1e-6);
         assert!(config.build.synth_full_fp16);
+        assert!((config.build.synth_fp16_input_scale - 0.0078125).abs() < 1e-7);
         assert!(config.build.synth_fp16_source);
+        assert!(config.build.synth_fp16_noise);
+        assert_eq!(config.build.synth_fp16_noise_stage_mask, 4);
         assert_eq!(config.profile.min_samples, 44_960);
         assert_eq!(config.runtime.graph_cache_size, 4);
         assert_eq!(
@@ -684,6 +716,21 @@ mod tests {
             env::set_var("VOCAL_TRT_SYNTH_PRECISION", "fp16");
             env::set_var("VOCAL_TRT_SYNTH_W8A8_CONV1_MASK", "0x3");
             env::set_var("VOCAL_TRT_SYNTH_W8A8_ACTIVATION_SCALE", "0.01");
+        }
+        assert!(matches!(
+            TensorRtConfig::from_env(),
+            Err(ConfigError::InvalidCombination(_))
+        ));
+        clear();
+    }
+
+    #[test]
+    fn rejects_noise_mask_outside_decoder_stages() {
+        let _guard = env_lock();
+        clear();
+        unsafe {
+            env::set_var("VOCAL_TRT_SYNTH_PRECISION", "fp16");
+            env::set_var("VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK", "0x10");
         }
         assert!(matches!(
             TensorRtConfig::from_env(),

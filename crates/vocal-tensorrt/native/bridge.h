@@ -131,8 +131,11 @@ struct Options {
     // the decoder type; residual accumulation/source remain independently
     // selectable for accuracy.
     int32_t synth_full_fp16;
+    float synth_fp16_input_scale;
     int32_t synth_fp16_residual_accum;
     int32_t synth_fp16_source;
+    int32_t synth_fp16_noise;
+    int32_t synth_fp16_noise_stage_mask;
     // RMVPE mixed-precision regions. Public I/O remains FP32. STFT, GRU, and
     // logits are fixed to FP32 by the native graph; their fields document the
     // ABI contract and are reserved for future experiments.

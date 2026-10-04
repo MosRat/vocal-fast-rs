@@ -219,6 +219,12 @@ pub struct NativeBuildOptions {
     /// The NSF phase/source stays FP32 unless `synth_fp16_source` is set.
     #[serde(default)]
     pub synth_full_fp16: bool,
+    /// Positive scale applied immediately before the first FP32 -> FP16
+    /// decoder boundary. The first upsample kernel is folded by `1/scale`,
+    /// preserving the affine result while reducing FP16 quantization of the
+    /// large `decoder_pre` activation. `1.0` disables the transform.
+    #[serde(default = "default_synth_fp16_input_scale")]
+    pub synth_fp16_input_scale: f32,
     /// Allow residual branch sums to remain in FP16 in the full-decoder
     /// experiment. This saves cast kernels but is more numerically sensitive.
     #[serde(default)]
@@ -227,6 +233,19 @@ pub struct NativeBuildOptions {
     /// separate because phase accumulation is more sensitive than Conv1d.
     #[serde(default)]
     pub synth_fp16_source: bool,
+    /// Keep the learned NSF noise convolutions and their adds in the decoder
+    /// precision while leaving the phase/source generation in FP32. This
+    /// removes the per-stage FP32 round trip around `noise_convs`; it is an
+    /// opt-in experiment because the final-stage noise path is voice
+    /// dependent.
+    #[serde(default)]
+    pub synth_fp16_noise: bool,
+    /// Optional per-upsampler mask for the learned NSF noise convolutions.
+    /// Bit 0 is the first decoder stage. A nonzero mask enables only those
+    /// stages in the decoder FP16 domain; the boolean switch above remains a
+    /// compatibility shorthand for all stages.
+    #[serde(default)]
+    pub synth_fp16_noise_stage_mask: u32,
     /// Emit one structured build summary through `tracing`.
     #[serde(default)]
     pub log_build_options: bool,
@@ -245,6 +264,10 @@ fn default_fused_qkv() -> bool {
 }
 
 pub(crate) fn default_w8a8_activation_scale() -> f32 {
+    1.0
+}
+
+pub(crate) fn default_synth_fp16_input_scale() -> f32 {
     1.0
 }
 
@@ -303,8 +326,11 @@ impl Default for NativeBuildOptions {
             synth_fuse_resblock_scale: false,
             synth_polyphase_upsample: false,
             synth_full_fp16: false,
+            synth_fp16_input_scale: default_synth_fp16_input_scale(),
             synth_fp16_residual_accum: false,
             synth_fp16_source: false,
+            synth_fp16_noise: false,
+            synth_fp16_noise_stage_mask: 0,
             log_build_options: false,
             dispatch_tune: DispatchTune::Auto,
             tactic_sources: default_tactic_sources(),

@@ -24,6 +24,10 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     // precision while the boundary avoids an unnecessary half round-trip.
     DataType decoder_type=real_type();
     bool full_fp16=decoder_type==DataType::kHALF && o.synth_full_fp16!=0;
+    // Keep the large pre-projection activation in a compact FP16 range.  The
+    // inverse factor is folded into the first linear upsample kernel below,
+    // so the transform is exact before FP16 rounding (bias is not scaled).
+    float decoder_input_scale=1.0f;
     T x=nullptr;
     if(decoder_type!=DataType::kFLOAT) {
         if(full_fp16) {
@@ -36,12 +40,22 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             x=add(conv(z_fp,"dec.conv_pre"),conv(speaker_fp,"dec.cond"));
         }
         active_type=decoder_type;
+        if (decoder_type==DataType::kHALF && !full_fp16 &&
+            o.synth_fp16_input_scale!=1.0f) {
+            decoder_input_scale=o.synth_fp16_input_scale;
+            active_type=DataType::kFLOAT;
+            x=scale(x,decoder_input_scale);
+            active_type=decoder_type;
+        }
         if(x->getType()!=decoder_type) x=cast(x,decoder_type);
     } else {
         x=add(conv(z,"dec.conv_pre"),conv(speaker,"dec.cond"));
     }
     if(o.debug_outputs)mark(x,"decoder_pre");
     T harmonic=nullptr;
+    T harmonic_low=nullptr;
+    bool any_noise_low=decoder_type==DataType::kHALF &&
+        (full_fp16 || o.synth_fp16_noise!=0 || o.synth_fp16_noise_stage_mask!=0);
     if(c.uses_f0) {
         if(decoder_type!=DataType::kFLOAT && o.synth_fp16_source!=0) {
             active_type=decoder_type;
@@ -51,10 +65,20 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             auto noise_fp=cast(noise,DataType::kFLOAT);
             active_type=DataType::kFLOAT;
             harmonic=source(pitchf_fp,noise_fp);
-            active_type=decoder_type;
-            harmonic=cast(harmonic,decoder_type);
         } else {
             harmonic=source(pitchf,noise);
+        }
+        if(decoder_type!=DataType::kFLOAT) active_type=decoder_type;
+        // Keep phase/source generation in FP32 by default, but allow the
+        // learned noise convolutions to consume a single decoder-domain copy.
+        // The default FP32 noise path keeps the source in FP32 directly; this
+        // removes the previous source FP32 -> FP16 -> FP32 round trip as well
+        // as the per-stage conversion of the same tensor.
+        if(any_noise_low && harmonic->getType()!=decoder_type) {
+            active_type=decoder_type;
+            harmonic_low=cast(harmonic,decoder_type);
+        } else if(any_noise_low) {
+            harmonic_low=harmonic;
         }
     }
     auto precision_type=[&](int code)->DataType {
@@ -64,6 +88,7 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     float residual_scale=1.0f/static_cast<float>(c.resblock_count);
     for(int i=0;i<c.upsample_count;i++) {
         float input_scale=fuse_residual_scale && i>0?residual_scale:1.0f;
+        if (i==0) input_scale/=decoder_input_scale;
         auto up_prefix="dec.ups."+std::to_string(i);
         auto up_input=act(x,ActivationType::kLEAKY_RELU,0.1f);
         if(o.synth_polyphase_upsample)
@@ -73,12 +98,15 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         if(o.debug_outputs)mark(x,("decoder_up_"+std::to_string(i)).c_str());
         if(harmonic) {
             int tail=1;for(int j=i+1;j<c.upsample_count;j++)tail*=c.rates[j];
-            if(full_fp16) {
+            bool noise_low=decoder_type==DataType::kHALF &&
+                (full_fp16 || o.synth_fp16_noise!=0 ||
+                 ((o.synth_fp16_noise_stage_mask >> i) & 1) != 0);
+            if(noise_low) {
                 active_type=decoder_type;
-                x=add(x,conv(harmonic,"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
+                x=add(x,conv(harmonic_low,"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
             } else if(decoder_type!=DataType::kFLOAT) {
                 active_type=DataType::kFLOAT;
-                x=add(cast(x,DataType::kFLOAT),conv(cast(harmonic,DataType::kFLOAT),"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
+                x=add(cast(x,DataType::kFLOAT),conv(harmonic,"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
                 active_type=decoder_type;
                 x=cast(x,decoder_type);
             } else {
@@ -89,8 +117,8 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         // Residual blocks are the largest repeated decoder workload.  The
         // stable path evaluates them in FP32, but an explicit low-precision
         // mode keeps x in the decoder type and avoids two cast kernels per
-        // stage.  Noise convolution remains FP32 in both modes because its
-        // source phase is the most sensitive NSF path.
+        // stage. Noise convolution can independently use the decoder type via
+        // the stage mask while source phase arithmetic remains FP32.
         bool residual_low=decoder_type!=DataType::kFLOAT && o.synth_resblock_precision!=0 &&
             ((o.synth_resblock_stage_mask >> i) & 1) != 0;
         bool residual_compute_low=full_fp16 || residual_low;

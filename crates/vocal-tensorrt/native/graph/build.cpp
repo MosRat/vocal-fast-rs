@@ -20,10 +20,20 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 "invalid Synth FP16 residual accumulation option");
         require(options->synth_fp16_source==0 || options->synth_fp16_source==1,
                 "invalid Synth FP16 source option");
-        if(options->synth_full_fp16 || options->synth_fp16_residual_accum || options->synth_fp16_source) {
+        require(options->synth_fp16_noise==0 || options->synth_fp16_noise==1,
+                "invalid Synth FP16 noise option");
+        require(options->synth_fp16_noise_stage_mask>=0,
+                "invalid Synth FP16 noise stage mask");
+        require(std::isfinite(options->synth_fp16_input_scale) &&
+                    options->synth_fp16_input_scale>0.0f,
+                "invalid Synth FP16 input scale");
+        if(options->synth_full_fp16 || options->synth_fp16_residual_accum ||
+           options->synth_fp16_source || options->synth_fp16_noise) {
             require(options->precision==1,
                     "Synth FP16 decoder options require FP16 Synth precision");
         }
+        if(options->synth_fp16_noise_stage_mask!=0 && options->precision!=1)
+            require(false,"Synth FP16 noise stage mask requires FP16 Synth precision");
         require(options->synth_fp16_residual_accum==0 || options->synth_full_fp16!=0,
                 "Synth FP16 residual accumulation requires full FP16 decoder");
         if(options->synth_w8a16_conv2_mask!=0) {
@@ -52,6 +62,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         uint32_t valid_stage_mask=c->upsample_count>=31?0xffffffffu:((1u<<c->upsample_count)-1u);
         require((static_cast<uint32_t>(options->synth_resblock_stage_mask)&~valid_stage_mask)==0,
                 "Synth residual stage mask exceeds upsample stages");
+        require((static_cast<uint32_t>(options->synth_fp16_noise_stage_mask)&~valid_stage_mask)==0,
+                "Synth FP16 noise stage mask exceeds upsample stages");
         require((static_cast<uint32_t>(options->synth_resblock_conv1_stage_mask)&~valid_stage_mask)==0 &&
                     (static_cast<uint32_t>(options->synth_resblock_conv2_stage_mask)&~valid_stage_mask)==0,
                 "Synth residual operation mask exceeds upsample stages");
@@ -143,8 +155,11 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                     " native layers, " + std::to_string(g.used.size()) +
                     " weights, F0=" + std::to_string(c->uses_f0) +
                     ", synth_full_fp16=" + std::to_string(options->synth_full_fp16) +
+                    ", synth_fp16_input_scale=" + std::to_string(options->synth_fp16_input_scale) +
                     ", synth_fp16_residual_accum=" + std::to_string(options->synth_fp16_residual_accum) +
                     ", synth_fp16_source=" + std::to_string(options->synth_fp16_source) +
+                    ", synth_fp16_noise=" + std::to_string(options->synth_fp16_noise) +
+                    ", synth_fp16_noise_stage_mask=" + std::to_string(options->synth_fp16_noise_stage_mask) +
                     ", fused_hubert_qkv=" + std::to_string(options->fused_qkv) +
                     ", fused_rvc_qkv=" + std::to_string(options->fused_rvc_qkv) +
                     ", synth_w8a16_conv2_mask=0x" + [&]{

@@ -44,6 +44,29 @@ without folding.  Because low-precision weight rounding makes this transform
 slightly less accurate and slower in this build, it remains opt-in rather than
 being used as the default FP16 boundary fix.
 
+## FP32 to FP16 input scaling
+
+`VOCAL_TRT_SYNTH_FP16_INPUT_SCALE` inserts a positive scale immediately before
+the first decoder boundary and folds its reciprocal into `dec.ups.0.weight`.
+This leaves the bias and later residual arithmetic untouched.  The first
+`decoder_pre` activation reached about `85` on the static fixture, while the
+first upsample output was below `4.5`, so this is the only boundary where such
+a scale is potentially useful.
+
+The sweep did not show a universal win:
+
+| shape | scale | mean | relative L2 | cosine |
+| ---: | ---: | ---: | ---: | ---: |
+| 11200 | `1` | 11.73 ms | 0.14390% | 0.99999923 |
+| 11200 | `1/256` | 11.93 ms | 0.14461% | 0.99999922 |
+| 44960 | `1` | 37.55 ms | 3.06368% | 0.99953558 |
+| 44960 | `1/256` | 36.79 ms | 3.05918% | 0.99953723 |
+
+The scale is therefore an opt-in calibration hook rather than a default.  A
+voice-specific calibration should check the largest activation and the scaled
+kernel range before selecting it; the reciprocal folded weights must remain
+well inside FP16 range.
+
 ## Selective residual blocks
 
 The residual stage masks can remove part of the FP32 round-trip traffic, but
@@ -87,3 +110,63 @@ rtk cargo run -p vocal-fast --features tensorrt-rtx -- model compile-trt `
 `VOCAL_TRT_SYNTH_FP16_SOURCE=1` are additional experimental switches.  They
 are rejected unless full FP16 is selected because they remove FP32 safety
 boundaries in the residual sum and NSF phase arithmetic.
+
+## Noise convolution boundary
+
+`VOCAL_TRT_SYNTH_FP16_NOISE=1` is a narrower experiment.  The NSF phase and
+source construction remain FP32, then one FP16 copy is kept for the learned
+`dec.noise_convs.*` layers.  Their convolution and add therefore stay in the
+decoder domain instead of doing an FP16 to FP32 to FP16 round trip at every
+upsample stage.  Residual accumulation and `conv_post` remain on the normal
+mixed-precision path.  The switch is disabled by default until it passes
+several voice models, since the last noise convolution directly affects the
+waveform-rate output.
+
+For a safer partial experiment use
+`VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK=0x1`, `0x2`, `0x4`, or `0x8`.  The mask
+keeps only selected upsample stages in FP16 and leaves the other noise
+convolutions on the FP32 path.  This is useful when the highest-rate stage is
+the accuracy limiter; the boolean switch is equivalent to selecting all
+stages.
+
+On the deterministic 44960 VIN fixture, the stage sweep was:
+
+| noise mask | Synth mean | relative L2 | cosine |
+| ---: | ---: | ---: | ---: |
+| `0` | 37.62 ms | 3.0643% | 0.9995350 |
+| `0x2` | 39.34 ms | 3.0586% | 0.9995377 |
+
+The earlier tactic build of the same mask measured about 37.15 ms, showing
+that TensorRT-RTX tactic selection is larger than this small graph change on
+the test GPU.  The mask is therefore useful as a profile candidate, not a
+guaranteed speedup.  It remains opt-in and should be selected only after a
+steady Nsight/CUDA-event replay on the target GPU.
+
+## Hot residual convolution stage
+
+The largest residual MAC block is upsample stage 1 (bit `0x2`, C=128).  The
+existing per-operation precision controls can place only its `convs1` and
+`convs2` in FP16 while keeping every residual add in FP32:
+
+```powershell
+$env:VOCAL_TRT_SYNTH_RESBLOCK_PRECISION = "fp32"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK = "0"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV1_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV1_STAGE_MASK = "0x2"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV2_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_CONV2_STAGE_MASK = "0x2"
+```
+
+Measured Synth-only medians on the RTX 3060 fixture were:
+
+| profile | mixed | hot residual FP16 | relative L2 | cosine |
+| ---: | ---: | ---: | ---: | ---: |
+| 11200 | 11.76 ms | 10.20 ms | 0.3017% | 0.9999958 |
+| 44960 | 37.69 ms | 29.36 ms | 3.0559% | 0.9995358 |
+
+This is a substantially larger opportunity than moving all residual adds to
+FP16.  It is still an opt-in voice-model candidate: the 11200 error roughly
+doubles in relative L2 even though cosine remains high, and TensorRT tactic
+selection can move absolute timings between builds.  Combining hot residual
+FP16 with noise mask `0x2` measured 28.89 ms at 44960 with cosine `0.9995346`,
+so the noise mask should only be added when a steady replay proves a benefit.

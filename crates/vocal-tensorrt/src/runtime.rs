@@ -703,21 +703,27 @@ impl PinnedHostBuffer {
 
     pub fn copy_from_f32(&mut self, data: &[f32]) -> Result<(), NativeBuildError> {
         let bytes = std::mem::size_of_val(data);
-        if bytes > self.bytes {
-            return Err(NativeBuildError::Argument(
-                "pinned host copy exceeds allocation".into(),
-            ));
-        }
         if !cfg!(target_endian = "little") {
             return Err(NativeBuildError::Argument(
                 "pinned host f32 staging requires a little-endian host".into(),
             ));
         }
+        self.copy_from_bytes(unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes)
+        })
+    }
+
+    pub fn copy_from_bytes(&mut self, data: &[u8]) -> Result<(), NativeBuildError> {
+        if data.len() > self.bytes {
+            return Err(NativeBuildError::Argument(
+                "pinned host copy exceeds allocation".into(),
+            ));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
-                data.as_ptr() as *const u8,
+                data.as_ptr(),
                 ffi::vocal_cuda_host_ptr(self.raw) as *mut u8,
-                bytes,
+                data.len(),
             );
         }
         Ok(())
@@ -738,6 +744,28 @@ impl PinnedHostBuffer {
                 ffi::vocal_cuda_host_ptr(self.raw) as *const u8,
                 destination.as_mut_ptr(),
                 destination.len(),
+            );
+        }
+        Ok(())
+    }
+
+    fn copy_to_f32(&self, destination: &mut [f32]) -> Result<(), NativeBuildError> {
+        if !cfg!(target_endian = "little") {
+            return Err(NativeBuildError::Argument(
+                "pinned host f32 download requires a little-endian host".into(),
+            ));
+        }
+        let bytes = std::mem::size_of_val(destination);
+        if bytes > self.bytes {
+            return Err(NativeBuildError::Argument(
+                "pinned host copy exceeds allocation".into(),
+            ));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ffi::vocal_cuda_host_ptr(self.raw) as *const u8,
+                destination.as_mut_ptr() as *mut u8,
+                bytes,
             );
         }
         Ok(())
@@ -785,6 +813,22 @@ impl PinnedHostRing {
         destination.upload_async_pinned(slot, std::mem::size_of_val(data), stream)
     }
 
+    /// Copy a small control payload into pinned memory and enqueue it on the
+    /// same stream as the inference graph. This avoids the implicit default
+    /// stream synchronization of synchronous scalar uploads.
+    pub fn upload_bytes(
+        &mut self,
+        destination: &CudaBuffer,
+        data: &[u8],
+        stream: &CudaStream,
+    ) -> Result<(), NativeBuildError> {
+        let index = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        let slot = &mut self.slots[index];
+        slot.copy_from_bytes(data)?;
+        destination.upload_async_pinned(slot, data.len(), stream)
+    }
+
     /// Queue a device-to-host copy into the next pinned slot. The caller must
     /// wait for `stream` before copying the slot into pageable output memory;
     /// the pipeline does that once for the complete graph and the final D2H.
@@ -812,6 +856,13 @@ impl PinnedHostRing {
             NativeBuildError::Argument("pinned host ring slot index out of range".into())
         })?;
         slot.copy_to_bytes(destination)
+    }
+
+    pub fn copy_f32(&self, index: usize, destination: &mut [f32]) -> Result<(), NativeBuildError> {
+        let slot = self.slots.get(index).ok_or_else(|| {
+            NativeBuildError::Argument("pinned host ring slot index out of range".into())
+        })?;
+        slot.copy_to_f32(destination)
     }
 }
 
@@ -1000,6 +1051,40 @@ impl CudaBuffer {
             Err(NativeBuildError::Api(ffi::native_message(
                 error,
                 "cuda download failed",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn download_f32(&self, data: &mut [f32]) -> Result<(), NativeBuildError> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes > self.bytes {
+            return Err(NativeBuildError::Argument(
+                "host download exceeds CUDA buffer".into(),
+            ));
+        }
+        if !cfg!(target_endian = "little") {
+            let mut raw = vec![0_u8; bytes];
+            self.download_bytes(&mut raw)?;
+            for (value, chunk) in data.iter_mut().zip(raw.chunks_exact(4)) {
+                *value = f32::from_le_bytes(chunk.try_into().expect("f32 chunk"));
+            }
+            return Ok(());
+        }
+        let mut error = ptr::null_mut();
+        let code = unsafe {
+            ffi::vocal_cuda_download(
+                self.raw,
+                data.as_mut_ptr() as *mut c_void,
+                bytes,
+                &mut error,
+            )
+        };
+        if code != 0 {
+            Err(NativeBuildError::Api(ffi::native_message(
+                error,
+                "cuda f32 download failed",
             )))
         } else {
             Ok(())

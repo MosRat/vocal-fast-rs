@@ -94,10 +94,20 @@ the same command to measure actual graph replay. The parity values in this run
 are exact because those two rows executed the same eager kernels as the native
 reference after native graph strategy was disabled.
 
+The boundary-only update was smoke-tested on the same 11200-sample input with
+five measured iterations. NativeSubgraphs reported `upload=0.0465 ms` and
+`total=17.12 ms`; the outputs remained bit-identical across the compared modes.
+The run also confirms that WholePipeline and HybridSubgraphs retain their
+existing eager fallback behavior on these plans.
+
 ## Host and plan IO
 
-`PinnedHostRing` already keeps the recurring waveform upload and final audio
-download asynchronous. The remaining load path is now shared:
+`PinnedHostRing` keeps the recurring waveform upload and final audio download
+asynchronous. Scalar `sid` and `p_len` updates use a second pinned ring on the
+inference stream, avoiding a default-stream synchronization. Final FP32 audio
+is copied directly from the pinned slot into the output vector, so the hot path
+does not allocate a temporary byte buffer or parse samples one by one. The
+remaining load path is now shared:
 
 * `vocal_model::load_cache_shared` uses a weak process-wide cache keyed by
   canonical path, file size, modification time, and load policy. Repeated

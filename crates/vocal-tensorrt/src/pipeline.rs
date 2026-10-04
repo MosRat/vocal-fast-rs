@@ -767,6 +767,7 @@ pub struct RvcTrtPipeline {
     stage_events: StageEvents,
     waveform: CudaBuffer,
     waveform_host_ring: PinnedHostRing,
+    control_host_ring: PinnedHostRing,
     audio_host_ring: PinnedHostRing,
     threshold: CudaBuffer,
     hubert_features: CudaBuffer,
@@ -1019,6 +1020,7 @@ impl RvcTrtPipeline {
             stage_events,
             waveform: alloc(p.max_samples as usize * 4)?,
             waveform_host_ring: PinnedHostRing::new(3, p.max_samples as usize * 4)?,
+            control_host_ring: PinnedHostRing::new(3, std::mem::size_of::<i32>())?,
             audio_host_ring: PinnedHostRing::new(3, p.max_rvc_frames as usize * up * 4)?,
             threshold: alloc(4)?,
             hubert_features: alloc(p.max_hubert_frames as usize * 768 * 4)?,
@@ -1802,11 +1804,16 @@ impl RvcTrtPipeline {
         let p_len_value = i32::try_from(p_len_frames)
             .map_err(|_| NativeBuildError::Argument("RVC frame length exceeds i32".into()))?;
         if self.last_p_len != Some(p_len_value) {
-            self.p_len.upload_i32(p_len_value)?;
+            self.control_host_ring.upload_bytes(
+                &self.p_len,
+                &p_len_value.to_le_bytes(),
+                &self.stream,
+            )?;
             self.last_p_len = Some(p_len_value);
         }
         if self.last_sid != Some(sid) {
-            self.sid.upload_i32(sid)?;
+            self.control_host_ring
+                .upload_bytes(&self.sid, &sid.to_le_bytes(), &self.stream)?;
             self.last_sid = Some(sid);
         }
         self.synth
@@ -2108,9 +2115,11 @@ impl RvcTrtPipeline {
         // Pageable cudaMemcpy after synchronization adds a second host-side
         // synchronization point on every callback.  A pinned ring keeps the
         // copy ordered with the graph while retaining an owned Vec API.
-        let audio_bytes_len = rvc_frames
+        let audio_samples = rvc_frames
             .checked_mul(up)
-            .and_then(|samples| samples.checked_mul(4))
+            .ok_or_else(|| NativeBuildError::Argument("audio sample length overflow".into()))?;
+        let audio_bytes_len = audio_samples
+            .checked_mul(4)
             .ok_or_else(|| NativeBuildError::Argument("audio byte length overflow".into()))?;
         let async_audio_d2h = self.runtime_config.async_audio_d2h;
         let audio_host_slot = if self.debug_intermediates || !async_audio_d2h {
@@ -2140,16 +2149,12 @@ impl RvcTrtPipeline {
             .stage_events
             .synth_start
             .elapsed(&self.stage_events.synth_end)?;
-        let mut audio_bytes = vec![0_u8; audio_bytes_len];
+        let mut audio = vec![0_f32; audio_samples];
         if let Some(slot) = audio_host_slot {
-            self.audio_host_ring.copy_bytes(slot, &mut audio_bytes)?;
+            self.audio_host_ring.copy_f32(slot, &mut audio)?;
         } else {
-            self.audio.download_bytes(&mut audio_bytes)?;
+            self.audio.download_f32(&mut audio)?;
         }
-        let audio = audio_bytes
-            .chunks_exact(4)
-            .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
-            .collect::<Vec<_>>();
         let (
             hubert_features,
             rvc_features,

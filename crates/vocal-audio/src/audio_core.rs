@@ -2,6 +2,8 @@
 
 #[path = "config.rs"]
 mod config;
+#[path = "format.rs"]
+mod format;
 #[path = "ring.rs"]
 mod ring;
 #[path = "stream.rs"]
@@ -12,6 +14,7 @@ mod timing;
 mod wake;
 
 pub use config::*;
+pub use format::*;
 pub use ring::*;
 pub use stream::*;
 pub use timing::*;

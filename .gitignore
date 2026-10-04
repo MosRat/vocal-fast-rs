@@ -17,5 +17,11 @@ models/voices/**/*.onnx
 **/__pycache__/
 testdata/generated/
 
+# Tauri application build and dependency output.
+apps/tauri/node_modules/
+apps/tauri/dist/
+apps/tauri/src-tauri/target/
+apps/tauri/src-tauri/gen/
+
 # External reference checkouts used only for local parity tests.
 ref_repos/

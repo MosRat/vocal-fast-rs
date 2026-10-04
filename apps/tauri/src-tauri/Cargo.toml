@@ -4,9 +4,21 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[dependencies]
-vocal-engine = { path = "../../crates/vocal-engine" }
-vocal-model = { path = "../../crates/vocal-model" }
+[workspace]
 
-# Add tauri and tauri-build here when the host UI is wired. This crate stays
-# outside the root workspace while the core baseline remains headless/buildable.
+[lib]
+name = "vocal_fast_tauri_lib"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+vocal-types = { path = "../../../crates/vocal-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tauri = { version = "2", features = [] }
+vocal-engine = { path = "../../../crates/vocal-engine" }
+vocal-model = { path = "../../../crates/vocal-model" }

@@ -191,7 +191,8 @@ impl AudioSession {
                 };
                 let mut sequence = 0_u64;
                 let mut engine = engine;
-                while !worker_stop.load(Ordering::Acquire) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while !worker_stop.load(Ordering::Acquire) {
                     let result = worker_io.process_once(schedule, |input, output| {
                         let started = Instant::now();
                         let chunk = AudioChunk {
@@ -234,6 +235,12 @@ impl AudioSession {
                             break;
                         }
                     }
+                    }
+                }));
+                if result.is_err() {
+                    worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                    worker_report("audio worker panicked".into());
+                    worker_stop.store(true, Ordering::Release);
                 }
                 worker_alive_flag.store(false, Ordering::Release);
             })

@@ -2,7 +2,7 @@
 //! the portable baseline so the SDK can be linked only on RTX build machines.
 
 use std::time::Instant;
-use vocal_types::{AudioChunk, ConversionConfig, LatencyMetrics, ModelDescriptor};
+use vocal_types::{AudioChunk, AudioFormat, ConversionConfig, LatencyMetrics, ModelDescriptor};
 
 mod config;
 mod error;
@@ -22,6 +22,27 @@ pub trait InferenceEngine: Send {
         input: &AudioChunk,
         config: ConversionConfig,
     ) -> Result<AudioChunk, EngineError>;
+
+    /// Process a ring slot without first allocating an `AudioChunk` for the
+    /// borrowed input samples. Control-plane callers can keep using
+    /// [`Self::process`]; real-time workers should prefer this method.
+    fn process_samples(
+        &mut self,
+        format: AudioFormat,
+        samples: &[f32],
+        sequence: u64,
+        config: ConversionConfig,
+    ) -> Result<AudioChunk, EngineError> {
+        self.process(
+            &AudioChunk {
+                format,
+                samples: samples.to_vec(),
+                sequence,
+            },
+            config,
+        )
+    }
+
     fn metrics(&self) -> LatencyMetrics;
     fn status(&self) -> EngineStatus {
         EngineStatus::default()
@@ -110,38 +131,42 @@ impl InferenceEngine for PipelineEngine {
         input: &AudioChunk,
         config: ConversionConfig,
     ) -> Result<AudioChunk, EngineError> {
+        self.process_samples(input.format, &input.samples, input.sequence, config)
+    }
+
+    fn process_samples(
+        &mut self,
+        format: AudioFormat,
+        samples: &[f32],
+        sequence: u64,
+        config: ConversionConfig,
+    ) -> Result<AudioChunk, EngineError> {
         self.status
             .begin()
             .map_err(|error| EngineError::InvalidState(error.into()))?;
-        if let Err(error) = input
-            .validate()
-            .map_err(|error| EngineError::InvalidInput(error.to_string()))
-            .and_then(|_| validate_conversion(config))
+        if let Err(error) =
+            validate_audio_samples(format, samples).and_then(|_| validate_conversion(config))
         {
             self.status.failure(error.to_string());
             logging::failed(&error);
             return Err(error);
         }
         let started = Instant::now();
-        let channels = input.format.channels as usize;
+        let channels = format.channels as usize;
         let mono = if channels == 1 {
-            input.samples.clone()
+            samples.to_vec()
         } else {
-            input
-                .samples
+            samples
                 .chunks_exact(channels)
                 .map(|frame| frame.iter().sum::<f32>() / channels as f32)
                 .collect()
         };
-        let context = pipeline::resampled_len(1_600, 16_000, input.format.sample_rate).max(160);
+        let context = pipeline::resampled_len(1_600, 16_000, format.sample_rate).max(160);
         if self.history.is_empty() {
             self.history.resize(context, 0.0);
         }
         self.history.extend_from_slice(&mono);
-        let output = match self
-            .pipeline
-            .run(&self.history, input.format.sample_rate, config)
-        {
+        let output = match self.pipeline.run(&self.history, format.sample_rate, config) {
             Ok(output) => output,
             Err(error) => {
                 self.status.failure(error.to_string());
@@ -150,11 +175,8 @@ impl InferenceEngine for PipelineEngine {
             }
         };
         self.last_timings = output.timings;
-        let output_mono = pipeline::resample_linear(
-            &output.samples,
-            output.sample_rate,
-            input.format.sample_rate,
-        );
+        let output_mono =
+            pipeline::resample_linear(&output.samples, output.sample_rate, format.sample_rate);
         let mut output_block = if output_mono.len() >= mono.len() {
             output_mono[output_mono.len() - mono.len()..].to_vec()
         } else {
@@ -177,14 +199,14 @@ impl InferenceEngine for PipelineEngine {
             samples.extend(std::iter::repeat_n(sample, channels));
         }
         let output_frames = samples.len() / channels;
-        self.metrics.input_frames += input.frames() as u64;
+        self.metrics.input_frames += (samples.len() / channels) as u64;
         self.metrics.output_frames += output_frames as u64;
         self.metrics.processing_micros += started.elapsed().as_micros() as u64;
         self.status.success();
         Ok(AudioChunk {
-            format: input.format,
+            format,
             samples,
-            sequence: input.sequence,
+            sequence,
         })
     }
 
@@ -224,22 +246,33 @@ impl InferenceEngine for PassthroughEngine {
         input: &AudioChunk,
         _config: ConversionConfig,
     ) -> Result<AudioChunk, EngineError> {
+        self.process_samples(input.format, &input.samples, input.sequence, _config)
+    }
+
+    fn process_samples(
+        &mut self,
+        format: AudioFormat,
+        samples: &[f32],
+        sequence: u64,
+        _config: ConversionConfig,
+    ) -> Result<AudioChunk, EngineError> {
         self.status
             .begin()
             .map_err(|error| EngineError::InvalidState(error.into()))?;
-        if let Err(error) = input
-            .validate()
-            .map_err(|error| EngineError::InvalidInput(error.to_string()))
-            .and_then(|_| validate_conversion(_config))
+        if let Err(error) =
+            validate_audio_samples(format, samples).and_then(|_| validate_conversion(_config))
         {
             self.status.failure(error.to_string());
             logging::failed(&error);
             return Err(error);
         }
         let start = Instant::now();
-        let mut output = input.clone();
-        output.sequence = input.sequence;
-        self.metrics.input_frames += input.frames() as u64;
+        let output = AudioChunk {
+            format,
+            samples: samples.to_vec(),
+            sequence,
+        };
+        self.metrics.input_frames += output.frames() as u64;
         self.metrics.output_frames += output.frames() as u64;
         self.metrics.processing_micros += start.elapsed().as_micros() as u64;
         self.status.success();
@@ -253,6 +286,26 @@ impl InferenceEngine for PassthroughEngine {
     fn status(&self) -> EngineStatus {
         self.status.clone()
     }
+}
+
+fn validate_audio_samples(format: AudioFormat, samples: &[f32]) -> Result<(), EngineError> {
+    format
+        .validate()
+        .map_err(|error| EngineError::InvalidInput(error.to_string()))?;
+    if samples.is_empty() {
+        return Err(EngineError::InvalidInput("audio chunk is empty".into()));
+    }
+    if !samples.len().is_multiple_of(format.channels as usize) {
+        return Err(EngineError::InvalidInput(
+            "interleaved samples do not match channel count".into(),
+        ));
+    }
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(EngineError::InvalidInput(
+            "audio samples must be finite".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn model_name(config: &EngineConfig) -> &str {

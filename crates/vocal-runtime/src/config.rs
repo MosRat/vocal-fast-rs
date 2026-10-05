@@ -20,6 +20,7 @@ pub enum RuntimeBackend {
     #[default]
     Passthrough,
     RvcCpu,
+    TensorRtRtx,
 }
 
 impl RuntimeBackend {
@@ -27,6 +28,7 @@ impl RuntimeBackend {
         match self {
             Self::Passthrough => BackendKind::Passthrough,
             Self::RvcCpu => BackendKind::RvcCpuPipeline,
+            Self::TensorRtRtx => BackendKind::TensorRtRtx,
         }
     }
 }
@@ -46,6 +48,10 @@ pub struct RuntimeConfig {
     /// It is intentionally independent from `model_path`, which remains the
     /// last selected artifact and is restored directly at startup.
     pub model_directory: Option<String>,
+    /// TensorRT pipeline manifest produced by `compile-trt-pipeline`.
+    pub tensorrt_artifacts_path: Option<String>,
+    pub tensorrt_window_samples: Option<usize>,
+    pub speaker_id: i32,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub block_frames: usize,
@@ -62,6 +68,9 @@ impl Default for RuntimeConfig {
             backend: RuntimeBackend::Passthrough,
             model_path: None,
             model_directory: None,
+            tensorrt_artifacts_path: None,
+            tensorrt_window_samples: None,
+            speaker_id: 0,
             input_device: None,
             output_device: None,
             block_frames: 480,
@@ -98,6 +107,21 @@ impl RuntimeConfig {
         if self.input_format != self.output_format {
             return Err(RuntimeError::Config(
                 "input and output formats must match for duplex streaming".into(),
+            ));
+        }
+        if self.backend == RuntimeBackend::TensorRtRtx
+            && self
+                .tensorrt_artifacts_path
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(RuntimeError::Config(
+                "TensorRT backend requires tensorrt_artifacts_path".into(),
+            ));
+        }
+        if self.tensorrt_window_samples == Some(0) {
+            return Err(RuntimeError::Config(
+                "tensorrt_window_samples must be non-zero when provided".into(),
             ));
         }
         Ok(())

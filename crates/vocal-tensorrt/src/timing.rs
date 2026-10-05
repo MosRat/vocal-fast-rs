@@ -3,6 +3,11 @@ use crate::{CudaStream, NativeBuildError, ffi};
 use std::{os::raw::c_void, ptr};
 
 pub(crate) struct CudaEvent(*mut c_void);
+
+// Events are only recorded/read by the owning pipeline worker.  Marking the
+// opaque handle movable lets that worker satisfy the engine's `Send` contract
+// without permitting shared concurrent access.
+unsafe impl Send for CudaEvent {}
 impl CudaEvent {
     pub fn new() -> Result<Self, NativeBuildError> {
         let (mut raw, mut err) = (ptr::null_mut(), ptr::null_mut());

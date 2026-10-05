@@ -1027,6 +1027,7 @@ dependencies = [
  "tracing",
  "vocal-engine",
  "vocal-model",
+ "vocal-tensorrt",
  "vocal-types",
  "windows-sys",
 ]

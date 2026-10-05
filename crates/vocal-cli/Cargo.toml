@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-tensorrt-rtx = ["vocal-engine/tensorrt-rtx", "dep:vocal-tensorrt"]
+tensorrt-rtx = [
+    "vocal-engine/tensorrt-rtx",
+    "vocal-runtime/tensorrt-rtx",
+    "dep:vocal-tensorrt",
+]
 
 [[bin]]
 name = "vocal-fast"

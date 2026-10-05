@@ -528,6 +528,12 @@ pub struct CudaStream {
     raw: *mut ffi::Stream,
 }
 
+// CUDA stream handles are opaque ownership tokens.  The pipeline moves the
+// complete stream/context bundle to one worker thread and never accesses it
+// concurrently, which is the same ownership model used by `Runtime` and
+// `OwnedContext` above.
+unsafe impl Send for CudaStream {}
+
 impl CudaStream {
     pub fn new() -> Result<Self, NativeBuildError> {
         let (mut raw, mut error) = (ptr::null_mut(), ptr::null_mut());
@@ -668,6 +674,11 @@ pub struct CudaBuffer {
     raw: *mut ffi::Memory,
     pub bytes: usize,
 }
+
+// Device allocations are owned by one pipeline worker.  Moving the owner is
+// safe; callers must still provide their own synchronization for concurrent
+// access, which this crate intentionally does not expose.
+unsafe impl Send for CudaBuffer {}
 
 /// Page-locked host allocation suitable for `cudaMemcpyAsync`. The allocation
 /// is owned by Rust and remains live until the stream has consumed its bytes.

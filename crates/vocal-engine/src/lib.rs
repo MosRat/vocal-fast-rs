@@ -4,17 +4,25 @@
 use std::time::Instant;
 use vocal_types::{AudioChunk, AudioFormat, ConversionConfig, LatencyMetrics, ModelDescriptor};
 
+#[cfg_attr(not(feature = "tensorrt-rtx"), allow(dead_code))]
+mod audio_adapter;
 mod config;
 mod error;
 mod logging;
 mod state;
 
+#[cfg(feature = "tensorrt-rtx")]
+mod tensorrt_backend;
+
 pub mod pipeline;
 pub mod tensorrt;
 
-pub use config::{BackendKind, EngineConfig, validate_conversion};
+pub use config::{BackendKind, EngineConfig, TensorRtEngineSpec, validate_conversion};
 pub use error::EngineError;
 pub use state::{EngineLifecycle, EngineStatus};
+
+#[cfg(feature = "tensorrt-rtx")]
+pub use tensorrt_backend::{TensorRtBackendConfig, TensorRtEngine, create_tensorrt_engine};
 
 pub trait InferenceEngine: Send {
     fn process(
@@ -60,9 +68,25 @@ pub fn create_engine(config: EngineConfig) -> Result<Box<dyn InferenceEngine>, E
             logging::created("rvc-cpu");
             Ok(Box::new(PipelineEngine::new(config.model)?))
         }
-        BackendKind::TensorRtRtx => Err(EngineError::BackendUnavailable(
-            "TensorRT RTX adapter is a build-time integration point; enable the SDK adapter on an RTX host".into(),
-        )),
+        BackendKind::TensorRtRtx => {
+            #[cfg(feature = "tensorrt-rtx")]
+            {
+                let spec = config.tensorrt.ok_or_else(|| {
+                    EngineError::InvalidConfig(
+                        "TensorRT backend requires pipeline artifacts and a VFRM model package"
+                            .into(),
+                    )
+                })?;
+                logging::created("tensorrt-rtx");
+                return create_tensorrt_engine(config.model, spec);
+            }
+            #[cfg(not(feature = "tensorrt-rtx"))]
+            {
+                Err(EngineError::BackendUnavailable(
+                    "TensorRT RTX backend requires the vocal-engine/tensorrt-rtx feature and an RTX SDK".into(),
+                ))
+            }
+        }
     }
 }
 
@@ -329,6 +353,7 @@ mod tests {
         let mut engine = create_engine(EngineConfig {
             backend: BackendKind::Passthrough,
             model,
+            tensorrt: None,
         })
         .unwrap();
         let input = AudioChunk {
@@ -357,6 +382,7 @@ mod tests {
         let mut engine = create_engine(EngineConfig {
             backend: BackendKind::RvcCpuPipeline,
             model,
+            tensorrt: None,
         })
         .unwrap();
         let input = AudioChunk {
@@ -383,5 +409,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second.frames(), input.frames());
+    }
+
+    #[test]
+    fn tensor_rt_backend_requires_pipeline_specification() {
+        let model = ModelDescriptor {
+            id: "fixture".into(),
+            display_name: "Fixture".into(),
+            architecture: "rvc-v2".into(),
+            sample_rate: 32_000,
+            version: "2".into(),
+        };
+        let result = create_engine(EngineConfig {
+            backend: BackendKind::TensorRtRtx,
+            model,
+            tensorrt: None,
+        });
+        assert!(matches!(result, Err(EngineError::InvalidConfig(_))));
+    }
+
+    #[cfg(not(feature = "tensorrt-rtx"))]
+    #[test]
+    fn tensor_rt_backend_reports_disabled_feature() {
+        let model = ModelDescriptor {
+            id: "fixture".into(),
+            display_name: "Fixture".into(),
+            architecture: "rvc-v2".into(),
+            sample_rate: 32_000,
+            version: "2".into(),
+        };
+        let result = create_engine(EngineConfig {
+            backend: BackendKind::TensorRtRtx,
+            model,
+            tensorrt: Some(TensorRtEngineSpec {
+                artifacts_path: "missing-pipeline.json".into(),
+                model_package_path: "missing.vfrm".into(),
+                speaker_id: 0,
+                window_samples: None,
+            }),
+        });
+        assert!(matches!(result, Err(EngineError::BackendUnavailable(_))));
     }
 }

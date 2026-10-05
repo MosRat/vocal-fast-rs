@@ -15,7 +15,7 @@ use vocal_model::{
 use vocal_types::{AudioChunk, LatencyMetrics, LifecycleState, ModelDescriptor};
 
 use crate::{
-    RuntimeConfig,
+    RuntimeBackend, RuntimeConfig,
     error::{RuntimeError, RuntimeResult},
 };
 
@@ -370,7 +370,9 @@ impl RuntimeInner {
         let replacement = self
             .descriptor
             .as_ref()
-            .map(|descriptor| create_runtime_engine(&config, descriptor))
+            .map(|descriptor| {
+                create_runtime_engine(&config, descriptor, self.model_package.as_deref())
+            })
             .transpose()?;
         if let Some(store) = &self.config_store {
             store.save(&config)?;
@@ -466,7 +468,7 @@ impl RuntimeInner {
         let result = (|| {
             descriptor.validate()?;
             let config = self.config.clone();
-            let engine = create_runtime_engine(&config, &descriptor)?;
+            let engine = create_runtime_engine(&config, &descriptor, None)?;
             if let Some(store) = &self.config_store {
                 let mut persisted = config.clone();
                 persisted.model_path = None;
@@ -543,7 +545,11 @@ impl RuntimeInner {
         if self.engine.is_none()
             && let Some(descriptor) = self.descriptor.as_ref()
         {
-            self.engine = Some(create_runtime_engine(&self.config, descriptor)?);
+            self.engine = Some(create_runtime_engine(
+                &self.config,
+                descriptor,
+                self.model_package.as_deref(),
+            )?);
         }
         self.lifecycle = if self.engine.is_some() {
             LifecycleState::Ready
@@ -609,7 +615,7 @@ impl RuntimeInner {
         let descriptor = manifest.descriptor();
         let mut config = self.config.clone();
         config.model_path = Some(input.display().to_string());
-        let engine = create_runtime_engine(&config, &descriptor)?;
+        let engine = create_runtime_engine(&config, &descriptor, Some(package.as_ref()))?;
         if let Some(store) = &self.config_store {
             store.save(&config)?;
         }
@@ -973,10 +979,44 @@ fn referenced_model_bytes(manifest_path: &Path, manifest: &RvcModelManifest) -> 
 fn create_runtime_engine(
     config: &RuntimeConfig,
     descriptor: &ModelDescriptor,
+    #[allow(unused_variables)] package: Option<&ModelPackage>,
 ) -> RuntimeResult<Box<dyn InferenceEngine>> {
+    if config.backend == RuntimeBackend::TensorRtRtx {
+        #[cfg(feature = "tensorrt-rtx")]
+        {
+            let package = package.ok_or_else(|| {
+                RuntimeError::Config("TensorRT backend requires a loaded VFRM model package".into())
+            })?;
+            let artifacts_path = config.tensorrt_artifacts_path.as_deref().ok_or_else(|| {
+                RuntimeError::Config("TensorRT artifacts path is not configured".into())
+            })?;
+            let trt_config = vocal_tensorrt::TensorRtConfig::from_env()
+                .map_err(|error| RuntimeError::Config(error.to_string()))?;
+            let trt = vocal_engine::TensorRtBackendConfig::for_package(
+                PathBuf::from(artifacts_path),
+                config.speaker_id,
+                config.tensorrt_window_samples,
+                trt_config.runtime,
+                trt_config.diagnostics,
+            );
+            return Ok(Box::new(vocal_engine::TensorRtEngine::from_package(
+                descriptor.clone(),
+                package,
+                trt,
+            )?));
+        }
+        #[cfg(not(feature = "tensorrt-rtx"))]
+        {
+            return Err(vocal_engine::EngineError::BackendUnavailable(
+                "TensorRT backend requires the vocal-runtime/tensorrt-rtx feature".into(),
+            )
+            .into());
+        }
+    }
     Ok(create_engine(EngineConfig {
         backend: config.backend.engine_kind(),
         model: descriptor.clone(),
+        tensorrt: None,
     })?)
 }
 

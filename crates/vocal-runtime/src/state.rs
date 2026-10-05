@@ -483,7 +483,10 @@ impl RuntimeContext {
     }
 
     pub fn process(&self, input: &AudioChunk) -> RuntimeResult<AudioChunk> {
-        let _operation = self.operation()?;
+        // The engine is exclusively mutable behind `inner`; lifecycle control
+        // methods also take that mutex and reject changes while Running. The
+        // separate control-operation mutex is intentionally omitted here so a
+        // slow control-plane command cannot delay an audio worker block.
         if input.samples.len() > MAX_CONTROL_BLOCK_SAMPLES {
             return Err(RuntimeError::Config(format!(
                 "control block exceeds {MAX_CONTROL_BLOCK_SAMPLES} samples"

@@ -2,6 +2,8 @@
 **/*.vfr
 models/*/*.pth
 models/*/*.index
+# Downloaded checkpoints and converter manifests used only for local parity runs.
+models/downloads/
 !models/fixture-rvc-v2/model.pth
 !models/fixture-rvc-v2/model.index
 # Shared HuBERT/RMVPE weights are local runtime assets and are not committed.

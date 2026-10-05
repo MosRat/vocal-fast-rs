@@ -164,6 +164,8 @@ struct RuntimeInner {
     /// running. During an active stream ownership moves to that worker.
     engine: Option<Box<dyn InferenceEngine>>,
     worker_status: Option<EngineStatus>,
+    worker_generation: u64,
+    worker_active: bool,
     metrics: LatencyMetrics,
     last_error: Option<RuntimeErrorInfo>,
     config_store: Option<crate::ConfigStore>,
@@ -196,6 +198,8 @@ impl RuntimeContext {
             model_package: None,
             engine: None,
             worker_status: None,
+            worker_generation: 0,
+            worker_active: false,
             metrics: LatencyMetrics::default(),
             last_error: None,
             config_store: None,
@@ -306,18 +310,25 @@ impl RuntimeContext {
 
     /// Transfer engine ownership to the dedicated audio/model worker after
     /// the lifecycle has entered Running.
-    pub fn take_engine_for_worker(&self) -> RuntimeResult<Box<dyn InferenceEngine>> {
+    pub fn take_engine_for_worker(&self) -> RuntimeResult<(u64, Box<dyn InferenceEngine>)> {
         self.request(RuntimeInner::take_engine_for_worker)
+    }
+
+    /// Mark a reserved worker lease as started. A separate activation step
+    /// lets a failed thread spawn roll back without racing a stale worker.
+    pub fn activate_worker(&self, generation: u64) -> RuntimeResult<()> {
+        self.request(move |state| state.activate_worker(generation))
     }
 
     /// Return the engine after the model worker exits. This is a control
     /// message, so the worker never touches shared runtime state directly.
     pub fn complete_worker(
         &self,
+        generation: u64,
         engine: Box<dyn InferenceEngine>,
         failure: Option<(String, String)>,
     ) -> RuntimeResult<RuntimeSnapshot> {
-        self.request(move |state| state.complete_worker(engine, failure))
+        self.request(move |state| state.complete_worker(generation, engine, failure))
     }
 }
 
@@ -397,6 +408,8 @@ impl RuntimeInner {
         }
         self.engine = None;
         self.worker_status = None;
+        self.worker_active = false;
+        self.worker_generation = self.worker_generation.wrapping_add(1);
         self.model = None;
         self.descriptor = None;
         self.model_package = None;
@@ -466,6 +479,7 @@ impl RuntimeInner {
             self.model_package = None;
             self.engine = Some(engine);
             self.worker_status = None;
+            self.worker_active = false;
             self.lifecycle = LifecycleState::Ready;
             self.last_error = None;
             Ok(self.snapshot())
@@ -517,10 +531,14 @@ impl RuntimeInner {
 
     fn abort_processing_start(&mut self) -> RuntimeResult<RuntimeSnapshot> {
         if self.worker_status.is_some() {
-            return Err(RuntimeError::State {
-                state: format!("{:?}", self.lifecycle),
-                action: "abort_processing_start_with_active_worker".into(),
-            });
+            if self.worker_active {
+                return Err(RuntimeError::State {
+                    state: format!("{:?}", self.lifecycle),
+                    action: "abort_processing_start_with_active_worker".into(),
+                });
+            }
+            self.worker_status = None;
+            self.worker_generation = self.worker_generation.wrapping_add(1);
         }
         if self.engine.is_none()
             && let Some(descriptor) = self.descriptor.as_ref()
@@ -596,12 +614,13 @@ impl RuntimeInner {
         self.model_package = Some(package);
         self.engine = Some(engine);
         self.worker_status = None;
+        self.worker_active = false;
         self.lifecycle = LifecycleState::Ready;
         self.last_error = None;
         Ok(self.snapshot())
     }
 
-    fn take_engine_for_worker(&mut self) -> RuntimeResult<Box<dyn InferenceEngine>> {
+    fn take_engine_for_worker(&mut self) -> RuntimeResult<(u64, Box<dyn InferenceEngine>)> {
         if self.lifecycle != LifecycleState::Running {
             return Err(RuntimeError::State {
                 state: format!("{:?}", self.lifecycle),
@@ -612,16 +631,33 @@ impl RuntimeInner {
             state: "model_worker_owns_engine".into(),
             action: "take_engine_for_worker".into(),
         })?;
+        self.worker_generation = self.worker_generation.wrapping_add(1);
+        self.worker_active = false;
         self.worker_status = Some(engine.status());
-        Ok(engine)
+        Ok((self.worker_generation, engine))
+    }
+
+    fn activate_worker(&mut self, generation: u64) -> RuntimeResult<()> {
+        if self.worker_generation != generation || self.worker_status.is_none() {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.lifecycle),
+                action: "activate_stale_worker".into(),
+            });
+        }
+        self.worker_active = true;
+        Ok(())
     }
 
     fn complete_worker(
         &mut self,
+        generation: u64,
         engine: Box<dyn InferenceEngine>,
         failure: Option<(String, String)>,
     ) -> RuntimeResult<RuntimeSnapshot> {
-        if self.engine.is_some() || self.worker_status.is_none() {
+        if self.engine.is_some()
+            || self.worker_status.is_none()
+            || self.worker_generation != generation
+        {
             return Err(RuntimeError::State {
                 state: format!("{:?}", self.lifecycle),
                 action: "complete_worker_without_active_worker".into(),
@@ -629,6 +665,7 @@ impl RuntimeInner {
         }
         self.metrics = engine.metrics();
         self.worker_status = None;
+        self.worker_active = false;
         self.engine = Some(engine);
         if let Some((code, message)) = failure {
             self.lifecycle = LifecycleState::Failed;
@@ -1019,7 +1056,10 @@ mod tests {
         .expect("context");
         context.load_model_descriptor(descriptor()).expect("load");
         context.start_processing().expect("start");
-        let engine = context.take_engine_for_worker().expect("transfer engine");
+        let (generation, engine) = context.take_engine_for_worker().expect("transfer engine");
+        context
+            .activate_worker(generation)
+            .expect("activate worker");
         let snapshot = context.snapshot().expect("snapshot");
         assert!(snapshot.engine.is_some());
         let error = context
@@ -1031,7 +1071,7 @@ mod tests {
             .expect_err("worker owns engine");
         assert!(matches!(error, RuntimeError::State { .. }));
         context
-            .complete_worker(engine, None)
+            .complete_worker(generation, engine, None)
             .expect("return engine");
         context.stop_processing().expect("stop");
     }
@@ -1047,11 +1087,14 @@ mod tests {
         .expect("context");
         context.load_model_descriptor(descriptor()).expect("load");
         context.start_processing().expect("start");
-        let engine = context.take_engine_for_worker().expect("transfer engine");
+        let (generation, engine) = context.take_engine_for_worker().expect("transfer engine");
+        context
+            .activate_worker(generation)
+            .expect("activate worker");
         let stopping = context.stop_processing().expect("stop request");
         assert_eq!(stopping.lifecycle, LifecycleState::Stopping);
         let completed = context
-            .complete_worker(engine, None)
+            .complete_worker(generation, engine, None)
             .expect("return engine");
         assert_eq!(completed.lifecycle, LifecycleState::Stopped);
 
@@ -1059,6 +1102,29 @@ mod tests {
             context.take_engine_for_worker(),
             Err(RuntimeError::State { .. })
         ));
+    }
+
+    #[test]
+    fn aborted_worker_lease_cannot_replace_a_rebuilt_engine() {
+        let format = vocal_types::AudioFormat::MONO_16K;
+        let context = RuntimeContext::new(RuntimeConfig {
+            input_format: format,
+            output_format: format,
+            ..RuntimeConfig::default()
+        })
+        .expect("context");
+        context.load_model_descriptor(descriptor()).expect("load");
+        context.start_processing().expect("start");
+        let (generation, engine) = context.take_engine_for_worker().expect("transfer");
+
+        let rollback = context.abort_processing_start().expect("rollback");
+        assert_eq!(rollback.lifecycle, LifecycleState::Ready);
+        assert!(rollback.engine.is_some());
+        assert!(matches!(
+            context.complete_worker(generation, engine, None),
+            Err(RuntimeError::State { .. })
+        ));
+        assert!(context.snapshot().expect("snapshot").engine.is_some());
     }
 
     #[test]

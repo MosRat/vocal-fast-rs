@@ -176,6 +176,22 @@ deconvolution weight changed 44960 relative L2 from `2.9609%` to `2.9599%`.
 This is too small to justify enabling scaling globally, so the default remains
 `1.0`.
 
+The native TensorRT-RTX VIN benchmark confirms the trade-off against the
+existing mixed FP16 plans:
+
+| shape | graph | median | relative L2 | cosine |
+| ---: | --- | ---: | ---: | ---: |
+| 11200 | mixed FP16 | 11.799 ms | 0.1439% | 0.999999234 |
+| 11200 | coherent `0x2` | 8.884 ms | 0.3107% | 0.999995790 |
+| 44960 | mixed FP16 | 37.099 ms | 3.0637% | 0.999535584 |
+| 44960 | coherent `0x2` | 28.675 ms | 3.0481% | 0.999537739 |
+
+The native runs used the same `sine-11200.vin` and `sine-44960.vin` fixtures,
+20 CUDA-event iterations, and the Applio/PyTorch FP32 Synth as the reference.
+The short-window profile therefore remains accuracy-sensitive, while the
+44960 profile is a viable measured performance candidate for voice-model
+validation.
+
 ## Hot residual convolution stage
 
 The largest residual MAC block is upsample stage 1 (bit `0x2`, C=128).  The

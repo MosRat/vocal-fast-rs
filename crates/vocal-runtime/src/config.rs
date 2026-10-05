@@ -240,13 +240,19 @@ impl RuntimeConfig {
 pub fn classify_config_change(
     old: &RuntimeConfig,
     next: &RuntimeConfig,
-    _model_loaded: bool,
+    model_loaded: bool,
 ) -> ConfigUpdateKind {
-    if old.backend != next.backend {
-        return ConfigUpdateKind::RebuildEngine;
-    }
     if old.model_path != next.model_path {
         return ConfigUpdateKind::LoadModelRequired;
+    }
+    if old.backend != next.backend {
+        return if model_loaded {
+            ConfigUpdateKind::RebuildEngine
+        } else {
+            // There is no selected engine to replace yet. Persisting the
+            // backend still changes the engine that will be built on load.
+            ConfigUpdateKind::HotReload
+        };
     }
     if old.backend == RuntimeBackend::TensorRtRtx {
         let artifacts_changed = old.tensorrt_artifacts() != next.tensorrt_artifacts();
@@ -259,7 +265,11 @@ pub fn classify_config_change(
             || old.tensorrt.parallel_acoustic != next.tensorrt.parallel_acoustic
             || old.tensorrt.async_audio_d2h != next.tensorrt.async_audio_d2h;
         if artifacts_changed || runtime_changed {
-            return ConfigUpdateKind::ReloadTensorRtPipeline;
+            return if model_loaded {
+                ConfigUpdateKind::ReloadTensorRtPipeline
+            } else {
+                ConfigUpdateKind::HotReload
+            };
         }
         if trt_plan_config_changed(old, next) {
             return ConfigUpdateKind::PlanBuildRequired;
@@ -285,6 +295,7 @@ pub fn classify_config_change(
 fn trt_plan_config_changed(old: &RuntimeConfig, next: &RuntimeConfig) -> bool {
     old.tensorrt.hubert_source != next.tensorrt.hubert_source
         || old.tensorrt.rmvpe_source != next.tensorrt.rmvpe_source
+        || old.tensorrt.cache_directory != next.tensorrt.cache_directory
         || old.tensorrt.profile != next.tensorrt.profile
         || old.tensorrt.precision != next.tensorrt.precision
         || old.tensorrt.hubert_precision != next.tensorrt.hubert_precision
@@ -422,6 +433,16 @@ mod tests {
             classify_config_change(&old, &backend, true),
             ConfigUpdateKind::RebuildEngine
         );
+        assert_eq!(
+            classify_config_change(&old, &backend, false),
+            ConfigUpdateKind::HotReload
+        );
+        let mut both = backend.clone();
+        both.model_path = Some("new-voice.vfrm".into());
+        assert_eq!(
+            classify_config_change(&old, &both, true),
+            ConfigUpdateKind::LoadModelRequired
+        );
     }
 
     #[test]
@@ -440,6 +461,16 @@ mod tests {
         assert_eq!(
             classify_config_change(&old, &runtime, true),
             ConfigUpdateKind::ReloadTensorRtPipeline
+        );
+        assert_eq!(
+            classify_config_change(&old, &runtime, false),
+            ConfigUpdateKind::HotReload
+        );
+        let mut cache = old.clone();
+        cache.tensorrt.cache_directory = Some("cache".into());
+        assert_eq!(
+            classify_config_change(&old, &cache, true),
+            ConfigUpdateKind::PlanBuildRequired
         );
     }
 

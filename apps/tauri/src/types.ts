@@ -24,6 +24,7 @@ export interface GuiConfig {
   conversion: ConversionConfig;
   backend: Backend;
   modelPath: string | null;
+  modelDirectory: string | null;
   inputDevice: string | null;
   outputDevice: string | null;
   blockFrames: number;
@@ -44,6 +45,33 @@ export interface AudioDeviceInfo {
 export interface AudioDeviceCatalog {
   host: string;
   devices: AudioDeviceInfo[];
+}
+
+export type ModelArtifactKind = 'vfrm' | 'manifest';
+
+export interface ModelCatalogEntry {
+  path: string;
+  kind: ModelArtifactKind;
+  sizeBytes: number;
+  modifiedAtMs: number;
+  id: string;
+  displayName: string;
+  architecture: string;
+  version: string;
+  sampleRate: number;
+  featureDims: number;
+  usesF0: boolean;
+}
+
+export interface ModelCatalogIssue {
+  path: string;
+  message: string;
+}
+
+export interface ModelCatalog {
+  root: string;
+  entries: ModelCatalogEntry[];
+  issues: ModelCatalogIssue[];
 }
 
 export interface AudioTelemetry {
@@ -128,6 +156,7 @@ export function defaultConfig(): GuiConfig {
     },
     backend: 'passthrough',
     modelPath: null,
+    modelDirectory: null,
     inputDevice: null,
     outputDevice: null,
     blockFrames: 480,

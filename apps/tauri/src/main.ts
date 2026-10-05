@@ -6,7 +6,7 @@ import { emit, listen } from '@tauri-apps/api/event';
 import './style.css';
 import './effects.css';
 import { icon, type IconName } from './icons';
-import { formatNumber, lifecycleLabel, statusTone, themeLabel } from './format';
+import { formatBytes, formatNumber, lifecycleLabel, statusTone, themeLabel } from './format';
 import {
   defaultConfig,
   type AudioDeviceCatalog,
@@ -15,6 +15,7 @@ import {
   type ErrorReport,
   type GuiConfig,
   type Lifecycle,
+  type ModelCatalog,
   type Snapshot,
   type ThemePreference,
   type WorkspaceRoute,
@@ -27,6 +28,7 @@ if (!root) throw new Error('missing #app');
 const appRoot = root;
 let snapshot: Snapshot | null = null;
 let devices: AudioDeviceCatalog | null = null;
+let modelCatalog: ModelCatalog | null = null;
 let channelConnected = false;
 let busy = false;
 let localError: ErrorReport | null = null;
@@ -289,6 +291,22 @@ function renderSidebar(): string {
   return `<aside class="sidebar"><div class="sidebar-heading"><div class="brand-mark">V</div><div><strong>Vocal Studio</strong><span>Realtime workspace</span></div></div><div class="nav-label">Workspace</div><nav class="nav-list" aria-label="Workspace navigation">${navItem('studio', 'Studio', 'waveform')}${navItem('audio', 'Audio routing', 'speaker')}${navItem('tuning', 'Voice controls', 'sliders')}${navItem('diagnostics', 'Diagnostics', 'chart')}</nav><div class="sidebar-spacer"></div><div class="shortcut-hint">${icon('keyboard', 15)}<span><kbd>Space</kbd> Start or stop</span></div><button id="themeButton" class="theme-button" title="Change appearance">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 16)}<span>${themeLabel(themePreference)}</span><span class="chevron">${icon('chevron', 14)}</span></button><div class="sidebar-footer"><span class="connection-dot ${channelConnected ? 'online' : ''}"></span>${channelConnected ? 'Control channel connected' : 'Connecting to runtime…'}</div></aside>`;
 }
 
+function renderModelCatalog(config: GuiConfig, running: boolean): string {
+  if (!modelCatalog) {
+    return `<div class="model-library-empty"><span class="model-library-empty-icon">${icon('database', 17)}</span><span>Choose a model library folder and scan it to discover VFRM caches and manifests.</span></div>`;
+  }
+  const entries = modelCatalog.entries
+    .map((entry) => {
+      const selected = config.modelPath === entry.path;
+      return `<button class="model-library-entry ${selected ? 'selected' : ''}" data-model-path="${escapeHtml(entry.path)}" ${running ? 'disabled' : ''}><span class="model-library-entry-mark">${icon(entry.kind === 'vfrm' ? 'database' : 'folder', 16)}</span><span class="model-library-entry-copy"><strong>${escapeHtml(entry.displayName)}</strong><small>${escapeHtml(entry.architecture)} · v${escapeHtml(entry.version)} · ${entry.sampleRate.toLocaleString()} Hz</small></span><span class="model-library-entry-meta"><small>${formatBytes(entry.sizeBytes)}</small><small>${entry.kind.toUpperCase()}</small></span></button>`;
+    })
+    .join('');
+  const issue = modelCatalog.issues.length
+    ? `<details class="model-library-issues"><summary>${icon('alert', 14)}<span>${modelCatalog.issues.length} artifact${modelCatalog.issues.length === 1 ? '' : 's'} skipped</span></summary><ul>${modelCatalog.issues.map((item) => `<li><strong>${escapeHtml(item.path)}</strong><span>${escapeHtml(item.message)}</span></li>`).join('')}</ul></details>`
+    : '';
+  return `<div class="model-library-summary"><span>${icon('folder', 14)}${escapeHtml(modelCatalog.root)}</span><span>${modelCatalog.entries.length} model${modelCatalog.entries.length === 1 ? '' : 's'}</span></div>${entries || '<div class="model-library-empty compact">No supported model manifests or VFRM caches found.</div>'}${issue}`;
+}
+
 function render(): void {
   if (isSplashWindow()) {
     document.documentElement.classList.add('splash-window');
@@ -320,7 +338,7 @@ function render(): void {
       : null;
   appRoot.innerHTML = `${renderTitlebar()}<div class="app-layout">${renderSidebar()}<main class="content"><div class="page-heading"><div><div class="kicker">REALTIME VOICE WORKSPACE</div><h1>Make every take sound like you.</h1><p>Configure your voice chain, start the stream, and keep an eye on the audio path.</p></div><div class="headline-status ${statusTone(status)}"><span class="status-dot"></span><div><strong>${lifecycleLabel(status)}</strong><small>${audio?.active ? 'Audio stream online' : channelConnected ? 'Runtime ready for control' : 'Waiting for runtime'}</small></div></div></div>
     <section class="hero-panel ${running ? 'is-running' : ''}"><div class="hero-glow"></div><div class="hero-grid"></div><div class="hero-content"><div class="eyebrow-row"><span class="eyebrow-chip">${running ? 'LIVE SESSION' : 'SESSION CONTROL'}</span><span class="revision">Revision ${current?.configRevision ?? 0}</span></div><h2>${model ? escapeHtml(model.displayName) : 'No model loaded'}</h2><p>${model ? `${escapeHtml(model.architecture)} · ${model.sampleRate.toLocaleString()} Hz · ${model.featureDims} feature dimensions${model.usesF0 ? ' · F0 enabled' : ''}` : 'Load a .vfr cache or model manifest to prepare your voice chain.'}</p><div class="hero-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><div class="hero-actions">${button('start', running ? 'Streaming' : 'Start stream', running ? 'check' : 'play', 'primary', busy || transitional || !model || running)}${button('stop', 'Stop', 'stop', 'secondary', busy || !running)}${button('demo', 'Test block', 'sparkle', 'ghost', busy || !running || !!audio?.active, 'Run one synthetic block through the engine')}</div></div><div class="hero-orb"><div class="orb-ring ring-one"></div><div class="orb-ring ring-two"></div><div class="orb-core">${icon('waveform', 42)}</div><span class="orb-caption">${running ? 'Listening' : 'Standby'}</span></div></section>
-    <section class="workspace-grid"><article class="panel model-panel span-2" data-section-target="studio">${panelHeader('MODEL LIBRARY', 'Voice model', `<span class="panel-badge">${model ? icon('check', 13) + ' Loaded' : icon('database', 13) + ' Awaiting model'}</span>`)}<div class="model-layout"><div class="model-avatar">${model ? escapeHtml(model.displayName.slice(0, 1).toUpperCase()) : icon('database', 25)}</div><div class="model-details"><strong>${model ? escapeHtml(model.displayName) : 'Choose a model to begin'}</strong><span>${model ? `${escapeHtml(model.id)} · v${escapeHtml(model.version)}` : 'VFRM caches and RVC manifests are supported'}</span>${model ? `<div class="tag-row"><span class="tag">${escapeHtml(model.architecture)}</span><span class="tag">${model.sampleRate.toLocaleString()} Hz</span>${model.usesF0 ? '<span class="tag accent">F0 enabled</span>' : ''}</div>` : ''}</div><div class="model-actions">${button('unload', 'Unload', undefined, 'ghost', busy || transitional || !model || running)}<div class="model-path-row"><input id="modelPath" aria-label="Model path" value="${escapeHtml(config.modelPath ?? '')}" placeholder="Paste a model path…"/><button id="load" class="button primary compact" ${busy || transitional ? 'disabled' : ''} title="Load model">${icon('folder', 15)}<span>Load</span></button></div></div></div></article>
+    <section class="workspace-grid"><article class="panel model-panel span-2" data-section-target="studio">${panelHeader('MODEL LIBRARY', 'Voice model', `<span class="panel-badge">${model ? icon('check', 13) + ' Loaded' : icon('database', 13) + ' Awaiting model'}</span>`)}<div class="model-library-controls"><label class="field-label"><span>Library folder</span><input id="modelDirectory" aria-label="Model library folder" value="${escapeHtml(config.modelDirectory ?? '')}" placeholder="Choose a folder containing model artifacts..." ${running ? 'disabled' : ''}/></label><div class="model-library-actions">${button('browseModels', 'Browse', 'folder', 'secondary', busy || transitional || running || !runningInTauri())}${button('scanModels', 'Scan library', 'refresh', 'secondary', busy || transitional || running)}</div></div><div class="model-library-list">${renderModelCatalog(config, running)}</div><div class="model-layout"><div class="model-avatar">${model ? escapeHtml(model.displayName.slice(0, 1).toUpperCase()) : icon('database', 25)}</div><div class="model-details"><strong>${model ? escapeHtml(model.displayName) : 'Choose a model to begin'}</strong><span>${model ? `${escapeHtml(model.id)} · v${escapeHtml(model.version)}` : 'VFRM caches and RVC manifests are supported'}</span>${model ? `<div class="tag-row"><span class="tag">${escapeHtml(model.architecture)}</span><span class="tag">${model.sampleRate.toLocaleString()} Hz</span>${model.usesF0 ? '<span class="tag accent">F0 enabled</span>' : ''}</div>` : ''}</div><div class="model-actions">${button('unload', 'Unload', undefined, 'ghost', busy || transitional || !model || running)}<div class="model-path-row"><input id="modelPath" aria-label="Model path" value="${escapeHtml(config.modelPath ?? '')}" placeholder="Paste a model path…"/><button id="load" class="button primary compact" ${busy || transitional ? 'disabled' : ''} title="Load model">${icon('folder', 15)}<span>Load</span></button></div></div></div></article>
     <article class="panel audio-panel" data-section-target="audio">${panelHeader('AUDIO ROUTING', 'Devices', button('refreshDevices', 'Refresh', 'refresh', 'icon-only', false, 'Refresh device list'))}<div class="host-line"><span class="live-indicator ${audio?.active ? 'active' : ''}"></span><span>${devices ? escapeHtml(devices.host) : 'Audio host not queried'}</span><span class="host-count">${devices ? `${devices.devices.length} devices` : '—'}</span></div><label class="field-label">Capture<select id="inputDevice" ${running ? 'disabled' : ''}>${deviceOptions('input', config.inputDevice)}</select></label><label class="field-label">Render<select id="outputDevice" ${running ? 'disabled' : ''}>${deviceOptions('output', config.outputDevice)}</select></label><div class="route-summary"><span>${icon('speaker', 14)}${escapeHtml(inputName ?? 'System default')}</span><span class="route-arrow">→</span><span>${escapeHtml(outputName ?? 'System default')}</span></div></article>
     <article class="panel tuning-panel" data-section-target="tuning">${panelHeader('VOICE CONTROLS', 'Shape the sound', '<span class="panel-badge subtle">Live-safe</span>')}<div class="slider-list">${slider('pitch', 'Pitch shift', `${config.conversion.pitchSemitones.toFixed(1)} st`, config.conversion.pitchSemitones, -24, 24, 0.1)}${slider('index', 'Index ratio', config.conversion.indexRatio.toFixed(2), config.conversion.indexRatio, 0, 1, 0.01)}${slider('protect', 'Unvoiced protect', config.conversion.protect.toFixed(2), config.conversion.protect, 0, 1, 0.01)}${slider('rms', 'RMS mix', config.conversion.rmsMixRate.toFixed(2), config.conversion.rmsMixRate, 0, 1, 0.01)}</div></article>
     <article class="panel config-panel" data-section-target="studio">${panelHeader('ENGINE & STREAM', 'Session configuration', '<span class="panel-badge subtle">Optimistic sync</span>')}<label class="field-label">Backend<select id="backend" ${running ? 'disabled' : ''}><option value="passthrough" ${config.backend === 'passthrough' ? 'selected' : ''}>Passthrough</option><option value="rvcCpu" ${config.backend === 'rvcCpu' ? 'selected' : ''}>RVC CPU</option></select></label><div class="form-grid"><label class="field-label">Sample rate<input id="inputRate" type="number" min="1" value="${config.inputFormat.sampleRate}" ${running ? 'disabled' : ''}/></label><label class="field-label">Channels<input id="channels" type="number" min="1" max="8" value="${config.inputFormat.channels}" ${running ? 'disabled' : ''}/></label><label class="field-label">Block frames<input id="blockFrames" type="number" min="1" max="8192" value="${config.blockFrames}" ${running ? 'disabled' : ''}/></label><label class="field-label">Queue depth<input id="queueBlocks" type="number" min="1" max="64" value="${config.queueBlocks}" ${running ? 'disabled' : ''}/></label></div>${button('save', 'Save configuration', 'check', 'primary full', busy || running)}</article>
@@ -365,6 +383,8 @@ function readConfigForm(): GuiConfig {
     backend: (document.querySelector<HTMLSelectElement>('#backend')?.value as Backend) ?? current.backend,
     inputFormat: { sampleRate, channels },
     outputFormat: { sampleRate, channels },
+    modelPath: document.querySelector<HTMLInputElement>('#modelPath')?.value.trim() || null,
+    modelDirectory: document.querySelector<HTMLInputElement>('#modelDirectory')?.value.trim() || null,
     inputDevice: document.querySelector<HTMLSelectElement>('#inputDevice')?.value || null,
     outputDevice: document.querySelector<HTMLSelectElement>('#outputDevice')?.value || null,
     blockFrames: number('blockFrames', current.blockFrames),
@@ -426,6 +446,36 @@ function wireHandlers(): void {
   byId<HTMLInputElement>('modelPath')?.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') byId<HTMLButtonElement>('load')?.click();
   });
+  byId<HTMLButtonElement>('browseModels')?.addEventListener('click', () =>
+    runAction(async () => {
+      const directory = await call<string | null>('pick_model_directory');
+      if (!directory) return undefined;
+      const directoryInput = byId<HTMLInputElement>('modelDirectory');
+      if (directoryInput) directoryInput.value = directory;
+      modelCatalog = await call<ModelCatalog>('list_models', { path: directory });
+      draftConfig = readConfigForm();
+      return undefined;
+    }, 'browse-models'),
+  );
+  byId<HTMLButtonElement>('scanModels')?.addEventListener('click', () =>
+    runAction(async () => {
+      const directory = byId<HTMLInputElement>('modelDirectory')?.value.trim();
+      if (!directory) throw new Error('Model library folder is required');
+      modelCatalog = await call<ModelCatalog>('list_models', { path: directory });
+      draftConfig = { ...(draftConfig ?? snapshot?.config ?? defaultConfig()), modelDirectory: directory };
+      return undefined;
+    }, 'scan-models'),
+  );
+  document.querySelectorAll<HTMLButtonElement>('[data-model-path]').forEach((item) =>
+    item.addEventListener('click', () => {
+      const path = item.dataset.modelPath;
+      if (!path) return;
+      const input = byId<HTMLInputElement>('modelPath');
+      if (input) input.value = path;
+      draftConfig = readConfigForm();
+      render();
+    }),
+  );
   byId<HTMLButtonElement>('unload')?.addEventListener('click', () =>
     runAction(() => call<Snapshot>('unload_model'), 'unload-model'),
   );
@@ -507,7 +557,7 @@ function wireHandlers(): void {
       if (output) output.value = value.toFixed(digits) + (id === 'pitch' ? ' st' : '');
       draftConfig = readConfigForm();
     });
-  ['backend', 'inputRate', 'channels', 'blockFrames', 'queueBlocks', 'inputDevice', 'outputDevice'].forEach((id) =>
+  ['backend', 'inputRate', 'channels', 'blockFrames', 'queueBlocks', 'modelDirectory', 'inputDevice', 'outputDevice'].forEach((id) =>
     byId<HTMLInputElement | HTMLSelectElement>(id)?.addEventListener('change', () => {
       draftConfig = readConfigForm();
     }),
@@ -604,6 +654,10 @@ async function connect(): Promise<void> {
     snapshot = await call<Snapshot>('subscribe', { windowLabel, channel: events });
     channelConnected = true;
     devices = await call<AudioDeviceCatalog>('list_audio_devices');
+    const directory = snapshot.config.modelDirectory;
+    if (directory) {
+      modelCatalog = await call<ModelCatalog>('list_models', { path: directory }).catch(() => null);
+    }
   } catch (error) {
     localError = normalizeError(error);
   }

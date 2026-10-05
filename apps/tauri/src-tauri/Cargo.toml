@@ -31,6 +31,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 webview2-com = "0.39.1"
 windows-core = "0.62"
+rfd = { version = "0.17.2", default-features = false, features = ["common-controls-v6"] }
 
 # This crate is an isolated Cargo workspace, so keep its profiles aligned
 # with the root workspace's fast relink and thin-LTO policy.

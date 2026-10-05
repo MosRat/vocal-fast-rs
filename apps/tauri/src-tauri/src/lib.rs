@@ -61,7 +61,10 @@ pub fn run() {
             }
 
             match state.persisted_model_path() {
-                Ok(Some(model_path)) if std::path::Path::new(&model_path).is_file() => {
+                Ok(Some(model_path))
+                    if std::path::Path::new(&model_path).is_file()
+                        || std::path::Path::new(&model_path).is_dir() =>
+                {
                     let _ = state.set_boot_phase(
                         BootPhase::RestoringModel,
                         Some("Restoring the last voice model…".into()),
@@ -119,6 +122,8 @@ pub fn run() {
             commands::get_snapshot,
             commands::subscribe,
             commands::list_audio_devices,
+            commands::list_models,
+            commands::pick_model_directory,
             commands::update_config,
             commands::load_model,
             commands::unload_model,

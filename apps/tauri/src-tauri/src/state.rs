@@ -15,6 +15,7 @@ use crate::{
 };
 
 pub use crate::snapshot::{UiMetrics, UiSnapshot};
+pub use vocal_runtime::ModelCatalog;
 
 struct RuntimeState {
     runtime: RuntimeContext,
@@ -167,6 +168,11 @@ impl AppState {
 
     pub fn persisted_model_path(&self) -> GuiResult<Option<String>> {
         Ok(self.lock()?.runtime.persisted_model_path()?)
+    }
+
+    pub fn scan_model_directory(&self, path: String) -> GuiResult<ModelCatalog> {
+        let runtime = self.lock()?.runtime.clone();
+        runtime.scan_model_directory(path).map_err(Into::into)
     }
 
     pub fn attach_channel(

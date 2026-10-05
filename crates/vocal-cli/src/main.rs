@@ -2,6 +2,8 @@ use std::{env, fs, path::PathBuf, process::ExitCode};
 #[cfg(feature = "tensorrt-rtx")]
 use std::{io::Read, time::Instant};
 use vocal_audio::{AudioRing, StreamConfig};
+#[cfg(feature = "tensorrt-rtx")]
+use vocal_audio::{read_wav, write_wav_pcm16};
 #[cfg(not(feature = "tensorrt-rtx"))]
 use vocal_engine::tensorrt::{TensorRtCompiler, TrtExecCompiler};
 use vocal_engine::tensorrt::{TensorRtGraphOptions, build_rvc_graph};
@@ -29,7 +31,7 @@ use cli_state::CliStatus;
 
 fn usage() {
     eprintln!(
-        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
+        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model run-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> <output.wav>\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
     );
     eprintln!("  model benchmark-trt <output.plan> <input.vin> <output.bin> [iterations]");
 }
@@ -137,6 +139,11 @@ fn run(args: Vec<String>) -> CliResult<()> {
             if command == "model" && subcommand == "test-trt-pipeline" =>
         {
             test_trt_pipeline(artifacts.into(), cache.into(), input.into(), false)
+        }
+        [command, subcommand, artifacts, cache, input, output]
+            if command == "model" && subcommand == "run-trt-pipeline" =>
+        {
+            run_trt_pipeline(artifacts.into(), cache.into(), input.into(), output.into())
         }
         [command, subcommand, artifacts, cache, input]
             if command == "model" && subcommand == "profile-trt-pipeline" =>
@@ -350,6 +357,97 @@ fn test_trt_pipeline(
 }
 
 #[cfg(feature = "tensorrt-rtx")]
+fn run_trt_pipeline(
+    artifacts_path: PathBuf,
+    cache: PathBuf,
+    input: PathBuf,
+    output: PathBuf,
+) -> CliResult<()> {
+    let artifacts: vocal_tensorrt::RvcTrtPipelineArtifacts =
+        serde_json::from_slice(&fs::read(&artifacts_path)?)?;
+    let package = load_cache(cache)?;
+    let synth_config = package
+        .rvc_synth_config()?
+        .ok_or("cache has no rvc_synth config")?;
+    let samples = read_f32_audio(&input)?;
+    if samples.is_empty() {
+        return Err("offline input contains no samples".into());
+    }
+    let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
+    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config(
+        &artifacts,
+        synth_config.clone(),
+        trt_config.runtime,
+        trt_config.diagnostics,
+    )?;
+    let profile = artifacts.profile;
+    let min_samples = profile.min_samples.max(160) as usize;
+    let max_samples = profile.max_samples.max(min_samples as i32) as usize;
+    let preferred_samples = profile.opt_samples.max(min_samples as i32) as usize;
+    let mut output_audio = Vec::new();
+    let mut input_offset = 0usize;
+    let started = Instant::now();
+    let mut windows = 0usize;
+    while input_offset < samples.len() {
+        let remaining = samples.len() - input_offset;
+        let source_len = remaining.min(max_samples);
+        let aligned_len = round_up_audio_samples(source_len, 160);
+        let window_len = if aligned_len < min_samples {
+            preferred_samples.max(aligned_len)
+        } else {
+            aligned_len.min(max_samples)
+        };
+        let valid_len = source_len.min(window_len);
+        let mut window = vec![0.0f32; window_len];
+        window[..valid_len].copy_from_slice(&samples[input_offset..input_offset + valid_len]);
+        let result = pipeline.process(&window, 0)?;
+        let keep = if valid_len < window_len {
+            result.audio.len().saturating_mul(valid_len) / window_len
+        } else {
+            result.audio.len()
+        };
+        output_audio.extend_from_slice(&result.audio[..keep]);
+        input_offset += source_len;
+        windows += 1;
+    }
+    write_wav_pcm16(&output, synth_config.sample_rate, &output_audio)
+        .map_err(|error| format!("write output WAV {}: {error}", output.display()))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "input": input,
+            "output": output,
+            "input_samples_16k": samples.len(),
+            "output_samples": output_audio.len(),
+            "output_sample_rate": synth_config.sample_rate,
+            "windows": windows,
+            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "cuda_graph": pipeline.cuda_graph_stats(),
+        })
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "tensorrt-rtx"))]
+fn run_trt_pipeline(
+    _artifacts: PathBuf,
+    _cache: PathBuf,
+    _input: PathBuf,
+    _output: PathBuf,
+) -> CliResult<()> {
+    Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
+}
+
+#[cfg(feature = "tensorrt-rtx")]
+fn round_up_audio_samples(samples: usize, hop: usize) -> usize {
+    samples
+        .saturating_add(hop.saturating_sub(1))
+        .checked_div(hop)
+        .unwrap_or(0)
+        .saturating_mul(hop)
+}
+
+#[cfg(feature = "tensorrt-rtx")]
 fn compare_trt_pipeline(
     artifacts_path: PathBuf,
     cache: PathBuf,
@@ -523,40 +621,9 @@ fn compare_trt_pipeline(
 fn read_f32_audio(path: &PathBuf) -> CliResult<Vec<f32>> {
     let bytes = fs::read(path)?;
     if bytes.len() >= 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
-        let channels = u16::from_le_bytes(bytes[22..24].try_into()?);
-        let bits = u16::from_le_bytes(bytes[34..36].try_into()?);
-        let format = u16::from_le_bytes(bytes[20..22].try_into()?);
-        let marker = bytes
-            .windows(4)
-            .position(|w| w == b"data")
-            .ok_or("WAV data chunk missing")?;
-        let data_pos = marker
-            .checked_add(8)
-            .ok_or("WAV data chunk offset overflow")?;
-        let data_header_end = marker
-            .checked_add(8)
-            .ok_or("WAV data chunk header overflow")?;
-        if data_header_end > bytes.len() {
-            return Err("WAV data chunk header is truncated".into());
-        }
-        let data_len = u32::from_le_bytes(bytes[marker + 4..data_header_end].try_into()?) as usize;
-        let data_end = data_pos
-            .checked_add(data_len)
-            .ok_or("WAV data chunk size overflow")?;
-        if data_end > bytes.len() {
-            return Err("WAV data chunk is truncated".into());
-        }
-        let data = &bytes[data_pos..data_end];
-        if channels != 1 || format != 1 || bits != 16 {
-            return Err("only mono PCM16 WAV is supported".into());
-        }
-        if !data.len().is_multiple_of(2) {
-            return Err("PCM16 WAV data has an incomplete sample".into());
-        }
-        return Ok(data
-            .chunks_exact(2)
-            .map(|x| i16::from_le_bytes([x[0], x[1]]) as f32 / 32768.0)
-            .collect());
+        return Ok(read_wav(path)
+            .map_err(|error| format!("decode WAV {}: {error}", path.display()))?
+            .mono_16k());
     }
     if !bytes.len().is_multiple_of(4) {
         return Err("raw f32 input size must be a multiple of four bytes".into());

@@ -1,5 +1,17 @@
+mod build_support;
+
 use std::{env, path::PathBuf, process::Command};
+
 fn main() {
+    for variable in [
+        "TENSORRT_RTX_ROOT",
+        "TRT_RTX_ROOT",
+        "TENSORRT_ROOT",
+        "TRT_ROOT",
+        "CUDA_PATH",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
     let r = env::var_os("TENSORRT_RTX_ROOT")
         .or_else(|| env::var_os("TRT_RTX_ROOT"))
         .or_else(|| env::var_os("TENSORRT_ROOT"))
@@ -44,6 +56,12 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=tensorrt_onnxparser_rtx_1_6");
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cufft");
+    println!("cargo:rerun-if-env-changed=VOCAL_TRT_COPY_DLLS");
+    println!("cargo:rerun-if-env-changed=VOCAL_TRT_DLL_DIR");
+    if target_os_is_windows() && build_support::enabled() {
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
+        build_support::deploy(&r, &c, &out_dir);
+    }
     cc::Build::new()
         .cpp(true)
         .files([
@@ -101,6 +119,10 @@ fn main() {
     }
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=vocal_tensorrt_cufft");
+}
+
+fn target_os_is_windows() -> bool {
+    env::var("CARGO_CFG_TARGET_OS").is_ok_and(|value| value.eq_ignore_ascii_case("windows"))
 }
 
 fn find_msvc_cl() -> Option<PathBuf> {

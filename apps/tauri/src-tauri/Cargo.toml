@@ -6,6 +6,10 @@ publish = false
 
 [workspace]
 
+[features]
+default = []
+tensorrt-rtx = ["vocal-engine/tensorrt-rtx", "vocal-runtime/tensorrt-rtx"]
+
 [lib]
 name = "vocal_fast_tauri_lib"
 path = "src/lib.rs"

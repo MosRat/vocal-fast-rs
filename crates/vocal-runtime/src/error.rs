@@ -12,6 +12,8 @@ pub enum RuntimeError {
     ConfigConflict { expected: u64, actual: u64 },
     #[error("runtime lock was poisoned")]
     Lock,
+    #[error("runtime control actor unavailable: {0}")]
+    ControlClosed(String),
     #[error("model error: {0}")]
     Model(#[from] vocal_model::ModelError),
     #[error("engine error: {0}")]
@@ -31,6 +33,7 @@ impl RuntimeError {
             Self::State { .. } => "runtime.invalid_state",
             Self::ConfigConflict { .. } => "runtime.config_conflict",
             Self::Lock => "runtime.lock",
+            Self::ControlClosed(_) => "runtime.control_closed",
             Self::Model(error) => error.code(),
             Self::Engine(error) => error.code(),
             Self::Types(_) => "runtime.invalid_types",

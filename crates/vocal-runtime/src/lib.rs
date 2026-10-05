@@ -1,8 +1,11 @@
 //! Shared application runtime used by CLI and Tauri controllers.
 //!
-//! This crate owns configuration, model loading, engine construction and the
-//! processing state machine. Controllers provide presentation and transport:
-//! Tauri owns channels/device views, while CLI owns argument parsing/output.
+//! The public context is a bounded control-channel handle. A single actor
+//! owns lifecycle/configuration state and the idle engine. During an active
+//! audio session the engine is transferred to the model worker, while capture
+//! and render remain on their own SPSC rings. Controllers provide presentation
+//! and transport: Tauri owns device views, while CLI owns argument parsing and
+//! output.
 
 mod config;
 mod error;

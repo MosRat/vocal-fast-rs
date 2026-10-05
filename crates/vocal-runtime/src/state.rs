@@ -160,249 +160,90 @@ struct RuntimeInner {
     /// cache is weak by design, so this strong reference lets controllers
     /// share parsed packages without re-reading the file.
     model_package: Option<Arc<ModelPackage>>,
+    /// The control actor owns this engine while no audio model worker is
+    /// running. During an active stream ownership moves to that worker.
     engine: Option<Box<dyn InferenceEngine>>,
+    worker_status: Option<EngineStatus>,
     metrics: LatencyMetrics,
     last_error: Option<RuntimeErrorInfo>,
     config_store: Option<crate::ConfigStore>,
 }
 
+type RuntimeCommand = Box<dyn FnOnce(&mut RuntimeInner) + Send + 'static>;
+
+/// Thread-safe handle for the runtime control actor.
+///
+/// Calls enqueue bounded commands and wait for a typed reply. The actor is the
+/// only owner of mutable lifecycle state; no controller shares an engine
+/// reference across threads.
 #[derive(Clone)]
 pub struct RuntimeContext {
-    inner: std::sync::Arc<std::sync::Mutex<RuntimeInner>>,
-    operation: std::sync::Arc<std::sync::Mutex<()>>,
+    control: std::sync::mpsc::SyncSender<RuntimeCommand>,
 }
 
 impl RuntimeContext {
+    const CONTROL_CAPACITY: usize = 64;
+
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
         config.validate()?;
-        Ok(Self {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(RuntimeInner {
-                lifecycle: LifecycleState::Created,
-                config,
-                config_revision: 0,
-                model: None,
-                descriptor: None,
-                model_package: None,
-                engine: None,
-                metrics: LatencyMetrics::default(),
-                last_error: None,
-                config_store: None,
-            })),
-            operation: std::sync::Arc::new(std::sync::Mutex::new(())),
-        })
+        let (control, commands) = std::sync::mpsc::sync_channel(Self::CONTROL_CAPACITY);
+        let mut state = RuntimeInner {
+            lifecycle: LifecycleState::Created,
+            config,
+            config_revision: 0,
+            model: None,
+            descriptor: None,
+            model_package: None,
+            engine: None,
+            worker_status: None,
+            metrics: LatencyMetrics::default(),
+            last_error: None,
+            config_store: None,
+        };
+        std::thread::Builder::new()
+            .name("vocal-runtime-control".into())
+            .spawn(move || runtime_actor(commands, &mut state))
+            .map_err(|error| RuntimeError::ControlClosed(error.to_string()))?;
+        Ok(Self { control })
+    }
+
+    fn request<T, F>(&self, command: F) -> RuntimeResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut RuntimeInner) -> RuntimeResult<T> + Send + 'static,
+    {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.control
+            .send(Box::new(move |state| {
+                let _ = reply.send(command(state));
+            }))
+            .map_err(|_| RuntimeError::ControlClosed("runtime control actor stopped".into()))?;
+        result
+            .recv()
+            .map_err(|_| RuntimeError::ControlClosed("runtime control response dropped".into()))?
     }
 
     pub fn set_config_store(&self, store: crate::ConfigStore) -> RuntimeResult<()> {
-        let _operation = self.operation()?;
-        let loaded = store.load()?;
-        let mut state = self.lock()?;
-        state.config_store = Some(store);
-        if let Some(config) = loaded {
-            state.config = config;
-            state.config_revision = state.config_revision.saturating_add(1);
-        }
-        Ok(())
+        self.request(move |state| state.set_config_store(store))
     }
 
     pub fn config(&self) -> RuntimeResult<RuntimeConfig> {
-        Ok(self.lock()?.config.clone())
+        self.request(|state| Ok(state.config.clone()))
     }
 
     pub fn snapshot(&self) -> RuntimeResult<RuntimeSnapshot> {
-        Ok(self.lock()?.snapshot())
+        self.request(|state| Ok(state.snapshot()))
     }
 
     pub fn persisted_model_path(&self) -> RuntimeResult<Option<String>> {
-        Ok(self.lock()?.config.model_path.clone())
+        self.request(|state| Ok(state.config.model_path.clone()))
     }
 
     pub fn scan_model_directory(&self, root: impl Into<String>) -> RuntimeResult<ModelCatalog> {
-        // Catalog inspection only reads filesystem metadata and never mutates
-        // runtime state. Do not take the control operation mutex here: a slow
-        // antivirus/network directory scan must not stall audio processing.
-        let root = PathBuf::from(root.into());
-        let root = fs::canonicalize(&root).map_err(|error| RuntimeError::Io {
-            path: root.clone(),
-            message: error.to_string(),
-        })?;
-        if !root.is_dir() {
-            return Err(RuntimeError::Config(format!(
-                "model library is not a directory: {}",
-                root.display()
-            )));
-        }
-
-        const MAX_DEPTH: usize = 3;
-        const MAX_ENTRIES: usize = 512;
-        const MAX_MODEL_FILES: usize = 4096;
-        const MAX_ISSUES: usize = 512;
-        const MAX_SCAN_METADATA_BYTES: u64 = 4 * 1024 * 1024;
-        let load_config = ModelLoadConfig {
-            max_metadata_bytes: MAX_SCAN_METADATA_BYTES,
-            ..ModelLoadConfig::default()
-        };
-        let mut directories = vec![(root.clone(), 0_usize)];
-        let mut visited = HashSet::new();
-        let mut entries = Vec::new();
-        let mut issues = Vec::new();
-        let mut model_files_seen = 0_usize;
-        while let Some((directory, depth)) = directories.pop() {
-            if model_files_seen >= MAX_MODEL_FILES {
-                break;
-            }
-            if !visited.insert(directory.clone()) {
-                continue;
-            }
-            let read_dir = match fs::read_dir(&directory) {
-                Ok(read_dir) => read_dir,
-                Err(error) => {
-                    push_catalog_issue(
-                        &mut issues,
-                        MAX_ISSUES,
-                        directory.display().to_string(),
-                        error.to_string(),
-                    );
-                    continue;
-                }
-            };
-            for item in read_dir {
-                if entries.len() >= MAX_ENTRIES {
-                    push_catalog_issue(
-                        &mut issues,
-                        MAX_ISSUES,
-                        root.display().to_string(),
-                        format!("model library limit reached ({MAX_ENTRIES} entries)"),
-                    );
-                    break;
-                }
-                let item = match item {
-                    Ok(item) => item,
-                    Err(error) => {
-                        push_catalog_issue(
-                            &mut issues,
-                            MAX_ISSUES,
-                            directory.display().to_string(),
-                            error.to_string(),
-                        );
-                        continue;
-                    }
-                };
-                let path = item.path();
-                let metadata = match item.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        push_catalog_issue(
-                            &mut issues,
-                            MAX_ISSUES,
-                            path.display().to_string(),
-                            error.to_string(),
-                        );
-                        continue;
-                    }
-                };
-                if metadata.is_dir() {
-                    let canonical_path = match canonical_library_path(&path, &root) {
-                        Ok(path) => path,
-                        Err(error) => {
-                            push_catalog_issue(
-                                &mut issues,
-                                MAX_ISSUES,
-                                path.display().to_string(),
-                                error,
-                            );
-                            continue;
-                        }
-                    };
-                    if depth < MAX_DEPTH {
-                        directories.push((canonical_path, depth + 1));
-                    }
-                    continue;
-                }
-                if !metadata.is_file() || !is_model_catalog_file(&path) {
-                    continue;
-                }
-                model_files_seen = model_files_seen.saturating_add(1);
-                if model_files_seen > MAX_MODEL_FILES {
-                    push_catalog_issue(
-                        &mut issues,
-                        MAX_ISSUES,
-                        root.display().to_string(),
-                        format!("model file scan limit reached ({MAX_MODEL_FILES} files)"),
-                    );
-                    break;
-                }
-                let canonical_path = match canonical_library_path(&path, &root) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        push_catalog_issue(
-                            &mut issues,
-                            MAX_ISSUES,
-                            path.display().to_string(),
-                            error,
-                        );
-                        continue;
-                    }
-                };
-                let manifest = match inspect_model_manifest_with_config(&path, &load_config) {
-                    Ok(manifest) => manifest,
-                    Err(error) => {
-                        let is_named_manifest = path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.eq_ignore_ascii_case("manifest.json")
-                                    || name.eq_ignore_ascii_case("model.json")
-                                    || name.eq_ignore_ascii_case("vocal-fast.json")
-                            });
-                        if is_named_manifest || is_vfrm_path(&path) {
-                            push_catalog_issue(
-                                &mut issues,
-                                MAX_ISSUES,
-                                path.display().to_string(),
-                                error.to_string(),
-                            );
-                        }
-                        continue;
-                    }
-                };
-                let path_string = canonical_path.display().to_string();
-                let artifact_bytes = metadata.len();
-                let kind =
-                    model_artifact_kind(&canonical_path).unwrap_or(ModelArtifactKind::Manifest);
-                let referenced_bytes = if kind == ModelArtifactKind::Manifest {
-                    referenced_model_bytes(&canonical_path, &manifest)
-                } else {
-                    0
-                };
-                entries.push(ModelCatalogEntry {
-                    path: path_string,
-                    kind,
-                    size_bytes: artifact_bytes.saturating_add(referenced_bytes),
-                    modified_at_ms: metadata
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-                        .unwrap_or_default(),
-                    model: ModelSummary::from(&manifest),
-                });
-            }
-        }
-        entries.sort_by(|left, right| {
-            left.model
-                .display_name
-                .to_ascii_lowercase()
-                .cmp(&right.model.display_name.to_ascii_lowercase())
-                .then_with(|| artifact_priority(left.kind).cmp(&artifact_priority(right.kind)))
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        let mut identities = HashSet::new();
-        entries.retain(|entry| identities.insert(catalog_identity(entry)));
-        Ok(ModelCatalog {
-            root: root.display().to_string(),
-            entries,
-            issues,
-        })
+        // Directory inspection is read-only and can touch slow or
+        // antivirus-scanned files. Keep it off the control actor so a catalog
+        // refresh cannot delay lifecycle commands or worker ownership handoff.
+        scan_model_directory_impl(root.into())
     }
 
     pub fn update_config(
@@ -410,43 +251,130 @@ impl RuntimeContext {
         config: RuntimeConfig,
         expected_revision: u64,
     ) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
-        config.validate()?;
-        let (descriptor, store) = {
-            let state = self.lock()?;
-            self.check_revision(&state, expected_revision)?;
-            if matches!(
-                state.lifecycle,
-                LifecycleState::Running | LifecycleState::Stopping
-            ) {
-                return Err(RuntimeError::State {
-                    state: format!("{:?}", state.lifecycle),
-                    action: "update_config".into(),
-                });
-            }
-            (state.descriptor.clone(), state.config_store.clone())
-        };
-        let replacement = descriptor
-            .as_ref()
-            .map(|descriptor| create_runtime_engine(&config, descriptor))
-            .transpose()?;
-        if let Some(store) = &store {
-            store.save(&config)?;
-        }
-        let mut state = self.lock()?;
-        self.check_revision(&state, expected_revision)?;
-        state.config = config;
-        state.config_revision = state.config_revision.saturating_add(1);
-        if replacement.is_some() {
-            state.engine = replacement;
-        }
-        Ok(state.snapshot())
+        self.request(move |state| state.update_config(config, expected_revision))
     }
 
     pub fn load_model(&self, path: impl Into<String>) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
+        let path = path.into();
+        self.request(move |state| state.load_model(path))
+    }
+
+    pub fn unload_model(&self) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(RuntimeInner::unload_model)
+    }
+
+    /// Process a synchronous, non-audio block through the control actor. The
+    /// live audio path uses take_engine_for_worker instead, so it never sends
+    /// samples through this command channel.
+    pub fn process(&self, input: &AudioChunk) -> RuntimeResult<AudioChunk> {
+        let input = input.clone();
+        self.request(move |state| state.process(&input))
+    }
+
+    pub fn load_model_descriptor(
+        &self,
+        descriptor: ModelDescriptor,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(move |state| state.load_model_descriptor(descriptor))
+    }
+
+    pub fn start_processing(&self) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(RuntimeInner::start_processing)
+    }
+
+    pub fn stop_processing(&self) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(RuntimeInner::stop_processing)
+    }
+
+    pub fn abort_processing_start(&self) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(RuntimeInner::abort_processing_start)
+    }
+
+    pub fn report_failure(
+        &self,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        let code = code.into();
+        let message = message.into();
+        self.request(move |state| state.report_failure(code, message))
+    }
+
+    pub fn clear_error(&self) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(RuntimeInner::clear_error)
+    }
+
+    /// Transfer engine ownership to the dedicated audio/model worker after
+    /// the lifecycle has entered Running.
+    pub fn take_engine_for_worker(&self) -> RuntimeResult<Box<dyn InferenceEngine>> {
+        self.request(RuntimeInner::take_engine_for_worker)
+    }
+
+    /// Return the engine after the model worker exits. This is a control
+    /// message, so the worker never touches shared runtime state directly.
+    pub fn complete_worker(
+        &self,
+        engine: Box<dyn InferenceEngine>,
+        failure: Option<(String, String)>,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(move |state| state.complete_worker(engine, failure))
+    }
+}
+
+fn runtime_actor(commands: std::sync::mpsc::Receiver<RuntimeCommand>, state: &mut RuntimeInner) {
+    while let Ok(command) = commands.recv() {
+        command(state);
+    }
+}
+
+impl RuntimeInner {
+    fn set_config_store(&mut self, store: crate::ConfigStore) -> RuntimeResult<()> {
+        let loaded = store.load()?;
+        self.config_store = Some(store);
+        if let Some(config) = loaded {
+            self.config = config;
+            self.config_revision = self.config_revision.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn update_config(
+        &mut self,
+        config: RuntimeConfig,
+        expected_revision: u64,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        config.validate()?;
+        self.check_revision(expected_revision)?;
+        if self.worker_status.is_some()
+            || matches!(
+                self.lifecycle,
+                LifecycleState::Running | LifecycleState::Stopping
+            )
+        {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.lifecycle),
+                action: "update_config".into(),
+            });
+        }
+        let replacement = self
+            .descriptor
+            .as_ref()
+            .map(|descriptor| create_runtime_engine(&config, descriptor))
+            .transpose()?;
+        if let Some(store) = &self.config_store {
+            store.save(&config)?;
+        }
+        self.config = config;
+        self.config_revision = self.config_revision.saturating_add(1);
+        if replacement.is_some() {
+            self.engine = replacement;
+        }
+        Ok(self.snapshot())
+    }
+
+    fn load_model(&mut self, path: String) -> RuntimeResult<RuntimeSnapshot> {
         self.transition(LifecycleState::Loading, "load_model")?;
-        match self.load_model_inner(path.into()) {
+        match self.load_model_inner(path) {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 self.fail(&error);
@@ -455,102 +383,92 @@ impl RuntimeContext {
         }
     }
 
-    pub fn unload_model(&self) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
-        let mut state = self.lock()?;
-        if matches!(
-            state.lifecycle,
-            LifecycleState::Loading | LifecycleState::Running | LifecycleState::Stopping
-        ) {
+    fn unload_model(&mut self) -> RuntimeResult<RuntimeSnapshot> {
+        if self.worker_status.is_some()
+            || matches!(
+                self.lifecycle,
+                LifecycleState::Loading | LifecycleState::Running | LifecycleState::Stopping
+            )
+        {
             return Err(RuntimeError::State {
-                state: format!("{:?}", state.lifecycle),
+                state: format!("{:?}", self.lifecycle),
                 action: "unload_model".into(),
             });
         }
-        state.engine = None;
-        state.model = None;
-        state.descriptor = None;
-        state.model_package = None;
-        state.config.model_path = None;
-        state.metrics = LatencyMetrics::default();
-        state.config_revision = state.config_revision.saturating_add(1);
-        if let Some(store) = &state.config_store {
-            store.save(&state.config)?;
+        self.engine = None;
+        self.worker_status = None;
+        self.model = None;
+        self.descriptor = None;
+        self.model_package = None;
+        self.config.model_path = None;
+        self.metrics = LatencyMetrics::default();
+        self.config_revision = self.config_revision.saturating_add(1);
+        if let Some(store) = &self.config_store {
+            store.save(&self.config)?;
         }
-        state.lifecycle = LifecycleState::Created;
-        state.last_error = None;
-        Ok(state.snapshot())
+        self.lifecycle = LifecycleState::Created;
+        self.last_error = None;
+        Ok(self.snapshot())
     }
 
-    pub fn process(&self, input: &AudioChunk) -> RuntimeResult<AudioChunk> {
-        // The engine is exclusively mutable behind `inner`; lifecycle control
-        // methods also take that mutex and reject changes while Running. The
-        // separate control-operation mutex is intentionally omitted here so a
-        // slow control-plane command cannot delay an audio worker block.
+    fn process(&mut self, input: &AudioChunk) -> RuntimeResult<AudioChunk> {
         if input.samples.len() > MAX_CONTROL_BLOCK_SAMPLES {
             return Err(RuntimeError::Config(format!(
                 "control block exceeds {MAX_CONTROL_BLOCK_SAMPLES} samples"
             )));
         }
         input.validate()?;
-        let mut state = self.lock()?;
-        if state.lifecycle != LifecycleState::Running {
+        if self.lifecycle != LifecycleState::Running {
             return Err(RuntimeError::State {
-                state: format!("{:?}", state.lifecycle),
+                state: format!("{:?}", self.lifecycle),
                 action: "process".into(),
             });
         }
-        let config = state.config.conversion;
-        let engine = state.engine.as_mut().ok_or_else(|| RuntimeError::State {
-            state: "no_engine".into(),
+        let config = self.config.conversion;
+        let engine = self.engine.as_mut().ok_or_else(|| RuntimeError::State {
+            state: "model_worker_owns_engine".into(),
             action: "process".into(),
         })?;
-        let result = engine.process(input, config);
-        match result {
+        match engine.process(input, config) {
             Ok(output) => {
-                state.metrics = engine.metrics();
+                self.metrics = engine.metrics();
                 Ok(output)
             }
             Err(error) => {
-                state.last_error = Some(RuntimeErrorInfo {
+                self.last_error = Some(RuntimeErrorInfo {
                     code: error.code().into(),
                     message: error.to_string(),
                 });
-                state.lifecycle = LifecycleState::Failed;
+                self.lifecycle = LifecycleState::Failed;
                 Err(error.into())
             }
         }
     }
 
-    /// Install an already-resolved model descriptor and construct the
-    /// configured engine. This keeps descriptor based adapters and file based
-    /// model loading on the same lifecycle and processing API.
-    pub fn load_model_descriptor(
-        &self,
+    fn load_model_descriptor(
+        &mut self,
         descriptor: ModelDescriptor,
     ) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
         self.transition(LifecycleState::Loading, "load_model_descriptor")?;
         let result = (|| {
             descriptor.validate()?;
-            let config = self.lock()?.config.clone();
+            let config = self.config.clone();
             let engine = create_runtime_engine(&config, &descriptor)?;
-            let store = self.lock()?.config_store.clone();
-            if let Some(store) = &store {
+            if let Some(store) = &self.config_store {
                 let mut persisted = config.clone();
                 persisted.model_path = None;
                 store.save(&persisted)?;
             }
-            let mut state = self.lock()?;
-            state.config.model_path = None;
-            state.config_revision = state.config_revision.saturating_add(1);
-            state.model = Some(ModelSummary::from_descriptor(&descriptor));
-            state.descriptor = Some(descriptor);
-            state.model_package = None;
-            state.engine = Some(engine);
-            state.lifecycle = LifecycleState::Ready;
-            state.last_error = None;
-            Ok(state.snapshot())
+            self.config.model_path = None;
+            self.config_revision = self.config_revision.saturating_add(1);
+            self.model = Some(ModelSummary::from_descriptor(&descriptor));
+            self.descriptor = Some(descriptor);
+            self.model_package = None;
+            self.engine = Some(engine);
+            self.worker_status = None;
+            self.lifecycle = LifecycleState::Ready;
+            self.last_error = None;
+            Ok(self.snapshot())
         })();
         match result {
             Ok(snapshot) => Ok(snapshot),
@@ -561,87 +479,88 @@ impl RuntimeContext {
         }
     }
 
-    pub fn start_processing(&self) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
-        let mut state = self.lock()?;
-        if state.descriptor.is_none() || state.engine.is_none() {
+    fn start_processing(&mut self) -> RuntimeResult<RuntimeSnapshot> {
+        if self.descriptor.is_none() || self.engine.is_none() {
             return Err(RuntimeError::State {
-                state: format!("{:?}", state.lifecycle),
+                state: format!("{:?}", self.lifecycle),
                 action: "start_without_model".into(),
             });
         }
-        if !state.lifecycle.can_transition_to(LifecycleState::Running) {
+        if !self.lifecycle.can_transition_to(LifecycleState::Running) {
             return Err(RuntimeError::State {
-                state: format!("{:?}", state.lifecycle),
+                state: format!("{:?}", self.lifecycle),
                 action: "start".into(),
             });
         }
-        state.lifecycle = LifecycleState::Running;
-        state.last_error = None;
-        Ok(state.snapshot())
+        self.lifecycle = LifecycleState::Running;
+        self.last_error = None;
+        Ok(self.snapshot())
     }
 
-    pub fn stop_processing(&self) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
-        let mut state = self.lock()?;
+    fn stop_processing(&mut self) -> RuntimeResult<RuntimeSnapshot> {
         if !matches!(
-            state.lifecycle,
+            self.lifecycle,
             LifecycleState::Running | LifecycleState::Ready
         ) {
             return Err(RuntimeError::State {
-                state: format!("{:?}", state.lifecycle),
+                state: format!("{:?}", self.lifecycle),
                 action: "stop".into(),
             });
         }
-        state.lifecycle = LifecycleState::Stopped;
-        Ok(state.snapshot())
-    }
-
-    /// Roll back a start attempt when the device adapter could not open. The
-    /// engine remains loaded and ready for another device attempt.
-    pub fn abort_processing_start(&self) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
-        let mut state = self.lock()?;
-        if state.engine.is_some() {
-            state.lifecycle = LifecycleState::Ready;
+        self.lifecycle = if self.worker_status.is_some() {
+            LifecycleState::Stopping
         } else {
-            state.lifecycle = LifecycleState::Created;
-        }
-        Ok(state.snapshot())
+            LifecycleState::Stopped
+        };
+        Ok(self.snapshot())
     }
 
-    /// Publish a fatal adapter failure into the shared runtime state. The
-    /// controller decides how to transport the resulting snapshot.
-    pub fn report_failure(
-        &self,
+    fn abort_processing_start(&mut self) -> RuntimeResult<RuntimeSnapshot> {
+        if self.worker_status.is_some() {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.lifecycle),
+                action: "abort_processing_start_with_active_worker".into(),
+            });
+        }
+        if self.engine.is_none()
+            && let Some(descriptor) = self.descriptor.as_ref()
+        {
+            self.engine = Some(create_runtime_engine(&self.config, descriptor)?);
+        }
+        self.lifecycle = if self.engine.is_some() {
+            LifecycleState::Ready
+        } else {
+            LifecycleState::Created
+        };
+        Ok(self.snapshot())
+    }
+
+    fn report_failure(
+        &mut self,
         code: impl Into<String>,
         message: impl Into<String>,
     ) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
-        let mut state = self.lock()?;
-        state.lifecycle = LifecycleState::Failed;
-        state.last_error = Some(RuntimeErrorInfo {
+        self.lifecycle = LifecycleState::Failed;
+        self.last_error = Some(RuntimeErrorInfo {
             code: code.into(),
             message: message.into(),
         });
-        Ok(state.snapshot())
+        Ok(self.snapshot())
     }
 
-    pub fn clear_error(&self) -> RuntimeResult<RuntimeSnapshot> {
-        let _operation = self.operation()?;
-        let mut state = self.lock()?;
-        state.last_error = None;
-        if state.lifecycle == LifecycleState::Failed {
-            state.lifecycle = if state.engine.is_some() {
+    fn clear_error(&mut self) -> RuntimeResult<RuntimeSnapshot> {
+        self.last_error = None;
+        if self.lifecycle == LifecycleState::Failed {
+            self.lifecycle = if self.engine.is_some() || self.worker_status.is_some() {
                 LifecycleState::Ready
             } else {
                 LifecycleState::Created
             };
         }
-        Ok(state.snapshot())
+        Ok(self.snapshot())
     }
 
-    fn load_model_inner(&self, path: String) -> RuntimeResult<RuntimeSnapshot> {
+    fn load_model_inner(&mut self, path: String) -> RuntimeResult<RuntimeSnapshot> {
         let input = resolve_model_path(Path::new(&path))?;
         if !input.is_file() {
             return Err(RuntimeError::Config(format!(
@@ -659,69 +578,278 @@ impl RuntimeContext {
             (package.clone(), package.manifest.clone())
         } else {
             let manifest = loader.load_manifest(&input)?;
-            let root = input.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let root = input.parent().unwrap_or_else(|| Path::new("."));
             let package = Arc::new(loader.load_rvc_directory(root, manifest.clone())?);
             (package, manifest)
         };
         let descriptor = manifest.descriptor();
-        let mut config = self.lock()?.config.clone();
+        let mut config = self.config.clone();
         config.model_path = Some(input.display().to_string());
         let engine = create_runtime_engine(&config, &descriptor)?;
-        let store = self.lock()?.config_store.clone();
-        if let Some(store) = &store {
+        if let Some(store) = &self.config_store {
             store.save(&config)?;
         }
-        let mut state = self.lock()?;
-        state.config = config;
-        state.config_revision = state.config_revision.saturating_add(1);
-        state.model = Some(ModelSummary::from(&manifest));
-        state.descriptor = Some(descriptor);
-        state.model_package = Some(package);
-        state.engine = Some(engine);
-        state.lifecycle = LifecycleState::Ready;
-        state.last_error = None;
-        Ok(state.snapshot())
+        self.config = config;
+        self.config_revision = self.config_revision.saturating_add(1);
+        self.model = Some(ModelSummary::from(&manifest));
+        self.descriptor = Some(descriptor);
+        self.model_package = Some(package);
+        self.engine = Some(engine);
+        self.worker_status = None;
+        self.lifecycle = LifecycleState::Ready;
+        self.last_error = None;
+        Ok(self.snapshot())
     }
 
-    fn transition(&self, next: LifecycleState, action: &str) -> RuntimeResult<()> {
-        let mut state = self.lock()?;
-        if !state.lifecycle.can_transition_to(next) {
+    fn take_engine_for_worker(&mut self) -> RuntimeResult<Box<dyn InferenceEngine>> {
+        if self.lifecycle != LifecycleState::Running {
             return Err(RuntimeError::State {
-                state: format!("{:?}", state.lifecycle),
+                state: format!("{:?}", self.lifecycle),
+                action: "take_engine_for_worker".into(),
+            });
+        }
+        let engine = self.engine.take().ok_or_else(|| RuntimeError::State {
+            state: "model_worker_owns_engine".into(),
+            action: "take_engine_for_worker".into(),
+        })?;
+        self.worker_status = Some(engine.status());
+        Ok(engine)
+    }
+
+    fn complete_worker(
+        &mut self,
+        engine: Box<dyn InferenceEngine>,
+        failure: Option<(String, String)>,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        if self.engine.is_some() || self.worker_status.is_none() {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.lifecycle),
+                action: "complete_worker_without_active_worker".into(),
+            });
+        }
+        self.metrics = engine.metrics();
+        self.worker_status = None;
+        self.engine = Some(engine);
+        if let Some((code, message)) = failure {
+            self.lifecycle = LifecycleState::Failed;
+            self.last_error = Some(RuntimeErrorInfo { code, message });
+        } else if self.lifecycle == LifecycleState::Stopping {
+            self.lifecycle = LifecycleState::Stopped;
+        }
+        Ok(self.snapshot())
+    }
+
+    fn transition(&mut self, next: LifecycleState, action: &str) -> RuntimeResult<()> {
+        if !self.lifecycle.can_transition_to(next) {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.lifecycle),
                 action: action.into(),
             });
         }
-        state.lifecycle = next;
+        self.lifecycle = next;
         Ok(())
     }
 
-    fn fail(&self, error: &RuntimeError) {
-        if let Ok(mut state) = self.inner.lock() {
-            state.lifecycle = LifecycleState::Failed;
-            state.last_error = Some(RuntimeErrorInfo {
-                code: error.code().into(),
-                message: error.to_string(),
-            });
-        }
+    fn fail(&mut self, error: &RuntimeError) {
+        self.lifecycle = LifecycleState::Failed;
+        self.last_error = Some(RuntimeErrorInfo {
+            code: error.code().into(),
+            message: error.to_string(),
+        });
     }
 
-    fn check_revision(&self, state: &RuntimeInner, expected: u64) -> RuntimeResult<()> {
-        if state.config_revision != expected {
+    fn check_revision(&self, expected: u64) -> RuntimeResult<()> {
+        if self.config_revision != expected {
             return Err(RuntimeError::ConfigConflict {
                 expected,
-                actual: state.config_revision,
+                actual: self.config_revision,
             });
         }
         Ok(())
     }
+}
 
-    fn lock(&self) -> RuntimeResult<std::sync::MutexGuard<'_, RuntimeInner>> {
-        self.inner.lock().map_err(|_| RuntimeError::Lock)
+fn scan_model_directory_impl(root_input: String) -> RuntimeResult<ModelCatalog> {
+    // Catalog inspection only reads filesystem metadata and never mutates
+    // runtime state. Do not take the control operation mutex here: a slow
+    // antivirus/network directory scan must not stall audio processing.
+    let root = PathBuf::from(root_input);
+    let root = fs::canonicalize(&root).map_err(|error| RuntimeError::Io {
+        path: root.clone(),
+        message: error.to_string(),
+    })?;
+    if !root.is_dir() {
+        return Err(RuntimeError::Config(format!(
+            "model library is not a directory: {}",
+            root.display()
+        )));
     }
 
-    fn operation(&self) -> RuntimeResult<std::sync::MutexGuard<'_, ()>> {
-        self.operation.lock().map_err(|_| RuntimeError::Lock)
+    const MAX_DEPTH: usize = 3;
+    const MAX_ENTRIES: usize = 512;
+    const MAX_MODEL_FILES: usize = 4096;
+    const MAX_ISSUES: usize = 512;
+    const MAX_SCAN_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+    let load_config = ModelLoadConfig {
+        max_metadata_bytes: MAX_SCAN_METADATA_BYTES,
+        ..ModelLoadConfig::default()
+    };
+    let mut directories = vec![(root.clone(), 0_usize)];
+    let mut visited = HashSet::new();
+    let mut entries = Vec::new();
+    let mut issues = Vec::new();
+    let mut model_files_seen = 0_usize;
+    while let Some((directory, depth)) = directories.pop() {
+        if model_files_seen >= MAX_MODEL_FILES {
+            break;
+        }
+        if !visited.insert(directory.clone()) {
+            continue;
+        }
+        let read_dir = match fs::read_dir(&directory) {
+            Ok(read_dir) => read_dir,
+            Err(error) => {
+                push_catalog_issue(
+                    &mut issues,
+                    MAX_ISSUES,
+                    directory.display().to_string(),
+                    error.to_string(),
+                );
+                continue;
+            }
+        };
+        for item in read_dir {
+            if entries.len() >= MAX_ENTRIES {
+                push_catalog_issue(
+                    &mut issues,
+                    MAX_ISSUES,
+                    root.display().to_string(),
+                    format!("model library limit reached ({MAX_ENTRIES} entries)"),
+                );
+                break;
+            }
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    push_catalog_issue(
+                        &mut issues,
+                        MAX_ISSUES,
+                        directory.display().to_string(),
+                        error.to_string(),
+                    );
+                    continue;
+                }
+            };
+            let path = item.path();
+            let metadata = match item.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    push_catalog_issue(
+                        &mut issues,
+                        MAX_ISSUES,
+                        path.display().to_string(),
+                        error.to_string(),
+                    );
+                    continue;
+                }
+            };
+            if metadata.is_dir() {
+                let canonical_path = match canonical_library_path(&path, &root) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        push_catalog_issue(
+                            &mut issues,
+                            MAX_ISSUES,
+                            path.display().to_string(),
+                            error,
+                        );
+                        continue;
+                    }
+                };
+                if depth < MAX_DEPTH {
+                    directories.push((canonical_path, depth + 1));
+                }
+                continue;
+            }
+            if !metadata.is_file() || !is_model_catalog_file(&path) {
+                continue;
+            }
+            model_files_seen = model_files_seen.saturating_add(1);
+            if model_files_seen > MAX_MODEL_FILES {
+                push_catalog_issue(
+                    &mut issues,
+                    MAX_ISSUES,
+                    root.display().to_string(),
+                    format!("model file scan limit reached ({MAX_MODEL_FILES} files)"),
+                );
+                break;
+            }
+            let canonical_path = match canonical_library_path(&path, &root) {
+                Ok(path) => path,
+                Err(error) => {
+                    push_catalog_issue(&mut issues, MAX_ISSUES, path.display().to_string(), error);
+                    continue;
+                }
+            };
+            let manifest = match inspect_model_manifest_with_config(&path, &load_config) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    let is_named_manifest = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.eq_ignore_ascii_case("manifest.json")
+                                || name.eq_ignore_ascii_case("model.json")
+                                || name.eq_ignore_ascii_case("vocal-fast.json")
+                        });
+                    if is_named_manifest || is_vfrm_path(&path) {
+                        push_catalog_issue(
+                            &mut issues,
+                            MAX_ISSUES,
+                            path.display().to_string(),
+                            error.to_string(),
+                        );
+                    }
+                    continue;
+                }
+            };
+            let path_string = canonical_path.display().to_string();
+            let artifact_bytes = metadata.len();
+            let kind = model_artifact_kind(&canonical_path).unwrap_or(ModelArtifactKind::Manifest);
+            let referenced_bytes = if kind == ModelArtifactKind::Manifest {
+                referenced_model_bytes(&canonical_path, &manifest)
+            } else {
+                0
+            };
+            entries.push(ModelCatalogEntry {
+                path: path_string,
+                kind,
+                size_bytes: artifact_bytes.saturating_add(referenced_bytes),
+                modified_at_ms: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or_default(),
+                model: ModelSummary::from(&manifest),
+            });
+        }
     }
+    entries.sort_by(|left, right| {
+        left.model
+            .display_name
+            .to_ascii_lowercase()
+            .cmp(&right.model.display_name.to_ascii_lowercase())
+            .then_with(|| artifact_priority(left.kind).cmp(&artifact_priority(right.kind)))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut identities = HashSet::new();
+    entries.retain(|entry| identities.insert(catalog_identity(entry)));
+    Ok(ModelCatalog {
+        root: root.display().to_string(),
+        entries,
+        issues,
+    })
 }
 
 fn is_vfrm_path(path: &Path) -> bool {
@@ -817,11 +945,16 @@ impl RuntimeInner {
             config_revision: self.config_revision,
             model: self.model.clone(),
             metrics: self.metrics.into(),
-            engine: self.engine.as_ref().map(|engine| {
-                let mut status: RuntimeEngineStatus = engine.status().into();
-                status.state = self.lifecycle;
-                status
-            }),
+            engine: self
+                .engine
+                .as_ref()
+                .map(|engine| engine.status())
+                .or_else(|| self.worker_status.clone())
+                .map(|status| {
+                    let mut status: RuntimeEngineStatus = status.into();
+                    status.state = self.lifecycle;
+                    status
+                }),
             last_error: self.last_error.clone(),
         }
     }
@@ -873,6 +1006,59 @@ mod tests {
         assert_eq!(output.samples.len(), 160);
         context.stop_processing().expect("stop");
         context.start_processing().expect("restart loaded engine");
+    }
+
+    #[test]
+    fn model_worker_owns_engine_between_start_and_completion() {
+        let format = vocal_types::AudioFormat::MONO_16K;
+        let context = RuntimeContext::new(RuntimeConfig {
+            input_format: format,
+            output_format: format,
+            ..RuntimeConfig::default()
+        })
+        .expect("context");
+        context.load_model_descriptor(descriptor()).expect("load");
+        context.start_processing().expect("start");
+        let engine = context.take_engine_for_worker().expect("transfer engine");
+        let snapshot = context.snapshot().expect("snapshot");
+        assert!(snapshot.engine.is_some());
+        let error = context
+            .process(&AudioChunk {
+                format,
+                samples: vec![0.0; 160],
+                sequence: 1,
+            })
+            .expect_err("worker owns engine");
+        assert!(matches!(error, RuntimeError::State { .. }));
+        context
+            .complete_worker(engine, None)
+            .expect("return engine");
+        context.stop_processing().expect("stop");
+    }
+
+    #[test]
+    fn stop_waits_for_worker_return_and_rejects_duplicate_completion() {
+        let format = vocal_types::AudioFormat::MONO_16K;
+        let context = RuntimeContext::new(RuntimeConfig {
+            input_format: format,
+            output_format: format,
+            ..RuntimeConfig::default()
+        })
+        .expect("context");
+        context.load_model_descriptor(descriptor()).expect("load");
+        context.start_processing().expect("start");
+        let engine = context.take_engine_for_worker().expect("transfer engine");
+        let stopping = context.stop_processing().expect("stop request");
+        assert_eq!(stopping.lifecycle, LifecycleState::Stopping);
+        let completed = context
+            .complete_worker(engine, None)
+            .expect("return engine");
+        assert_eq!(completed.lifecycle, LifecycleState::Stopped);
+
+        assert!(matches!(
+            context.take_engine_for_worker(),
+            Err(RuntimeError::State { .. })
+        ));
     }
 
     #[test]

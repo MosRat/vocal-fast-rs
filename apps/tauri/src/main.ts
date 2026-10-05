@@ -44,6 +44,8 @@ let windowLabel = 'main';
 let errorDialogOpen = false;
 let splashStartedAt = performance.now();
 let draftConfig: GuiConfig | null = null;
+let draftRevision: number | null = null;
+let draftConflict = false;
 let renderTimer: number | undefined;
 const lastActionAt = new Map<string, number>();
 const MIN_ACTION_GAP_MS = 240;
@@ -138,6 +140,70 @@ function navigateTo(route: ViewRoute): void {
   commitRoute(route, render);
 }
 
+function setDraftConfig(next: GuiConfig): void {
+  const base = snapshot?.config ?? defaultConfig();
+  if (JSON.stringify(next) === JSON.stringify(base)) {
+    clearDraftConfig();
+    return;
+  }
+  if (draftConfig === null) draftRevision = snapshot?.configRevision ?? 0;
+  draftConfig = next;
+}
+
+function clearDraftConfig(): void {
+  draftConfig = null;
+  draftRevision = null;
+  draftConflict = false;
+}
+
+function configIsDirty(): boolean {
+  if (!draftConfig) return false;
+  return JSON.stringify(draftConfig) !== JSON.stringify(snapshot?.config ?? defaultConfig());
+}
+
+function syncDraftControls(): void {
+  const locked = busy || snapshot?.lifecycle === 'running' || snapshot?.lifecycle === 'loading' || snapshot?.lifecycle === 'stopping';
+  const disabled = locked || !configIsDirty() || draftConflict;
+  for (const id of ['save', 'settingsSave']) {
+    const control = document.querySelector<HTMLButtonElement>(`#${id}`);
+    if (control) control.disabled = disabled;
+  }
+}
+
+function acceptSnapshot(next: Snapshot): void {
+  if (draftConfig && draftRevision !== null && next.configRevision !== draftRevision) draftConflict = true;
+  snapshot = next;
+}
+
+function validateConfig(config: GuiConfig): string | null {
+  const numbers: ReadonlyArray<readonly [string, number, number, number]> = [
+    ['sample rate', config.inputFormat.sampleRate, 8_000, 192_000],
+    ['channels', config.inputFormat.channels, 1, 8],
+    ['block frames', config.blockFrames, 1, 8_192],
+    ['queue depth', config.queueBlocks, 1, 64],
+    ['pitch shift', config.conversion.pitchSemitones, -24, 24],
+    ['index ratio', config.conversion.indexRatio, 0, 1],
+    ['unvoiced protect', config.conversion.protect, 0, 1],
+    ['RMS mix', config.conversion.rmsMixRate, 0, 1],
+  ];
+  for (const [label, value, minimum, maximum] of numbers) {
+    if (!Number.isFinite(value) || value < minimum || value > maximum) {
+      return `${label} must be between ${minimum} and ${maximum}.`;
+    }
+  }
+  if (!Number.isInteger(config.inputFormat.sampleRate)
+    || !Number.isInteger(config.inputFormat.channels)
+    || !Number.isInteger(config.blockFrames)
+    || !Number.isInteger(config.queueBlocks)) {
+    return 'Sample rate, channels, block frames, and queue depth must be whole numbers.';
+  }
+  if (config.inputFormat.sampleRate !== config.outputFormat.sampleRate
+    || config.inputFormat.channels !== config.outputFormat.channels) {
+    return 'Capture and render formats must match for duplex streaming.';
+  }
+  return null;
+}
+
 type AuxiliaryWindow = 'settings' | 'diagnostics';
 
 async function openAuxiliaryWindow(kind: AuxiliaryWindow): Promise<void> {
@@ -211,6 +277,9 @@ function escapeHtml(value: string): string {
 function deviceOptions(kind: 'input' | 'output', selected: string | null): string {
   const available = devices?.devices.filter((device) => (kind === 'input' ? device.input : device.output)) ?? [];
   const options = [`<option value="" ${selected ? '' : 'selected'}>System default</option>`];
+  if (selected && !available.some((device) => device.id === selected)) {
+    options.push(`<option value="${escapeHtml(selected)}" selected disabled>Selected device unavailable</option>`);
+  }
   for (const device of available) {
     const suffix = device.sampleRate ? ` · ${device.sampleRate} Hz` : '';
     const selectedAttr = selected === device.id ? 'selected' : '';
@@ -282,13 +351,45 @@ function renderTabs(): string {
 }
 
 function renderSettingsPanel(config: GuiConfig): string {
-  return `<section class="settings-panel panel ${activeSection === 'settings' ? 'is-active' : ''}" aria-labelledby="settings-title"><div class="settings-heading"><div class="kicker">APPLICATION SETTINGS</div><h2 id="settings-title">Personalize your workspace</h2><p>These controls apply to the current desktop session. Audio state remains shared with the Studio window.</p></div><div class="settings-grid"><article class="settings-card"><div class="settings-card-icon">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 18)}</div><div><h3>Appearance</h3><p>${themeLabel(themePreference)} with Fluent surfaces and motion-aware effects.</p></div><button id="settingsTheme" class="button secondary">Change theme</button></article><article class="settings-card"><div class="settings-card-icon">${icon('waveform', 18)}</div><div><h3>Audio defaults</h3><p>${config.inputFormat.sampleRate.toLocaleString()} Hz · ${config.inputFormat.channels} channel · ${config.blockFrames} frame blocks</p></div><button id="settingsStudio" class="button secondary">Back to Studio</button></article><article class="settings-card"><div class="settings-card-icon">${icon('keyboard', 18)}</div><div><h3>Keyboard</h3><p><kbd>Space</kbd> starts or stops a session. <kbd>Ctrl R</kbd> refreshes the snapshot.</p></div></article></div></section>`;
+  const running = snapshot?.lifecycle === 'running';
+  const locked = busy || running || snapshot?.lifecycle === 'loading' || snapshot?.lifecycle === 'stopping';
+  const dirty = configIsDirty();
+  const inputDeviceCount = devices?.devices.filter((device) => device.input).length ?? 0;
+  const outputDeviceCount = devices?.devices.filter((device) => device.output).length ?? 0;
+  const revisionLabel = draftRevision === null ? `Revision ${snapshot?.configRevision ?? 0}` : `Editing revision ${draftRevision}`;
+  const rates = [...new Set([16_000, 24_000, 44_100, 48_000, 96_000, config.inputFormat.sampleRate])].sort((a, b) => a - b);
+  const rateOptions = rates
+    .map((rate) => `<option value="${rate}" ${config.inputFormat.sampleRate === rate ? 'selected' : ''}>${rate.toLocaleString()} Hz</option>`)
+    .join('');
+  const blockFrames = [...new Set([240, 480, 960, 1920, config.blockFrames])].sort((a, b) => a - b);
+  const blockFrameOptions = blockFrames
+    .map((frames) => `<option value="${frames}" ${config.blockFrames === frames ? 'selected' : ''}>${frames} · ${(frames / config.inputFormat.sampleRate * 1000).toFixed(1)} ms</option>`)
+    .join('');
+  const themeOptions = (['system', 'light', 'dark'] as const)
+    .map((theme) => `<button type="button" class="settings-choice ${themePreference === theme ? 'active' : ''}" data-theme-choice="${theme}" aria-pressed="${themePreference === theme}">${icon(theme === 'system' ? 'desktop' : theme === 'light' ? 'sun' : 'moon', 15)}<span>${themeLabel(theme)}</span></button>`)
+    .join('');
+  const conflict = draftConflict
+    ? `<div class="settings-conflict" role="alert">${icon('alert', 15)}<span>This configuration changed in another window. Reload it before saving your draft.</span><button id="settingsReload" class="button ghost compact">Reload</button></div>`
+    : '';
+  return `<section class="settings-panel panel ${activeSection === 'settings' ? 'is-active' : ''}" aria-labelledby="settings-title">
+    <div class="settings-heading"><div class="kicker">APPLICATION SETTINGS</div><h2 id="settings-title">Control the session from one place.</h2><p>Audio, model library, and realtime budget share the same revisioned configuration as Studio.</p></div>
+    <div class="settings-toolbar"><div class="settings-save-state ${dirty ? 'dirty' : ''}"><span class="settings-save-dot"></span><div><strong>${dirty ? 'Unsaved changes' : 'All changes saved'}</strong><span>${draftConflict ? 'Resolve the revision conflict to continue.' : revisionLabel}</span></div></div><div class="settings-toolbar-actions">${button('settingsReset', 'Discard', 'refresh', 'ghost', !dirty)}${button('settingsSave', 'Save changes', 'check', 'primary', locked || !dirty || draftConflict)}</div></div>
+    ${conflict}
+    <div class="settings-grid">
+      <article class="settings-card settings-card-wide settings-appearance"><div class="settings-card-heading"><div class="settings-card-icon">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 18)}</div><div><h3>Appearance</h3><p>Choose the surface contrast for every vocal-fast window.</p></div></div><div class="settings-choice-list" role="group" aria-label="Theme preference">${themeOptions}</div></article>
+      <article class="settings-card settings-card-wide"><div class="settings-card-heading"><div class="settings-card-icon">${icon('speaker', 18)}</div><div><h3>Audio routing</h3><p>Defaults apply the next time the stream starts.</p></div><div class="settings-card-actions">${button('settingsRefreshDevices', 'Refresh', 'refresh', 'icon-only', busy, 'Refresh audio devices')}<span class="settings-card-badge">${devices ? `${inputDeviceCount} in · ${outputDeviceCount} out` : 'Not queried'}</span></div></div><div class="settings-form-grid"><label class="field-label">Capture<select id="settings-inputDevice" ${locked ? 'disabled' : ''}>${deviceOptions('input', config.inputDevice)}</select></label><label class="field-label">Render<select id="settings-outputDevice" ${locked ? 'disabled' : ''}>${deviceOptions('output', config.outputDevice)}</select></label><label class="field-label">Sample rate<select id="settings-inputRate" ${locked ? 'disabled' : ''}>${rateOptions}</select></label><label class="field-label">Channels<input id="settings-channels" type="number" min="1" max="8" step="1" value="${config.inputFormat.channels}" ${locked ? 'disabled' : ''}/></label></div></article>
+      <article class="settings-card"><div class="settings-card-heading"><div class="settings-card-icon">${icon('chart', 18)}</div><div><h3>Realtime budget</h3><p>Keep the worker responsive without starving device callbacks.</p></div></div><div class="settings-form-grid"><label class="field-label">Block frames<select id="settings-blockFrames" ${locked ? 'disabled' : ''}>${blockFrameOptions}</select></label><label class="field-label">Queue depth<input id="settings-queueBlocks" type="number" min="1" max="64" step="1" value="${config.queueBlocks}" ${locked ? 'disabled' : ''}/></label></div><div class="settings-budget"><span>${icon('chart', 13)} Estimated buffered age</span><strong>${((config.blockFrames * (config.queueBlocks + 1) / config.inputFormat.sampleRate) * 1000).toFixed(1)} ms</strong></div></article>
+      <article class="settings-card"><div class="settings-card-heading"><div class="settings-card-icon">${icon('database', 18)}</div><div><h3>Model library</h3><p>Persist the folder used for model discovery.</p></div></div><label class="field-label">Library folder<input id="settings-modelDirectory" value="${escapeHtml(config.modelDirectory ?? '')}" placeholder="Choose a model folder…" ${locked ? 'disabled' : ''}/></label><div class="settings-inline-actions">${button('settingsBrowseModels', 'Browse', 'folder', 'secondary', locked || !runningInTauri())}${button('settingsScanModels', 'Scan library', 'refresh', 'ghost', locked)}</div></article>
+      <article class="settings-card"><div class="settings-card-heading"><div class="settings-card-icon">${icon('cpu', 18)}</div><div><h3>Processing backend</h3><p>${config.modelPath ? 'The selected model is ready for this backend.' : 'Load a model in Studio before starting a session.'}</p></div></div><label class="field-label">Backend<select id="settings-backend" ${locked ? 'disabled' : ''}><option value="passthrough" ${config.backend === 'passthrough' ? 'selected' : ''}>Passthrough</option><option value="rvcCpu" ${config.backend === 'rvcCpu' ? 'selected' : ''}>RVC CPU</option><option value="tensorRtRtx" ${config.backend === 'tensorRtRtx' ? 'selected' : ''}>TensorRT RTX</option></select></label><div class="settings-backend-note">${config.backend === 'tensorRtRtx' ? 'TensorRT pipeline details stay in Studio → Engine & Stream.' : 'Backend changes are applied atomically when saved.'}</div></article>
+      <article class="settings-card settings-card-wide settings-about"><div class="settings-card-heading"><div class="settings-card-icon">${icon('keyboard', 18)}</div><div><h3>Window and keyboard</h3><p><kbd>Space</kbd> starts or stops a session. <kbd>Ctrl R</kbd> refreshes the runtime snapshot. Settings are shared across Studio and auxiliary windows.</p></div><button id="settingsStudio" class="button secondary">Open Studio</button></div></article>
+    </div>
+  </section>`;
 }
 
 function renderSidebar(): string {
   const navItem = (id: string, label: string, iconName: IconName) =>
     `<button class="nav-item ${activeSection === id ? 'active' : ''}" data-section="${id}" aria-label="${label}" aria-current="${activeSection === id ? 'page' : 'false'}" title="${label}">${icon(iconName, 17)}<span>${label}</span></button>`;
-  return `<aside class="sidebar"><div class="sidebar-heading"><div class="brand-mark">V</div><div><strong>Vocal Studio</strong><span>Realtime workspace</span></div></div><div class="nav-label">Workspace</div><nav class="nav-list" aria-label="Workspace navigation">${navItem('studio', 'Studio', 'waveform')}${navItem('audio', 'Audio routing', 'speaker')}${navItem('tuning', 'Voice controls', 'sliders')}${navItem('diagnostics', 'Diagnostics', 'chart')}</nav><div class="sidebar-spacer"></div><div class="shortcut-hint">${icon('keyboard', 15)}<span><kbd>Space</kbd> Start or stop</span></div><button id="themeButton" class="theme-button" title="Change appearance">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 16)}<span>${themeLabel(themePreference)}</span><span class="chevron">${icon('chevron', 14)}</span></button><div class="sidebar-footer"><span class="connection-dot ${channelConnected ? 'online' : ''}"></span>${channelConnected ? 'Control channel connected' : 'Connecting to runtime…'}</div></aside>`;
+  return `<aside class="sidebar"><div class="sidebar-heading"><div class="brand-mark">V</div><div><strong>Vocal Studio</strong><span>Realtime workspace</span></div></div><div class="nav-label">Workspace</div><nav class="nav-list" aria-label="Workspace navigation">${navItem('studio', 'Studio', 'waveform')}${navItem('audio', 'Audio routing', 'speaker')}${navItem('tuning', 'Voice controls', 'sliders')}${navItem('diagnostics', 'Diagnostics', 'chart')}</nav><div class="nav-label nav-label-settings">Application</div><nav class="nav-list" aria-label="Application navigation">${navItem('settings', 'Settings', 'settings')}</nav><div class="sidebar-spacer"></div><div class="shortcut-hint">${icon('keyboard', 15)}<span><kbd>Space</kbd> Start or stop</span></div><button id="themeButton" class="theme-button" title="Change appearance">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 16)}<span>${themeLabel(themePreference)}</span><span class="chevron">${icon('chevron', 14)}</span></button><div class="sidebar-footer"><span class="connection-dot ${channelConnected ? 'online' : ''}"></span>${channelConnected ? 'Control channel connected' : 'Connecting to runtime…'}</div></aside>`;
 }
 
 function renderModelCatalog(config: GuiConfig, running: boolean): string {
@@ -337,11 +438,11 @@ function render(): void {
       ? devices?.devices.find((item) => item.id === config.outputDevice)?.name
       : null;
   appRoot.innerHTML = `${renderTitlebar()}<div class="app-layout">${renderSidebar()}<main class="content"><div class="page-heading"><div><div class="kicker">REALTIME VOICE WORKSPACE</div><h1>Make every take sound like you.</h1><p>Configure your voice chain, start the stream, and keep an eye on the audio path.</p></div><div class="headline-status ${statusTone(status)}"><span class="status-dot"></span><div><strong>${lifecycleLabel(status)}</strong><small>${audio?.active ? 'Audio stream online' : channelConnected ? 'Runtime ready for control' : 'Waiting for runtime'}</small></div></div></div>
-    <section class="hero-panel ${running ? 'is-running' : ''}"><div class="hero-glow"></div><div class="hero-grid"></div><div class="hero-content"><div class="eyebrow-row"><span class="eyebrow-chip">${running ? 'LIVE SESSION' : 'SESSION CONTROL'}</span><span class="revision">Revision ${current?.configRevision ?? 0}</span></div><h2>${model ? escapeHtml(model.displayName) : 'No model loaded'}</h2><p>${model ? `${escapeHtml(model.architecture)} · ${model.sampleRate.toLocaleString()} Hz · ${model.featureDims} feature dimensions${model.usesF0 ? ' · F0 enabled' : ''}` : 'Load a .vfr cache or model manifest to prepare your voice chain.'}</p><div class="hero-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><div class="hero-actions">${button('start', running ? 'Streaming' : 'Start stream', running ? 'check' : 'play', 'primary', busy || transitional || !model || running)}${button('stop', 'Stop', 'stop', 'secondary', busy || !running)}${button('demo', 'Test block', 'sparkle', 'ghost', busy || !running || !!audio?.active, 'Run one synthetic block through the engine')}</div></div><div class="hero-orb"><div class="orb-ring ring-one"></div><div class="orb-ring ring-two"></div><div class="orb-core">${icon('waveform', 42)}</div><span class="orb-caption">${running ? 'Listening' : 'Standby'}</span></div></section>
-    <section class="workspace-grid"><article class="panel model-panel span-2" data-section-target="studio">${panelHeader('MODEL LIBRARY', 'Voice model', `<span class="panel-badge">${model ? icon('check', 13) + ' Loaded' : icon('database', 13) + ' Awaiting model'}</span>`)}<div class="model-library-controls"><label class="field-label"><span>Library folder</span><input id="modelDirectory" aria-label="Model library folder" value="${escapeHtml(config.modelDirectory ?? '')}" placeholder="Choose a folder containing model artifacts..." ${running ? 'disabled' : ''}/></label><div class="model-library-actions">${button('browseModels', 'Browse', 'folder', 'secondary', busy || transitional || running || !runningInTauri())}${button('scanModels', 'Scan library', 'refresh', 'secondary', busy || transitional || running)}</div></div><div class="model-library-list">${renderModelCatalog(config, running)}</div><div class="model-layout"><div class="model-avatar">${model ? escapeHtml(model.displayName.slice(0, 1).toUpperCase()) : icon('database', 25)}</div><div class="model-details"><strong>${model ? escapeHtml(model.displayName) : 'Choose a model to begin'}</strong><span>${model ? `${escapeHtml(model.id)} · v${escapeHtml(model.version)}` : 'VFRM caches and RVC manifests are supported'}</span>${model ? `<div class="tag-row"><span class="tag">${escapeHtml(model.architecture)}</span><span class="tag">${model.sampleRate.toLocaleString()} Hz</span>${model.usesF0 ? '<span class="tag accent">F0 enabled</span>' : ''}</div>` : ''}</div><div class="model-actions">${button('unload', 'Unload', undefined, 'ghost', busy || transitional || !model || running)}<div class="model-path-row"><input id="modelPath" aria-label="Model path" value="${escapeHtml(config.modelPath ?? '')}" placeholder="Paste a model path…"/><button id="load" class="button primary compact" ${busy || transitional ? 'disabled' : ''} title="Load model">${icon('folder', 15)}<span>Load</span></button></div></div></div></article>
+    <section class="hero-panel ${running ? 'is-running' : ''}"><div class="hero-glow"></div><div class="hero-grid"></div><div class="hero-content"><div class="eyebrow-row"><span class="eyebrow-chip">${running ? 'LIVE SESSION' : 'SESSION CONTROL'}</span><span class="revision">${configIsDirty() ? 'Save draft before starting' : `Revision ${current?.configRevision ?? 0}`}</span></div><h2>${model ? escapeHtml(model.displayName) : 'No model loaded'}</h2><p>${model ? `${escapeHtml(model.architecture)} · ${model.sampleRate.toLocaleString()} Hz · ${model.featureDims} feature dimensions${model.usesF0 ? ' · F0 enabled' : ''}` : 'Load a .vfr cache or model manifest to prepare your voice chain.'}</p><div class="hero-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><div class="hero-actions">${button('start', running ? 'Streaming' : 'Start stream', running ? 'check' : 'play', 'primary', busy || transitional || !model || running || configIsDirty())}${button('stop', 'Stop', 'stop', 'secondary', busy || !running)}${button('demo', 'Test block', 'sparkle', 'ghost', busy || !running || !!audio?.active, 'Run one synthetic block through the engine')}</div></div><div class="hero-orb"><div class="orb-ring ring-one"></div><div class="orb-ring ring-two"></div><div class="orb-core">${icon('waveform', 42)}</div><span class="orb-caption">${running ? 'Listening' : 'Standby'}</span></div></section>
+    <section class="workspace-grid"><article class="panel model-panel span-2" data-section-target="studio">${panelHeader('MODEL LIBRARY', 'Voice model', `<span class="panel-badge">${model ? icon('check', 13) + ' Loaded' : icon('database', 13) + ' Awaiting model'}</span>`)}<div class="model-library-controls"><label class="field-label"><span>Library folder</span><input id="modelDirectory" aria-label="Model library folder" value="${escapeHtml(config.modelDirectory ?? '')}" placeholder="Choose a folder containing model artifacts..." ${running ? 'disabled' : ''}/></label><div class="model-library-actions">${button('browseModels', 'Browse', 'folder', 'secondary', busy || transitional || running || !runningInTauri())}${button('scanModels', 'Scan library', 'refresh', 'secondary', busy || transitional || running)}</div></div><div class="model-library-list">${renderModelCatalog(config, running)}</div><div class="model-layout"><div class="model-avatar">${model ? escapeHtml(model.displayName.slice(0, 1).toUpperCase()) : icon('database', 25)}</div><div class="model-details"><strong>${model ? escapeHtml(model.displayName) : 'Choose a model to begin'}</strong><span>${model ? `${escapeHtml(model.id)} · v${escapeHtml(model.version)}` : 'VFRM caches and RVC manifests are supported'}</span>${model ? `<div class="tag-row"><span class="tag">${escapeHtml(model.architecture)}</span><span class="tag">${model.sampleRate.toLocaleString()} Hz</span>${model.usesF0 ? '<span class="tag accent">F0 enabled</span>' : ''}</div>` : ''}</div><div class="model-actions">${button('unload', 'Unload', undefined, 'ghost', busy || transitional || !model || running || configIsDirty())}<div class="model-path-row"><input id="modelPath" aria-label="Model path" value="${escapeHtml(config.modelPath ?? '')}" placeholder="Paste a model path…" ${running ? 'disabled' : ''}/><button id="load" class="button primary compact" ${busy || transitional || running || configIsDirty() ? 'disabled' : ''} title="Load model">${icon('folder', 15)}<span>Load</span></button></div></div></div></article>
     <article class="panel audio-panel" data-section-target="audio">${panelHeader('AUDIO ROUTING', 'Devices', button('refreshDevices', 'Refresh', 'refresh', 'icon-only', false, 'Refresh device list'))}<div class="host-line"><span class="live-indicator ${audio?.active ? 'active' : ''}"></span><span>${devices ? escapeHtml(devices.host) : 'Audio host not queried'}</span><span class="host-count">${devices ? `${devices.devices.length} devices` : '—'}</span></div><label class="field-label">Capture<select id="inputDevice" ${running ? 'disabled' : ''}>${deviceOptions('input', config.inputDevice)}</select></label><label class="field-label">Render<select id="outputDevice" ${running ? 'disabled' : ''}>${deviceOptions('output', config.outputDevice)}</select></label><div class="route-summary"><span>${icon('speaker', 14)}${escapeHtml(inputName ?? 'System default')}</span><span class="route-arrow">→</span><span>${escapeHtml(outputName ?? 'System default')}</span></div></article>
     <article class="panel tuning-panel" data-section-target="tuning">${panelHeader('VOICE CONTROLS', 'Shape the sound', '<span class="panel-badge subtle">Live-safe</span>')}<div class="slider-list">${slider('pitch', 'Pitch shift', `${config.conversion.pitchSemitones.toFixed(1)} st`, config.conversion.pitchSemitones, -24, 24, 0.1)}${slider('index', 'Index ratio', config.conversion.indexRatio.toFixed(2), config.conversion.indexRatio, 0, 1, 0.01)}${slider('protect', 'Unvoiced protect', config.conversion.protect.toFixed(2), config.conversion.protect, 0, 1, 0.01)}${slider('rms', 'RMS mix', config.conversion.rmsMixRate.toFixed(2), config.conversion.rmsMixRate, 0, 1, 0.01)}</div></article>
-     <article class="panel config-panel" data-section-target="studio">${panelHeader('ENGINE & STREAM', 'Session configuration', '<span class="panel-badge subtle">Optimistic sync</span>')}<label class="field-label">Backend<select id="backend" ${running ? 'disabled' : ''}><option value="passthrough" ${config.backend === 'passthrough' ? 'selected' : ''}>Passthrough</option><option value="rvcCpu" ${config.backend === 'rvcCpu' ? 'selected' : ''}>RVC CPU</option><option value="tensorRtRtx" ${config.backend === 'tensorRtRtx' ? 'selected' : ''}>TensorRT RTX</option></select></label><div class="form-grid"><label class="field-label">Sample rate<input id="inputRate" type="number" min="1" value="${config.inputFormat.sampleRate}" ${running ? 'disabled' : ''}/></label><label class="field-label">Channels<input id="channels" type="number" min="1" max="8" value="${config.inputFormat.channels}" ${running ? 'disabled' : ''}/></label><label class="field-label">Block frames<input id="blockFrames" type="number" min="1" max="8192" value="${config.blockFrames}" ${running ? 'disabled' : ''}/></label><label class="field-label">Queue depth<input id="queueBlocks" type="number" min="1" max="64" value="${config.queueBlocks}" ${running ? 'disabled' : ''}/></label></div>${config.backend === 'tensorRtRtx' ? `<div class="trt-config"><div class="section-label">TensorRT pipeline</div><div class="form-grid"><label class="field-label">HuBERT VFRM<input id="hubertSource" value="${escapeHtml(config.tensorrt.hubertSource ?? '')}" placeholder="path to hubert.vfr" ${running ? 'disabled' : ''}/></label><label class="field-label">RMVPE VFRM<input id="rmvpeSource" value="${escapeHtml(config.tensorrt.rmvpeSource ?? '')}" placeholder="path to rmvpe.vfr" ${running ? 'disabled' : ''}/></label><label class="field-label">Profile<select id="trtProfile" ${running ? 'disabled' : ''}><option value="reference" ${config.tensorrt.profile === 'reference' ? 'selected' : ''}>Reference</option><option value="voice_changer" ${config.tensorrt.profile === 'voice_changer' ? 'selected' : ''}>Voice changer 11200</option><option value="realtime_44960" ${config.tensorrt.profile === 'realtime_44960' ? 'selected' : ''}>WebUI/Applio 44960</option></select></label><label class="field-label">Graph mode<select id="trtGraphMode" ${running ? 'disabled' : ''}><option value="native_subgraphs" ${config.tensorrt.graphMode === 'native_subgraphs' ? 'selected' : ''}>Native subgraphs</option><option value="whole_pipeline" ${config.tensorrt.graphMode === 'whole_pipeline' ? 'selected' : ''}>Whole pipeline</option><option value="hybrid_subgraphs" ${config.tensorrt.graphMode === 'hybrid_subgraphs' ? 'selected' : ''}>Hybrid</option><option value="disabled" ${config.tensorrt.graphMode === 'disabled' ? 'selected' : ''}>Disabled</option></select></label><label class="field-label">HuBERT precision<select id="hubertPrecision"><option value="fp16" ${config.tensorrt.hubertPrecision === 'fp16' ? 'selected' : ''}>FP16</option><option value="fp32" ${config.tensorrt.hubertPrecision === 'fp32' ? 'selected' : ''}>FP32</option><option value="bf16" ${config.tensorrt.hubertPrecision === 'bf16' ? 'selected' : ''}>BF16</option></select></label><label class="field-label">RMVPE precision<select id="rmvpePrecision"><option value="fp32" ${config.tensorrt.rmvpePrecision === 'fp32' ? 'selected' : ''}>FP32</option><option value="fp16" ${config.tensorrt.rmvpePrecision === 'fp16' ? 'selected' : ''}>FP16</option><option value="bf16" ${config.tensorrt.rmvpePrecision === 'bf16' ? 'selected' : ''}>BF16</option></select></label><label class="field-label">Synth precision<select id="synthPrecision"><option value="fp16" ${config.tensorrt.synthPrecision === 'fp16' ? 'selected' : ''}>FP16</option><option value="fp32" ${config.tensorrt.synthPrecision === 'fp32' ? 'selected' : ''}>FP32</option><option value="bf16" ${config.tensorrt.synthPrecision === 'bf16' ? 'selected' : ''}>BF16</option></select></label><label class="field-label">RMVPE FFT<select id="rmvpeFft"><option value="cufft" ${config.tensorrt.rmvpeFft === 'cufft' ? 'selected' : ''}>cuFFT</option><option value="radix2" ${config.tensorrt.rmvpeFft === 'radix2' ? 'selected' : ''}>Radix-2</option><option value="none" ${config.tensorrt.rmvpeFft === 'none' ? 'selected' : ''}>Native</option></select></label></div><div class="pipeline-actions"><span class="pipeline-status">${escapeHtml(current?.tensorrtPipeline?.message ?? 'Pipeline not prepared')}</span>${button('prepareTensorRt', 'Build TensorRT pipeline', 'sparkle', 'secondary', busy || running || !config.modelPath || !config.tensorrt.hubertSource || !config.tensorrt.rmvpeSource)}</div></div>` : ''}${button('save', 'Save configuration', 'check', 'primary full', busy || running)}</article>
+      <article class="panel config-panel" data-section-target="studio">${panelHeader('ENGINE & STREAM', 'Session configuration', '<span class="panel-badge subtle">Optimistic sync</span>')}<label class="field-label">Backend<select id="backend" ${running ? 'disabled' : ''}><option value="passthrough" ${config.backend === 'passthrough' ? 'selected' : ''}>Passthrough</option><option value="rvcCpu" ${config.backend === 'rvcCpu' ? 'selected' : ''}>RVC CPU</option><option value="tensorRtRtx" ${config.backend === 'tensorRtRtx' ? 'selected' : ''}>TensorRT RTX</option></select></label><div class="form-grid"><label class="field-label">Sample rate<input id="inputRate" type="number" min="1" value="${config.inputFormat.sampleRate}" ${running ? 'disabled' : ''}/></label><label class="field-label">Channels<input id="channels" type="number" min="1" max="8" value="${config.inputFormat.channels}" ${running ? 'disabled' : ''}/></label><label class="field-label">Block frames<input id="blockFrames" type="number" min="1" max="8192" value="${config.blockFrames}" ${running ? 'disabled' : ''}/></label><label class="field-label">Queue depth<input id="queueBlocks" type="number" min="1" max="64" value="${config.queueBlocks}" ${running ? 'disabled' : ''}/></label></div>${config.backend === 'tensorRtRtx' ? `<div class="trt-config"><div class="section-label">TensorRT pipeline</div><div class="form-grid"><label class="field-label">HuBERT VFRM<input id="hubertSource" value="${escapeHtml(config.tensorrt.hubertSource ?? '')}" placeholder="path to hubert.vfr" ${running ? 'disabled' : ''}/></label><label class="field-label">RMVPE VFRM<input id="rmvpeSource" value="${escapeHtml(config.tensorrt.rmvpeSource ?? '')}" placeholder="path to rmvpe.vfr" ${running ? 'disabled' : ''}/></label><label class="field-label">Profile<select id="trtProfile" ${running ? 'disabled' : ''}><option value="reference" ${config.tensorrt.profile === 'reference' ? 'selected' : ''}>Reference</option><option value="voice_changer" ${config.tensorrt.profile === 'voice_changer' ? 'selected' : ''}>Voice changer 11200</option><option value="realtime_44960" ${config.tensorrt.profile === 'realtime_44960' ? 'selected' : ''}>WebUI/Applio 44960</option></select></label><label class="field-label">Graph mode<select id="trtGraphMode" ${running ? 'disabled' : ''}><option value="native_subgraphs" ${config.tensorrt.graphMode === 'native_subgraphs' ? 'selected' : ''}>Native subgraphs</option><option value="whole_pipeline" ${config.tensorrt.graphMode === 'whole_pipeline' ? 'selected' : ''}>Whole pipeline</option><option value="hybrid_subgraphs" ${config.tensorrt.graphMode === 'hybrid_subgraphs' ? 'selected' : ''}>Hybrid</option><option value="disabled" ${config.tensorrt.graphMode === 'disabled' ? 'selected' : ''}>Disabled</option></select></label><label class="field-label">HuBERT precision<select id="hubertPrecision"><option value="fp16" ${config.tensorrt.hubertPrecision === 'fp16' ? 'selected' : ''}>FP16</option><option value="fp32" ${config.tensorrt.hubertPrecision === 'fp32' ? 'selected' : ''}>FP32</option><option value="bf16" ${config.tensorrt.hubertPrecision === 'bf16' ? 'selected' : ''}>BF16</option></select></label><label class="field-label">RMVPE precision<select id="rmvpePrecision"><option value="fp32" ${config.tensorrt.rmvpePrecision === 'fp32' ? 'selected' : ''}>FP32</option><option value="fp16" ${config.tensorrt.rmvpePrecision === 'fp16' ? 'selected' : ''}>FP16</option><option value="bf16" ${config.tensorrt.rmvpePrecision === 'bf16' ? 'selected' : ''}>BF16</option></select></label><label class="field-label">Synth precision<select id="synthPrecision"><option value="fp16" ${config.tensorrt.synthPrecision === 'fp16' ? 'selected' : ''}>FP16</option><option value="fp32" ${config.tensorrt.synthPrecision === 'fp32' ? 'selected' : ''}>FP32</option><option value="bf16" ${config.tensorrt.synthPrecision === 'bf16' ? 'selected' : ''}>BF16</option></select></label><label class="field-label">RMVPE FFT<select id="rmvpeFft"><option value="cufft" ${config.tensorrt.rmvpeFft === 'cufft' ? 'selected' : ''}>cuFFT</option><option value="radix2" ${config.tensorrt.rmvpeFft === 'radix2' ? 'selected' : ''}>Radix-2</option><option value="none" ${config.tensorrt.rmvpeFft === 'none' ? 'selected' : ''}>Native</option></select></label></div><div class="pipeline-actions"><span class="pipeline-status">${escapeHtml(current?.tensorrtPipeline?.message ?? 'Pipeline not prepared')}</span>${button('prepareTensorRt', 'Build TensorRT pipeline', 'sparkle', 'secondary', busy || running || !config.modelPath || !config.tensorrt.hubertSource || !config.tensorrt.rmvpeSource)}</div></div>` : ''}${button('save', 'Save configuration', 'check', 'primary full', busy || running || !configIsDirty() || draftConflict)}</article>
     <article class="panel telemetry-panel span-2" data-section-target="diagnostics">${panelHeader('RUNTIME HEALTH', 'Audio telemetry', `<span class="stream-state ${audio?.active ? 'active' : ''}"><span class="status-dot"></span>${audio?.active ? 'Streaming' : 'Idle'}</span>`)}<div class="metrics-grid">${metric('Input frames', formatNumber(current?.metrics.inputFrames ?? 0), 'waveform')}${metric('Output frames', formatNumber(current?.metrics.outputFrames ?? 0), 'speaker')}${metric('Processing', current ? `${(current.metrics.processingMicros / 1000).toFixed(2)} ms` : '0.00 ms', 'cpu')}${metric('p95 audio age', latency, 'chart', audio?.latencyP95Micros ? 'positive' : '')}${metric('Underflows', formatNumber(audio?.underflowSamples ?? 0), 'alert', audio?.underflowSamples ? 'critical' : '')}${metric('Queue drops', formatNumber(audio?.queueOverflows ?? 0), 'database', audio?.queueOverflows ? 'critical' : '')}</div><div class="telemetry-footer"><span>${escapeHtml(audio?.streamState ?? 'Stopped')} · ${escapeHtml(inputName ?? 'default input')} → ${escapeHtml(outputName ?? 'default output')}</span><span>Worker failures: ${audio?.failures ?? current?.engine?.failures ?? 0}</span></div></article></section>
     ${bootMessage ? `<section class="boot-strip ${bootPending ? 'pending' : ''}"><span class="boot-strip-dot"></span><div><strong>${bootPending ? 'Starting vocal-fast' : 'Startup notice'}</strong><span>${escapeHtml(bootMessage)}</span></div></section>` : ''}${report ? `<section class="error-banner" role="alert"><div class="error-icon">${icon('alert', 18)}</div><div><strong>${escapeHtml(report.code)}</strong><span>${escapeHtml(report.message)}</span></div><div class="error-actions"><button id="showErrorDetails" class="button ghost">Details</button>${report.recoverable ? button('clearError', 'Dismiss', 'close', 'ghost') : ''}</div></section>` : ''}<footer class="app-footer"><span>Audio stays in the Rust worker; this surface receives snapshots and metrics.</span><span>${icon('keyboard', 13)} <kbd>Space</kbd> session · <kbd>Ctrl R</kbd> refresh</span></footer></main></div>${report && errorDialogOpen ? renderErrorDialog(report) : ''}`;
   const content = appRoot.querySelector<HTMLElement>('main.content');
@@ -374,31 +475,33 @@ function render(): void {
 
 function readConfigForm(): GuiConfig {
   const current = draftConfig ?? snapshot?.config ?? defaultConfig();
-  const number = (id: string, fallback: number) =>
-    Number(document.querySelector<HTMLInputElement>(`#${id}`)?.value ?? fallback);
+  const formId = (id: string) => activeSection === 'settings' ? `settings-${id}` : id;
+  const element = <T extends HTMLElement>(id: string): T | null =>
+    document.querySelector<T>(`#${formId(id)}`) ?? document.querySelector<T>(`#${id}`);
+  const number = (id: string, fallback: number) => Number(element<HTMLInputElement>(id)?.value ?? fallback);
   const sampleRate = number('inputRate', current.inputFormat.sampleRate);
   const channels = number('channels', current.inputFormat.channels);
   return {
     ...current,
-    backend: (document.querySelector<HTMLSelectElement>('#backend')?.value as Backend) ?? current.backend,
+    backend: (element<HTMLSelectElement>('backend')?.value as Backend) ?? current.backend,
     inputFormat: { sampleRate, channels },
     outputFormat: { sampleRate, channels },
-    modelPath: document.querySelector<HTMLInputElement>('#modelPath')?.value.trim() || null,
-    modelDirectory: document.querySelector<HTMLInputElement>('#modelDirectory')?.value.trim() || null,
-    inputDevice: document.querySelector<HTMLSelectElement>('#inputDevice')?.value || null,
-    outputDevice: document.querySelector<HTMLSelectElement>('#outputDevice')?.value || null,
+    modelPath: element<HTMLInputElement>('modelPath')?.value.trim() || null,
+    modelDirectory: element<HTMLInputElement>('modelDirectory')?.value.trim() || null,
+    inputDevice: element<HTMLSelectElement>('inputDevice')?.value || null,
+    outputDevice: element<HTMLSelectElement>('outputDevice')?.value || null,
     blockFrames: number('blockFrames', current.blockFrames),
     queueBlocks: number('queueBlocks', current.queueBlocks),
     tensorrt: {
       ...current.tensorrt,
       hubertSource: document.querySelector<HTMLInputElement>('#hubertSource')?.value.trim() || current.tensorrt.hubertSource,
       rmvpeSource: document.querySelector<HTMLInputElement>('#rmvpeSource')?.value.trim() || current.tensorrt.rmvpeSource,
-      profile: document.querySelector<HTMLSelectElement>('#trtProfile')?.value ?? current.tensorrt.profile,
-      graphMode: document.querySelector<HTMLSelectElement>('#trtGraphMode')?.value ?? current.tensorrt.graphMode,
-      hubertPrecision: document.querySelector<HTMLSelectElement>('#hubertPrecision')?.value ?? current.tensorrt.hubertPrecision,
-      rmvpePrecision: document.querySelector<HTMLSelectElement>('#rmvpePrecision')?.value ?? current.tensorrt.rmvpePrecision,
-      synthPrecision: document.querySelector<HTMLSelectElement>('#synthPrecision')?.value ?? current.tensorrt.synthPrecision,
-      rmvpeFft: document.querySelector<HTMLSelectElement>('#rmvpeFft')?.value ?? current.tensorrt.rmvpeFft,
+      profile: element<HTMLSelectElement>('trtProfile')?.value ?? current.tensorrt.profile,
+      graphMode: element<HTMLSelectElement>('trtGraphMode')?.value ?? current.tensorrt.graphMode,
+      hubertPrecision: element<HTMLSelectElement>('hubertPrecision')?.value ?? current.tensorrt.hubertPrecision,
+      rmvpePrecision: element<HTMLSelectElement>('rmvpePrecision')?.value ?? current.tensorrt.rmvpePrecision,
+      synthPrecision: element<HTMLSelectElement>('synthPrecision')?.value ?? current.tensorrt.synthPrecision,
+      rmvpeFft: element<HTMLSelectElement>('rmvpeFft')?.value ?? current.tensorrt.rmvpeFft,
     },
     conversion: {
       ...current.conversion,
@@ -421,7 +524,7 @@ async function runAction(action: () => Promise<unknown>, key = 'command'): Promi
     const result = await action();
     if (isSnapshot(result)) {
       snapshot = result;
-      draftConfig = null;
+      clearDraftConfig();
     }
   } catch (error) {
     localError = normalizeError(error);
@@ -449,6 +552,7 @@ function wireHandlers(): void {
   const byId = <T extends HTMLElement>(id: string) => document.querySelector<T>(`#${id}`);
   byId<HTMLButtonElement>('load')?.addEventListener('click', () =>
     runAction(async () => {
+      if (configIsDirty()) throw new Error('Save configuration before loading a model.');
       const path = byId<HTMLInputElement>('modelPath')?.value.trim();
       if (!path) throw new Error('Model path is required');
       return call<Snapshot>('load_model', { path });
@@ -461,21 +565,45 @@ function wireHandlers(): void {
     runAction(async () => {
       const directory = await call<string | null>('pick_model_directory');
       if (!directory) return undefined;
-      const directoryInput = byId<HTMLInputElement>('modelDirectory');
+      const directoryInput = activeSection === 'settings'
+        ? byId<HTMLInputElement>('settings-modelDirectory')
+        : byId<HTMLInputElement>('modelDirectory');
       if (directoryInput) directoryInput.value = directory;
       modelCatalog = await call<ModelCatalog>('list_models', { path: directory });
-      draftConfig = readConfigForm();
+      setDraftConfig(readConfigForm());
       return undefined;
     }, 'browse-models'),
   );
+  byId<HTMLButtonElement>('settingsBrowseModels')?.addEventListener('click', () =>
+    runAction(async () => {
+      const directory = await call<string | null>('pick_model_directory');
+      if (!directory) return undefined;
+      const directoryInput = byId<HTMLInputElement>('settings-modelDirectory');
+      if (directoryInput) directoryInput.value = directory;
+      modelCatalog = await call<ModelCatalog>('list_models', { path: directory });
+      setDraftConfig(readConfigForm());
+      return undefined;
+    }, 'settings-browse-models'),
+  );
   byId<HTMLButtonElement>('scanModels')?.addEventListener('click', () =>
     runAction(async () => {
-      const directory = byId<HTMLInputElement>('modelDirectory')?.value.trim();
+      const directory = (activeSection === 'settings'
+        ? byId<HTMLInputElement>('settings-modelDirectory')
+        : byId<HTMLInputElement>('modelDirectory'))?.value.trim();
       if (!directory) throw new Error('Model library folder is required');
       modelCatalog = await call<ModelCatalog>('list_models', { path: directory });
-      draftConfig = { ...(draftConfig ?? snapshot?.config ?? defaultConfig()), modelDirectory: directory };
+      setDraftConfig({ ...(draftConfig ?? snapshot?.config ?? defaultConfig()), modelDirectory: directory });
       return undefined;
     }, 'scan-models'),
+  );
+  byId<HTMLButtonElement>('settingsScanModels')?.addEventListener('click', () =>
+    runAction(async () => {
+      const directory = byId<HTMLInputElement>('settings-modelDirectory')?.value.trim();
+      if (!directory) throw new Error('Model library folder is required');
+      modelCatalog = await call<ModelCatalog>('list_models', { path: directory });
+      setDraftConfig({ ...(draftConfig ?? snapshot?.config ?? defaultConfig()), modelDirectory: directory });
+      return undefined;
+    }, 'settings-scan-models'),
   );
   document.querySelectorAll<HTMLButtonElement>('[data-model-path]').forEach((item) =>
     item.addEventListener('click', () => {
@@ -483,12 +611,15 @@ function wireHandlers(): void {
       if (!path) return;
       const input = byId<HTMLInputElement>('modelPath');
       if (input) input.value = path;
-      draftConfig = readConfigForm();
+      setDraftConfig(readConfigForm());
       render();
     }),
   );
   byId<HTMLButtonElement>('unload')?.addEventListener('click', () =>
-    runAction(() => call<Snapshot>('unload_model'), 'unload-model'),
+    runAction(async () => {
+      if (configIsDirty()) throw new Error('Save configuration before unloading the model.');
+      return call<Snapshot>('unload_model');
+    }, 'unload-model'),
   );
   byId<HTMLButtonElement>('start')?.addEventListener('click', () =>
     runAction(() => call<Snapshot>('start_session'), 'start-session'),
@@ -530,15 +661,42 @@ function wireHandlers(): void {
       return devices;
     }, 'refresh-devices'),
   );
-  byId<HTMLButtonElement>('save')?.addEventListener('click', () =>
-    runAction(
-      () =>
-        call<Snapshot>('update_config', {
-          config: readConfigForm(),
-          expectedRevision: snapshot?.configRevision ?? 0,
-        }),
-      'save-config',
-    ),
+  byId<HTMLButtonElement>('settingsRefreshDevices')?.addEventListener('click', () =>
+    runAction(async () => {
+      devices = await call<AudioDeviceCatalog>('list_audio_devices');
+      return devices;
+    }, 'refresh-devices'),
+  );
+  const saveConfiguration = () => runAction(
+    async () => {
+      const config = readConfigForm();
+      const validation = validateConfig(config);
+      if (validation) throw new Error(validation);
+      if (draftConflict) throw new Error('Configuration changed in another window. Reload before saving.');
+      return call<Snapshot>('update_config', {
+        config,
+        expectedRevision: draftRevision ?? snapshot?.configRevision ?? 0,
+      });
+    },
+    'save-config',
+  );
+  byId<HTMLButtonElement>('save')?.addEventListener('click', saveConfiguration);
+  byId<HTMLButtonElement>('settingsSave')?.addEventListener('click', saveConfiguration);
+  byId<HTMLButtonElement>('settingsReset')?.addEventListener('click', () => {
+    if (!configIsDirty()) return;
+    clearDraftConfig();
+    render();
+  });
+  byId<HTMLButtonElement>('settingsReload')?.addEventListener('click', () => {
+    clearDraftConfig();
+    localError = null;
+    render();
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-theme-choice]').forEach((item) =>
+    item.addEventListener('click', () => {
+      const choice = item.dataset.themeChoice;
+      if (choice === 'system' || choice === 'light' || choice === 'dark') setThemePreference(choice);
+    }),
   );
   byId<HTMLButtonElement>('prepareTensorRt')?.addEventListener('click', () =>
     runAction(async () => {
@@ -549,9 +707,10 @@ function wireHandlers(): void {
       const staging = form.backend === 'tensorRtRtx' ? { ...form, backend: 'passthrough' as const } : form;
       const saved = await call<Snapshot>('update_config', {
         config: staging,
-        expectedRevision: snapshot?.configRevision ?? 0,
+        expectedRevision: draftRevision ?? snapshot?.configRevision ?? 0,
       });
       snapshot = saved;
+      clearDraftConfig();
       const prepared = await call<Snapshot>('prepare_tensorrt_pipeline', {
         request: {
           expectedRevision: saved.configRevision,
@@ -590,23 +749,38 @@ function wireHandlers(): void {
       const value = Number((event.target as HTMLInputElement).value);
       const output = byId<HTMLOutputElement>(outputId);
       if (output) output.value = value.toFixed(digits) + (id === 'pitch' ? ' st' : '');
-      draftConfig = readConfigForm();
+      setDraftConfig(readConfigForm());
+      syncDraftControls();
     });
   ['backend', 'inputRate', 'channels', 'blockFrames', 'queueBlocks', 'modelDirectory', 'inputDevice', 'outputDevice'].forEach((id) =>
     byId<HTMLInputElement | HTMLSelectElement>(id)?.addEventListener('change', () => {
-      draftConfig = readConfigForm();
+      setDraftConfig(readConfigForm());
+      if (id === 'backend') render();
+      else syncDraftControls();
+    }),
+  );
+  ['hubertSource', 'rmvpeSource', 'trtProfile', 'trtGraphMode', 'hubertPrecision', 'rmvpePrecision', 'synthPrecision', 'rmvpeFft'].forEach((id) =>
+    byId<HTMLInputElement | HTMLSelectElement>(id)?.addEventListener('change', () => {
+      setDraftConfig(readConfigForm());
+      syncDraftControls();
+    }),
+  );
+  ['settings-backend', 'settings-inputRate', 'settings-channels', 'settings-blockFrames', 'settings-queueBlocks', 'settings-modelDirectory', 'settings-inputDevice', 'settings-outputDevice'].forEach((id) =>
+    byId<HTMLInputElement | HTMLSelectElement>(id)?.addEventListener('change', () => {
+      setDraftConfig(readConfigForm());
+      render();
     }),
   );
   document.querySelectorAll<HTMLButtonElement>('[data-section]').forEach((item) =>
     item.addEventListener('click', () => {
       const route = item.dataset.section;
-      if (route && isWorkspaceRoute(route)) navigateTo(route);
+      if (route && (route === 'settings' || isWorkspaceRoute(route))) navigateTo(route as ViewRoute);
     }),
   );
   document.querySelectorAll<HTMLButtonElement>('[data-route]').forEach((item) =>
     item.addEventListener('click', () => {
       const route = item.dataset.route;
-      if (route && isWorkspaceRoute(route)) navigateTo(route);
+      if (route && (route === 'settings' || isWorkspaceRoute(route))) navigateTo(route as ViewRoute);
     }),
   );
   const cycleTheme = () => {
@@ -676,8 +850,8 @@ async function connect(): Promise<void> {
       if (lastEventSequence !== 0 && event.sequence > lastEventSequence + 1) void resyncSnapshot();
       lastEventSequence = event.sequence;
       if (event.type === 'snapshot') {
-        snapshot = event.payload as Snapshot;
-        if (!snapshot.lastError) localError = null;
+        acceptSnapshot(event.payload as Snapshot);
+        if (!snapshot?.lastError) localError = null;
       }
       if (event.type === 'metrics' && snapshot) snapshot.metrics = event.payload as Snapshot['metrics'];
       if (event.type === 'error') {
@@ -686,10 +860,10 @@ async function connect(): Promise<void> {
       }
       scheduleRender();
     };
-    snapshot = await call<Snapshot>('subscribe', { windowLabel, channel: events });
+    acceptSnapshot(await call<Snapshot>('subscribe', { windowLabel, channel: events }));
     channelConnected = true;
     devices = await call<AudioDeviceCatalog>('list_audio_devices');
-    const directory = snapshot.config.modelDirectory;
+    const directory = snapshot?.config.modelDirectory;
     if (directory) {
       modelCatalog = await call<ModelCatalog>('list_models', { path: directory }).catch(() => null);
     }
@@ -702,7 +876,7 @@ async function resyncSnapshot(): Promise<void> {
   if (resyncInFlight) return;
   resyncInFlight = true;
   try {
-    snapshot = await call<Snapshot>('get_snapshot');
+    acceptSnapshot(await call<Snapshot>('get_snapshot'));
     render();
   } catch {
     /* Periodic refresh will retry. */
@@ -764,7 +938,7 @@ window.setInterval(async () => {
   if (isSplashWindow() || document.visibilityState !== 'visible' || !channelConnected || busy || refreshInFlight) return;
   refreshInFlight = true;
   try {
-    snapshot = await call<Snapshot>('get_snapshot');
+    acceptSnapshot(await call<Snapshot>('get_snapshot'));
     render();
   } catch {
     /* Keep the last usable snapshot. */

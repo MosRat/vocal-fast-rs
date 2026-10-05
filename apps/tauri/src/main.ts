@@ -705,7 +705,9 @@ function wireHandlers(): void {
       // A first build has no artifact manifest yet. Persist the editable
       // source/profile fields through a portable backend, then atomically
       // switch to TensorRT once the plans are ready.
-      const staging = form.backend === 'tensorRtRtx' ? { ...form, backend: 'passthrough' as const } : form;
+      const existingArtifacts = snapshot?.config.tensorrt.artifactsPath ?? snapshot?.config.tensorrtArtifactsPath;
+      const needsStaging = form.backend === 'tensorRtRtx' && !existingArtifacts;
+      const staging = needsStaging ? { ...form, backend: 'passthrough' as const } : form;
       const saved = await call<Snapshot>('update_config', {
         config: staging,
         expectedRevision: draftRevision ?? snapshot?.configRevision ?? 0,

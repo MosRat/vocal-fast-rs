@@ -161,6 +161,11 @@ struct RuntimeInner {
     last_config_update: ConfigUpdateKind,
     model: Option<ModelSummary>,
     descriptor: Option<ModelDescriptor>,
+    /// Canonical path of the package currently resident in `model_package`.
+    /// `RuntimeConfig::model_path` is the persisted selection and may point
+    /// at a pending replacement, so it must not be used to decide whether an
+    /// existing TensorRT engine is compatible with newly published plans.
+    loaded_model_path: Option<String>,
     /// Keep the parsed package alive while its engine is selected. The model
     /// cache is weak by design, so this strong reference lets controllers
     /// share parsed packages without re-reading the file.
@@ -201,6 +206,7 @@ impl RuntimeContext {
             last_config_update: ConfigUpdateKind::Unchanged,
             model: None,
             descriptor: None,
+            loaded_model_path: None,
             model_package: None,
             engine: None,
             worker_status: None,
@@ -373,7 +379,13 @@ impl RuntimeInner {
                 action: "update_config".into(),
             });
         }
-        let change = classify_config_change(&self.config, &config, self.descriptor.is_some());
+        let model_needs_reload = self.descriptor.is_some()
+            && config.model_path.as_deref() != self.loaded_model_path.as_deref();
+        let change = if model_needs_reload {
+            ConfigUpdateKind::LoadModelRequired
+        } else {
+            classify_config_change(&self.config, &config, self.descriptor.is_some())
+        };
         let replacement = if change == ConfigUpdateKind::RebuildEngine {
             self.descriptor
                 .as_ref()
@@ -391,7 +403,11 @@ impl RuntimeInner {
         if change == ConfigUpdateKind::ReloadTensorRtPipeline && self.engine.is_some() {
             if let Err(error) = self.reload_idle_engine(&config) {
                 if let Some(store) = &self.config_store {
-                    let _ = store.save(&previous);
+                    if let Err(rollback) = store.save(&previous) {
+                        return Err(RuntimeError::Config(format!(
+                            "TensorRT pipeline reload failed: {error}; restoring the previous configuration also failed: {rollback}"
+                        )));
+                    }
                 }
                 return Err(error);
             }
@@ -459,6 +475,7 @@ impl RuntimeInner {
         self.worker_generation = self.worker_generation.wrapping_add(1);
         self.model = None;
         self.descriptor = None;
+        self.loaded_model_path = None;
         self.model_package = None;
         self.config.model_path = None;
         self.metrics = LatencyMetrics::default();
@@ -523,6 +540,7 @@ impl RuntimeInner {
             self.config_revision = self.config_revision.saturating_add(1);
             self.model = Some(ModelSummary::from_descriptor(&descriptor));
             self.descriptor = Some(descriptor);
+            self.loaded_model_path = None;
             self.model_package = None;
             self.engine = Some(engine);
             self.worker_status = None;
@@ -668,6 +686,7 @@ impl RuntimeInner {
         self.config_revision = self.config_revision.saturating_add(1);
         self.model = Some(ModelSummary::from(&manifest));
         self.descriptor = Some(descriptor);
+        self.loaded_model_path = Some(input.display().to_string());
         self.model_package = Some(package);
         self.engine = Some(engine);
         self.worker_status = None;
@@ -1276,6 +1295,65 @@ mod tests {
             .expect_err("stale update");
         assert!(matches!(error, RuntimeError::ConfigConflict { .. }));
         assert_eq!(context.config().unwrap().queue_blocks, 2);
+    }
+
+    #[test]
+    fn idle_hot_reload_keeps_engine_state() {
+        let context = RuntimeContext::new(RuntimeConfig::default()).expect("context");
+        context.load_model_descriptor(descriptor()).expect("load");
+        context.start_processing().expect("start");
+        context
+            .process(&AudioChunk {
+                format: vocal_types::AudioFormat::MONO_48K,
+                samples: vec![0.0; 480],
+                sequence: 1,
+            })
+            .expect("first block");
+        context.stop_processing().expect("stop");
+
+        let mut config = context.config().expect("config");
+        config.conversion.pitch_semitones = 1.0;
+        let snapshot = context.update_config(config, 1).expect("hot reload");
+        assert_eq!(snapshot.last_config_update, ConfigUpdateKind::HotReload);
+
+        context.start_processing().expect("restart");
+        context
+            .process(&AudioChunk {
+                format: vocal_types::AudioFormat::MONO_48K,
+                samples: vec![0.0; 480],
+                sequence: 2,
+            })
+            .expect("second block");
+        assert_eq!(
+            context.snapshot().unwrap().engine.unwrap().processed_chunks,
+            2
+        );
+    }
+
+    #[test]
+    fn pending_model_path_prevents_follow_up_engine_reload() {
+        let context = RuntimeContext::new(RuntimeConfig::default()).expect("context");
+        context.load_model_descriptor(descriptor()).expect("load");
+
+        let mut config = context.config().expect("config");
+        config.model_path = Some("pending.vfrm".into());
+        let snapshot = context
+            .update_config(config.clone(), 1)
+            .expect("select model");
+        assert_eq!(
+            snapshot.last_config_update,
+            ConfigUpdateKind::LoadModelRequired
+        );
+
+        config.backend = RuntimeBackend::RvcCpu;
+        let snapshot = context
+            .update_config(config, snapshot.config_revision)
+            .expect("defer backend change");
+        assert_eq!(
+            snapshot.last_config_update,
+            ConfigUpdateKind::LoadModelRequired
+        );
+        assert_eq!(snapshot.model.unwrap().id, "fixture");
     }
 
     #[test]

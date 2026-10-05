@@ -231,11 +231,17 @@ impl AudioSession {
                     while !worker_stop.load(Ordering::Acquire) {
                         let result = worker_io.process_once(schedule, |input, output| {
                             let started = Instant::now();
-                            let converted = match engine
-                                .as_mut()
-                                .expect("model worker engine must remain owned by worker")
-                                .process_samples(format, input, sequence, conversion)
-                            {
+                            let Some(worker_engine) = engine.as_mut() else {
+                                return Err(AudioError::Processing(
+                                    "model worker lost its engine ownership".into(),
+                                ));
+                            };
+                            let converted = match worker_engine.process_samples(
+                                format,
+                                input,
+                                sequence,
+                                conversion,
+                            ) {
                                 Ok(converted) => converted,
                                 Err(error) => {
                                     failure = Some((error.code().into(), error.to_string()));

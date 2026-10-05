@@ -42,6 +42,10 @@ pub struct RuntimeConfig {
     pub conversion: ConversionConfig,
     pub backend: RuntimeBackend,
     pub model_path: Option<String>,
+    /// Optional library root used by controllers to discover model artifacts.
+    /// It is intentionally independent from `model_path`, which remains the
+    /// last selected artifact and is restored directly at startup.
+    pub model_directory: Option<String>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub block_frames: usize,
@@ -57,6 +61,7 @@ impl Default for RuntimeConfig {
             conversion: ConversionConfig::default(),
             backend: RuntimeBackend::Passthrough,
             model_path: None,
+            model_directory: None,
             input_device: None,
             output_device: None,
             block_frames: 480,

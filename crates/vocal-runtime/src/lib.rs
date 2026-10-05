@@ -11,6 +11,7 @@ mod state;
 pub use config::{ConfigStore, RUNTIME_CONFIG_SCHEMA_VERSION, RuntimeBackend, RuntimeConfig};
 pub use error::{RuntimeError, RuntimeResult};
 pub use state::{
-    ModelSummary, RuntimeContext, RuntimeEngineStatus, RuntimeErrorInfo, RuntimeMetrics,
-    RuntimeSnapshot,
+    ModelCatalog, ModelCatalogEntry, ModelCatalogIssue, ModelSummary, RuntimeContext,
+    RuntimeEngineStatus, RuntimeErrorInfo, RuntimeMetrics, RuntimeSnapshot,
 };
+pub use vocal_model::ModelArtifactKind;

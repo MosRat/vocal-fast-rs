@@ -1,8 +1,17 @@
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::UNIX_EPOCH,
+};
 
 use serde::Serialize;
 use vocal_engine::{EngineConfig, EngineStatus, InferenceEngine, create_engine};
-use vocal_model::{ModelLoader, ModelPackage, RvcModelManifest};
+use vocal_model::{
+    ModelArtifactKind, ModelLoadConfig, ModelLoader, ModelPackage, RvcModelManifest,
+    inspect_model_manifest_with_config, model_artifact_kind, resolve_model_path,
+};
 use vocal_types::{AudioChunk, LatencyMetrics, LifecycleState, ModelDescriptor};
 
 use crate::{
@@ -56,6 +65,32 @@ impl ModelSummary {
             uses_f0: true,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogEntry {
+    pub path: String,
+    pub kind: ModelArtifactKind,
+    pub size_bytes: u64,
+    pub modified_at_ms: u64,
+    #[serde(flatten)]
+    pub model: ModelSummary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogIssue {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalog {
+    pub root: String,
+    pub entries: Vec<ModelCatalogEntry>,
+    pub issues: Vec<ModelCatalogIssue>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -179,6 +214,180 @@ impl RuntimeContext {
 
     pub fn persisted_model_path(&self) -> RuntimeResult<Option<String>> {
         Ok(self.lock()?.config.model_path.clone())
+    }
+
+    pub fn scan_model_directory(&self, root: impl Into<String>) -> RuntimeResult<ModelCatalog> {
+        // Catalog inspection only reads filesystem metadata and never mutates
+        // runtime state. Do not take the control operation mutex here: a slow
+        // antivirus/network directory scan must not stall audio processing.
+        let root = PathBuf::from(root.into());
+        let root = fs::canonicalize(&root).map_err(|error| RuntimeError::Io {
+            path: root.clone(),
+            message: error.to_string(),
+        })?;
+        if !root.is_dir() {
+            return Err(RuntimeError::Config(format!(
+                "model library is not a directory: {}",
+                root.display()
+            )));
+        }
+
+        const MAX_DEPTH: usize = 3;
+        const MAX_ENTRIES: usize = 512;
+        const MAX_ISSUES: usize = 512;
+        const MAX_SCAN_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+        let load_config = ModelLoadConfig {
+            max_metadata_bytes: MAX_SCAN_METADATA_BYTES,
+            ..ModelLoadConfig::default()
+        };
+        let mut directories = vec![(root.clone(), 0_usize)];
+        let mut visited = HashSet::new();
+        let mut entries = Vec::new();
+        let mut issues = Vec::new();
+        while let Some((directory, depth)) = directories.pop() {
+            if !visited.insert(directory.clone()) {
+                continue;
+            }
+            let read_dir = match fs::read_dir(&directory) {
+                Ok(read_dir) => read_dir,
+                Err(error) => {
+                    push_catalog_issue(
+                        &mut issues,
+                        MAX_ISSUES,
+                        directory.display().to_string(),
+                        error.to_string(),
+                    );
+                    continue;
+                }
+            };
+            for item in read_dir {
+                if entries.len() >= MAX_ENTRIES {
+                    push_catalog_issue(
+                        &mut issues,
+                        MAX_ISSUES,
+                        root.display().to_string(),
+                        format!("model library limit reached ({MAX_ENTRIES} entries)"),
+                    );
+                    break;
+                }
+                let item = match item {
+                    Ok(item) => item,
+                    Err(error) => {
+                        push_catalog_issue(
+                            &mut issues,
+                            MAX_ISSUES,
+                            directory.display().to_string(),
+                            error.to_string(),
+                        );
+                        continue;
+                    }
+                };
+                let path = item.path();
+                let metadata = match item.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        push_catalog_issue(
+                            &mut issues,
+                            MAX_ISSUES,
+                            path.display().to_string(),
+                            error.to_string(),
+                        );
+                        continue;
+                    }
+                };
+                if metadata.is_dir() {
+                    let canonical_path = match canonical_library_path(&path, &root) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            push_catalog_issue(
+                                &mut issues,
+                                MAX_ISSUES,
+                                path.display().to_string(),
+                                error,
+                            );
+                            continue;
+                        }
+                    };
+                    if depth < MAX_DEPTH {
+                        directories.push((canonical_path, depth + 1));
+                    }
+                    continue;
+                }
+                if !metadata.is_file() || !is_model_catalog_file(&path) {
+                    continue;
+                }
+                let canonical_path = match canonical_library_path(&path, &root) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        push_catalog_issue(
+                            &mut issues,
+                            MAX_ISSUES,
+                            path.display().to_string(),
+                            error,
+                        );
+                        continue;
+                    }
+                };
+                let manifest = match inspect_model_manifest_with_config(&path, &load_config) {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        let is_named_manifest = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.eq_ignore_ascii_case("manifest.json")
+                                    || name.eq_ignore_ascii_case("model.json")
+                                    || name.eq_ignore_ascii_case("vocal-fast.json")
+                            });
+                        if is_named_manifest || is_vfrm_path(&path) {
+                            push_catalog_issue(
+                                &mut issues,
+                                MAX_ISSUES,
+                                path.display().to_string(),
+                                error.to_string(),
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let path_string = canonical_path.display().to_string();
+                let artifact_bytes = metadata.len();
+                let kind =
+                    model_artifact_kind(&canonical_path).unwrap_or(ModelArtifactKind::Manifest);
+                let referenced_bytes = if kind == ModelArtifactKind::Manifest {
+                    referenced_model_bytes(&canonical_path, &manifest)
+                } else {
+                    0
+                };
+                entries.push(ModelCatalogEntry {
+                    path: path_string,
+                    kind,
+                    size_bytes: artifact_bytes.saturating_add(referenced_bytes),
+                    modified_at_ms: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+                        .unwrap_or_default(),
+                    model: ModelSummary::from(&manifest),
+                });
+            }
+        }
+        entries.sort_by(|left, right| {
+            left.model
+                .display_name
+                .to_ascii_lowercase()
+                .cmp(&right.model.display_name.to_ascii_lowercase())
+                .then_with(|| artifact_priority(left.kind).cmp(&artifact_priority(right.kind)))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let mut identities = HashSet::new();
+        entries.retain(|entry| identities.insert(catalog_identity(entry)));
+        Ok(ModelCatalog {
+            root: root.display().to_string(),
+            entries,
+            issues,
+        })
     }
 
     pub fn update_config(
@@ -415,7 +624,7 @@ impl RuntimeContext {
     }
 
     fn load_model_inner(&self, path: String) -> RuntimeResult<RuntimeSnapshot> {
-        let input = std::path::PathBuf::from(&path);
+        let input = resolve_model_path(Path::new(&path))?;
         if !input.is_file() {
             return Err(RuntimeError::Config(format!(
                 "model path does not exist: {path}"
@@ -425,8 +634,9 @@ impl RuntimeContext {
         let (package, manifest) = if input
             .extension()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("vfr"))
-        {
+            .is_some_and(|value| {
+                value.eq_ignore_ascii_case("vfr") || value.eq_ignore_ascii_case("vfrm")
+            }) {
             let package = loader.load_cache_shared(&input)?;
             (package.clone(), package.manifest.clone())
         } else {
@@ -437,7 +647,7 @@ impl RuntimeContext {
         };
         let descriptor = manifest.descriptor();
         let mut config = self.lock()?.config.clone();
-        config.model_path = Some(path);
+        config.model_path = Some(input.display().to_string());
         let engine = create_runtime_engine(&config, &descriptor)?;
         let store = self.lock()?.config_store.clone();
         if let Some(store) = &store {
@@ -494,6 +704,81 @@ impl RuntimeContext {
     fn operation(&self) -> RuntimeResult<std::sync::MutexGuard<'_, ()>> {
         self.operation.lock().map_err(|_| RuntimeError::Lock)
     }
+}
+
+fn is_vfrm_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("vfr") || value.eq_ignore_ascii_case("vfrm")
+        })
+}
+
+fn is_model_catalog_file(path: &Path) -> bool {
+    is_vfrm_path(path)
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+}
+
+fn canonical_library_path(path: &Path, root: &Path) -> Result<PathBuf, String> {
+    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if canonical.starts_with(root) {
+        Ok(canonical)
+    } else {
+        Err("skipped path outside model library".into())
+    }
+}
+
+fn artifact_priority(kind: ModelArtifactKind) -> u8 {
+    match kind {
+        ModelArtifactKind::Vfrm => 0,
+        ModelArtifactKind::Manifest => 1,
+    }
+}
+
+fn catalog_identity(entry: &ModelCatalogEntry) -> String {
+    let model = &entry.model;
+    if model.id.trim().is_empty() {
+        return format!("path:{}", entry.path);
+    }
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        model.id, model.version, model.architecture, model.sample_rate
+    )
+}
+
+fn push_catalog_issue(
+    issues: &mut Vec<ModelCatalogIssue>,
+    limit: usize,
+    path: String,
+    message: String,
+) {
+    if issues.len() < limit {
+        issues.push(ModelCatalogIssue { path, message });
+    }
+}
+
+fn referenced_model_bytes(manifest_path: &Path, manifest: &RvcModelManifest) -> u64 {
+    let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let size = |relative: &str| {
+        let candidate = root.join(relative);
+        let canonical = fs::canonicalize(candidate).ok()?;
+        if !canonical.starts_with(root) {
+            return None;
+        }
+        fs::metadata(canonical).ok().map(|metadata| metadata.len())
+    };
+    size(&manifest.model_file)
+        .unwrap_or_default()
+        .saturating_add(
+            manifest
+                .index_file
+                .as_deref()
+                .and_then(size)
+                .unwrap_or_default(),
+        )
 }
 
 fn create_runtime_engine(
@@ -596,5 +881,52 @@ mod tests {
         let snapshot = context.clear_error().expect("clear");
         assert_eq!(snapshot.lifecycle, LifecycleState::Ready);
         assert!(snapshot.last_error.is_none());
+    }
+
+    #[test]
+    fn model_catalog_scans_metadata_without_loading_payload_and_prefers_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "vocal-runtime-models-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create model root");
+        let manifest = serde_json::json!({
+            "id": "fixture",
+            "display_name": "Fixture",
+            "architecture": "rvc-v2",
+            "version": "1",
+            "sample_rate": 32000,
+            "model_file": "model.pth",
+            "index_file": null,
+            "source": "test",
+            "notes": null
+        });
+        std::fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .expect("write manifest");
+        std::fs::write(root.join("model.pth"), [0_u8; 4]).expect("write model");
+
+        let cache = vocal_model::ModelPackage {
+            manifest: serde_json::from_value(manifest).unwrap(),
+            metadata: serde_json::json!({}),
+            tensors: vec![vocal_model::Tensor::byte_tensor("payload", vec![1, 2, 3])],
+        };
+        vocal_model::write_cache(root.join("fixture.vfrm"), &cache).expect("write cache");
+
+        let context = RuntimeContext::new(RuntimeConfig::default()).expect("context");
+        let catalog = context
+            .scan_model_directory(root.to_string_lossy().into_owned())
+            .unwrap();
+        assert_eq!(catalog.entries.len(), 1);
+        assert_eq!(catalog.entries[0].kind, ModelArtifactKind::Vfrm);
+        assert_eq!(catalog.entries[0].model.id, "fixture");
+        assert!(catalog.issues.is_empty());
+        std::fs::remove_dir_all(root).expect("remove model root");
     }
 }

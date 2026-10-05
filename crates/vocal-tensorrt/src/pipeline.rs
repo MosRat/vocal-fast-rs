@@ -255,6 +255,9 @@ impl RvcTrtProfile {
         } else if value.eq_ignore_ascii_case("voice_changer")
             || value.eq_ignore_ascii_case("voice-changer")
             || value.eq_ignore_ascii_case("vc")
+            || value.eq_ignore_ascii_case("11200")
+            || value.eq_ignore_ascii_case("realtime_11200")
+            || value.eq_ignore_ascii_case("fixed_11200")
         {
             Ok(Self::voice_changer())
         } else if value.eq_ignore_ascii_case("rvc_webui_legacy") {

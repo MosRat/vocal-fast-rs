@@ -16,21 +16,18 @@ The default deployment directory is the profile directory discovered from
 
 - `tensorrt_rtx_1_6.dll`
 - `tensorrt_onnxparser_rtx_1_6.dll`
-- matching x64 `cudart`, `cuFFT`, cuBLAS/cuBLASLt, and NVRTC/NVRTC-builtins
-  DLLs
+- matching x64 `cudart` and `cuFFT` DLLs
 
-The current VFRM graph directly links `cudart` and `cuFFT`. TensorRT-RTX can
-discover cuBLAS/cuBLASLt and NVRTC lazily: the former is an optional math
-backend, while the latter is used by source-code JIT tactics and dynamic kernel
-specialization. They are retained in the deployment set so a serialized engine
-can use those tactics on a clean machine. A fixed plan built with only the
-edge-mask tactic also runs in the repository's isolated test without cuBLAS or
-NVRTC, but omitting them would make other TensorRT-RTX plans/configurations
-machine-dependent.
+The native VFRM graph directly uses the CUDA runtime and the cuFFT RMVPE
+frontend. Serialized TensorRT-RTX plans carry their selected tactics, so the
+application deployment does not copy optional CUDA compiler or math libraries.
+This keeps the package aligned with the actual runtime ABI and avoids shipping
+toolkit components that are only needed while developing a plan.
 
 `cufftw` is not used by the native cuFFT C API path. `nvJitLink` and `nvfatbin`
-are CUDA toolkit tooling libraries and are not loaded by the TensorRT-RTX
-runtime or by its NVRTC path, so they are deliberately not copied.
+are CUDA toolkit tooling libraries and are deliberately not copied. The same
+applies to cuBLAS/cuBLASLt, NVRTC, and NVRTC-builtins; they are not direct
+runtime dependencies of the packaged native path.
 
 Copies are idempotent and are skipped when the destination file has the same
 size. The source roots are resolved from `TENSORRT_RTX_ROOT`/`TRT_ROOT` and

@@ -7,24 +7,13 @@ use std::{
 
 const TRT_DLLS: &[&str] = &["tensorrt_rtx_1_6.dll", "tensorrt_onnxparser_rtx_1_6.dll"];
 
-// TensorRT-RTX loads these CUDA libraries lazily while selecting tactics and
-// compiling JIT kernels. We copy the CUDA runtime, the native cuFFT frontend,
-// and the optional math/JIT backends that the RTX runtime can discover by
-// name. Optional entries are skipped when a CUDA installation does not ship
-// that component, which keeps the builder compatible with minor CUDA updates.
-//
-// Keep this list narrower than the whole CUDA `bin` directory. In particular,
-// nvJitLink and nvFatbin are separate CUDA tooling libraries; TensorRT-RTX's
-// source-code JIT path calls NVRTC and loads the generated PTX/CUBIN through
-// the CUDA driver, so those two libraries are not runtime dependencies here.
-const CUDA_DLL_PATTERNS: &[&str] = &[
-    "cudart64_*.dll",
-    "cufft64_*.dll",
-    "cublas64_*.dll",
-    "cublasLt64_*.dll",
-    "nvrtc64_*.dll",
-    "nvrtc-builtins64_*.dll",
-];
+// Keep this list to the CUDA libraries used directly by the native VFRM
+// runtime. TensorRT-RTX plans contain their compiled tactics and do not need
+// the CUDA toolkit's optional compiler/math DLLs at application startup.
+// Entries are optional so a build can still use a CUDA installation with a
+// minor DLL naming change; the runtime reports an error when a required path
+// is actually unavailable.
+const CUDA_DLL_PATTERNS: &[&str] = &["cudart64_*.dll", "cufft64_*.dll"];
 
 pub fn enabled() -> bool {
     env::var("VOCAL_TRT_COPY_DLLS")

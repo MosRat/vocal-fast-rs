@@ -24,6 +24,10 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     // precision while the boundary avoids an unnecessary half round-trip.
     DataType decoder_type=real_type();
     bool full_fp16=decoder_type==DataType::kHALF && o.synth_full_fp16!=0;
+    auto coherent_stage=[&](int stage) {
+        return decoder_type==DataType::kHALF &&
+            ((static_cast<uint32_t>(o.synth_fp16_coherent_stage_mask) >> stage) & 1u) != 0;
+    };
     // Keep the large pre-projection activation in a compact FP16 range.  The
     // inverse factor is folded into the first linear upsample kernel below,
     // so the transform is exact before FP16 rounding (bias is not scaled).
@@ -55,7 +59,8 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     T harmonic=nullptr;
     T harmonic_low=nullptr;
     bool any_noise_low=decoder_type==DataType::kHALF &&
-        (full_fp16 || o.synth_fp16_noise!=0 || o.synth_fp16_noise_stage_mask!=0);
+        (full_fp16 || o.synth_fp16_noise!=0 || o.synth_fp16_noise_stage_mask!=0 ||
+         o.synth_fp16_coherent_stage_mask!=0);
     if(c.uses_f0) {
         if(decoder_type!=DataType::kFLOAT && o.synth_fp16_source!=0) {
             active_type=decoder_type;
@@ -100,6 +105,7 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             int tail=1;for(int j=i+1;j<c.upsample_count;j++)tail*=c.rates[j];
             bool noise_low=decoder_type==DataType::kHALF &&
                 (full_fp16 || o.synth_fp16_noise!=0 ||
+                 coherent_stage(i) ||
                  ((o.synth_fp16_noise_stage_mask >> i) & 1) != 0);
             if(noise_low) {
                 active_type=decoder_type;
@@ -121,8 +127,10 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         // the stage mask while source phase arithmetic remains FP32.
         bool residual_low=decoder_type!=DataType::kFLOAT && o.synth_resblock_precision!=0 &&
             ((o.synth_resblock_stage_mask >> i) & 1) != 0;
-        bool residual_compute_low=full_fp16 || residual_low;
-        bool residual_accum_low=full_fp16 && o.synth_fp16_residual_accum!=0 || residual_low;
+        bool coherent_low=coherent_stage(i);
+        bool residual_compute_low=full_fp16 || residual_low || coherent_low;
+        bool residual_accum_low=(full_fp16 && o.synth_fp16_residual_accum!=0) ||
+            residual_low || coherent_low;
         DataType accum_type=residual_accum_low?decoder_type:DataType::kFLOAT;
         if(accum_type==DataType::kFLOAT) {
             if(decoder_type!=DataType::kFLOAT) {

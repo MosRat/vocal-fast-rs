@@ -166,13 +166,30 @@ def decode(net, x, pitchf, g, mode: str, device: torch.device):
     # FP16 but leaves the NSF phase/source in FP32.  The source is tested
     # separately because phase arithmetic is more sensitive than convolution.
     full = mode in ("decoder_full", "decoder_full_no_source", "decoder_full_accum", "all_fp16")
+    coherent_masks = {
+        "decoder_coherent_stage0": 0x1,
+        "decoder_coherent_stage1": 0x2,
+        "decoder_coherent_stage2": 0x4,
+        "decoder_coherent_stage3": 0x8,
+        "decoder_coherent_stage12": 0x6,
+    }
+    coherent_mask = coherent_masks.get(mode, 0)
+    # The suffix is a build-time boundary scale experiment.  It mirrors the
+    # native input-scale transform: the first low-precision upsample receives
+    # s*x and its kernel is folded by 1/s, so the affine result is unchanged
+    # apart from the FP16 rounding point.
+    input_scale = 1.0
+    if mode.endswith("_scale256"):
+        input_scale = 1.0 / 256.0
+        mode = mode[:-len("_scale256")]
+        coherent_mask = coherent_masks.get(mode, 0)
     core = mode in ("decoder_core_fp16", "decoder_full", "decoder_full_no_source", "decoder_full_accum", "all_fp16") or mode.startswith("decoder_core_stage")
     source16 = mode in ("decoder_source", "decoder_full", "all_fp16")
     pre16 = mode in ("decoder_pre", "decoder_full", "decoder_full_no_source", "decoder_full_accum", "all_fp16")
     stage_mask = {f"decoder_core_stage{i}": 1 << i for i in range(len(dec.ups))}
     post16 = core or mode == "decoder_post"
-    upsample16 = core or mode == "decoder_upsample"
-    noise16 = core or mode == "decoder_noise"
+    upsample16 = core or mode == "decoder_upsample" or coherent_mask != 0
+    noise16 = core or mode == "decoder_noise" or coherent_mask != 0
 
     with autocast(source16, device):
         har_source, _, _ = dec.m_source(pitchf, dec.upp)
@@ -182,28 +199,53 @@ def decode(net, x, pitchf, g, mode: str, device: torch.device):
         if g is not None:
             x = x + dec.cond(g)
     x = x.float()
+    if input_scale != 1.0:
+        x = x * input_scale
     for i, (ups, noise_conv) in enumerate(zip(dec.ups, dec.noise_convs)):
+        coherent = bool(coherent_mask & (1 << i))
+        if coherent and x.dtype != torch.float16 and device.type == "cuda":
+            x = x.half()
+        elif not coherent and x.dtype != torch.float32:
+            x = x.float()
         x = F.leaky_relu(x, dec.lrelu_slope)
         with autocast(upsample16, device):
-            xu = ups(x)
+            if i == 0 and input_scale != 1.0:
+                # Match native weight folding exactly:
+                # W/s * (s*x) + b == W*x + b.  Dividing the complete output
+                # would incorrectly scale the deconvolution bias.
+                xu = F.conv_transpose1d(
+                    x, ups.weight / input_scale, ups.bias,
+                    stride=ups.stride, padding=ups.padding,
+                    output_padding=ups.output_padding, groups=ups.groups,
+                    dilation=ups.dilation,
+                )
+            else:
+                xu = ups(x)
         with autocast(noise16, device):
             xn = noise_conv(har_source)
-        x = (xu + xn).float()
+        if coherent and device.type == "cuda":
+            x = xu + xn
+        else:
+            x = (xu + xn).float()
         blocks = []
         for j in range(dec.num_kernels):
             stage_enabled = full or mode == "decoder_resblocks" or (stage_mask.get(mode, 0) & (1 << i)) != 0
-            with autocast(stage_enabled, device):
+            with autocast(stage_enabled or coherent, device):
                 blocks.append(dec.resblocks[i * dec.num_kernels + j](x))
         # A half accumulation is deliberately a separate experiment.  The
         # default full-decoder candidate still sums branches in FP32 even when
         # each residual Conv runs in FP16.
-        if mode == "decoder_full_accum":
-            x = (sum(blocks) / dec.num_kernels).float()
+        if mode == "decoder_full_accum" or coherent:
+            x = sum(blocks) / dec.num_kernels
+            if not coherent:
+                x = x.float()
         else:
             x = (sum(v.float() for v in blocks) / dec.num_kernels).float()
     # Match Applio HiFiGANNSFGenerator.forward: the final activation calls
     # F.leaky_relu without an explicit slope (PyTorch default 0.01), while
     # the upsample/residual loop uses LRELU_SLOPE=0.1.
+    if not post16:
+        x = x.float()
     x = F.leaky_relu(x)
     with autocast(post16, device):
         x = torch.tanh(dec.conv_post(x))
@@ -286,6 +328,9 @@ def main() -> None:
     modes = ["fp32", "encoder", "flow", "decoder_source", "decoder_pre", "decoder_upsample",
              "decoder_noise", "decoder_resblocks", "decoder_post", "decoder_core_fp16",
              "decoder_core_stage0", "decoder_core_stage1", "decoder_core_stage2", "decoder_core_stage3",
+             "decoder_coherent_stage0", "decoder_coherent_stage1", "decoder_coherent_stage2",
+             "decoder_coherent_stage3", "decoder_coherent_stage12",
+             "decoder_coherent_stage1_scale256", "decoder_coherent_stage12_scale256",
              "decoder_full_no_source", "decoder_full", "decoder_full_accum", "all_fp16"]
     # The reference is explicitly Applio/PyTorch FP32, independent of native TRT.
     ref = run_variant(net, inp, device, "fp32")

@@ -142,6 +142,40 @@ the test GPU.  The mask is therefore useful as a profile candidate, not a
 guaranteed speedup.  It remains opt-in and should be selected only after a
 steady Nsight/CUDA-event replay on the target GPU.
 
+## Coherent decoder stages
+
+`VOCAL_TRT_SYNTH_FP16_COHERENT_STAGE_MASK` is the contiguous-stage variant.
+For each selected bit, the graph keeps the upsample/deconvolution, NSF noise
+convolution and add, all residual convolutions, and the residual average in
+the Synth FP16 domain. The next unselected stage explicitly casts back to
+FP32, while the NSF phase/source and public audio output keep their existing
+precision boundaries. Bit `0x2` selects the second decoder stage, which has
+the largest measured residual workload on the reference voice.
+
+The Python Applio FP32 reference sweep on RTX 3060 produced:
+
+| shape | coherent mask | median | relative L2 | cosine |
+| ---: | ---: | ---: | ---: | ---: |
+| 11200 | `0x2` | 22.85 ms | 0.1053% | 0.999999504 |
+| 11200 | `0x6` | 22.57 ms | 0.1134% | 0.999999437 |
+| 44960 | `0x2` | 53.84 ms | 2.9609% | 0.999562196 |
+| 44960 | `0x6` | 52.78 ms | 3.0032% | 0.999549833 |
+
+These are Python CUDA-event measurements used to select candidate regions;
+native TensorRT tactic timing remains the deployment gate. The option is
+opt-in and defaults to zero:
+
+```powershell
+$env:VOCAL_TRT_SYNTH_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_FP16_COHERENT_STAGE_MASK = "0x2"
+```
+
+The existing `VOCAL_TRT_SYNTH_FP16_INPUT_SCALE` experiment was also tested
+with the coherent stage. Correctly folding `1/256` into the first
+deconvolution weight changed 44960 relative L2 from `2.9609%` to `2.9599%`.
+This is too small to justify enabling scaling globally, so the default remains
+`1.0`.
+
 ## Hot residual convolution stage
 
 The largest residual MAC block is upsample stage 1 (bit `0x2`, C=128).  The

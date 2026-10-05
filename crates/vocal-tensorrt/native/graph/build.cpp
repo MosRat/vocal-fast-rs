@@ -24,6 +24,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 "invalid Synth FP16 noise option");
         require(options->synth_fp16_noise_stage_mask>=0,
                 "invalid Synth FP16 noise stage mask");
+        require(options->synth_fp16_coherent_stage_mask>=0,
+                "invalid Synth coherent FP16 stage mask");
         require(options->synth_fp16_post==0 || options->synth_fp16_post==1,
                 "invalid Synth FP16 post option");
         require(std::isfinite(options->synth_fp16_input_scale) &&
@@ -31,7 +33,7 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 "invalid Synth FP16 input scale");
         if(options->synth_full_fp16 || options->synth_fp16_residual_accum ||
            options->synth_fp16_source || options->synth_fp16_noise ||
-           options->synth_fp16_post) {
+           options->synth_fp16_coherent_stage_mask || options->synth_fp16_post) {
             require(options->precision==1,
                     "Synth FP16 decoder options require FP16 Synth precision");
         }
@@ -67,6 +69,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 "Synth residual stage mask exceeds upsample stages");
         require((static_cast<uint32_t>(options->synth_fp16_noise_stage_mask)&~valid_stage_mask)==0,
                 "Synth FP16 noise stage mask exceeds upsample stages");
+        require((static_cast<uint32_t>(options->synth_fp16_coherent_stage_mask)&~valid_stage_mask)==0,
+                "Synth coherent FP16 stage mask exceeds upsample stages");
         require((static_cast<uint32_t>(options->synth_resblock_conv1_stage_mask)&~valid_stage_mask)==0 &&
                     (static_cast<uint32_t>(options->synth_resblock_conv2_stage_mask)&~valid_stage_mask)==0,
                 "Synth residual operation mask exceeds upsample stages");
@@ -163,6 +167,7 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                     ", synth_fp16_source=" + std::to_string(options->synth_fp16_source) +
                     ", synth_fp16_noise=" + std::to_string(options->synth_fp16_noise) +
                     ", synth_fp16_noise_stage_mask=" + std::to_string(options->synth_fp16_noise_stage_mask) +
+                    ", synth_fp16_coherent_stage_mask=" + std::to_string(options->synth_fp16_coherent_stage_mask) +
                     ", synth_fp16_post=" + std::to_string(options->synth_fp16_post) +
                     ", fused_hubert_qkv=" + std::to_string(options->fused_qkv) +
                     ", fused_rvc_qkv=" + std::to_string(options->fused_rvc_qkv) +

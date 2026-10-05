@@ -246,6 +246,13 @@ pub struct NativeBuildOptions {
     /// compatibility shorthand for all stages.
     #[serde(default)]
     pub synth_fp16_noise_stage_mask: u32,
+    /// Keep a complete decoder stage in FP16: upsample/deconvolution, NSF
+    /// noise convolution, residual convolutions, and residual accumulation.
+    /// This is the coherent low-precision mode used to remove intermediate
+    /// FP32 round trips. The NSF phase/source and final tanh remain governed
+    /// by their dedicated switches.
+    #[serde(default)]
+    pub synth_fp16_coherent_stage_mask: u32,
     /// Run only the final learned `conv_post` projection in FP16, then cast
     /// its result back to FP32 for tanh. The projection is small, so this is
     /// kept as a diagnostic knob rather than a default optimization.
@@ -336,6 +343,7 @@ impl Default for NativeBuildOptions {
             synth_fp16_source: false,
             synth_fp16_noise: false,
             synth_fp16_noise_stage_mask: 0,
+            synth_fp16_coherent_stage_mask: 0,
             synth_fp16_post: false,
             log_build_options: false,
             dispatch_tune: DispatchTune::Auto,

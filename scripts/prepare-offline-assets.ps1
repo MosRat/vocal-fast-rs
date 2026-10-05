@@ -14,7 +14,17 @@ $audioSha256 = "30a610eb2027bc2cb59b88da6ad7ab0c2e39ca3e342590ebb455d490b4248e25
 New-Item -ItemType Directory -Force $assetRoot | Out-Null
 
 function Get-Sha256([string]$Path) {
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            return ([System.BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $algorithm.Dispose()
+    }
 }
 
 function Get-VerifiedFile([string]$Url, [string]$Path, [string]$Sha256) {
@@ -57,7 +67,11 @@ $manifest = @{
     pitch_model = "rmvpe"
 } | ConvertTo-Json -Depth 3
 $manifestPath = Join-Path $assetRoot "manifest.json"
-Set-Content -LiteralPath $manifestPath -Value $manifest -Encoding UTF8
+[System.IO.File]::WriteAllText(
+    $manifestPath,
+    $manifest,
+    [System.Text.UTF8Encoding]::new($false)
+)
 
 $licensePath = Join-Path $assetRoot "LICENSE"
 if ($Force -or -not (Test-Path -LiteralPath $licensePath)) {

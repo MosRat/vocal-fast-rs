@@ -987,15 +987,29 @@ fn create_runtime_engine(
             let package = package.ok_or_else(|| {
                 RuntimeError::Config("TensorRT backend requires a loaded VFRM model package".into())
             })?;
-            let artifacts_path = config.tensorrt_artifacts_path.as_deref().ok_or_else(|| {
+            let artifacts_path = config.tensorrt_artifacts().ok_or_else(|| {
                 RuntimeError::Config("TensorRT artifacts path is not configured".into())
             })?;
-            let trt_config = vocal_tensorrt::TensorRtConfig::from_env()
+            let mut trt_config = vocal_tensorrt::TensorRtConfig::from_env()
                 .map_err(|error| RuntimeError::Config(error.to_string()))?;
+            let gui = &config.tensorrt;
+            trt_config.runtime.cuda_graph = gui.cuda_graph;
+            trt_config.runtime.native_cuda_graph = gui.native_cuda_graph;
+            trt_config.runtime.graph_cache_size = gui.graph_cache_size;
+            trt_config.runtime.parallel_acoustic = gui.parallel_acoustic;
+            trt_config.runtime.async_audio_d2h = gui.async_audio_d2h;
+            if let Some(mode) = vocal_tensorrt::GraphReplayMode::parse(&gui.graph_mode) {
+                trt_config.runtime.graph_mode = mode;
+            } else {
+                return Err(RuntimeError::Config(format!(
+                    "invalid TensorRT graph mode: {}",
+                    gui.graph_mode
+                )));
+            }
             let trt = vocal_engine::TensorRtBackendConfig::for_package(
                 PathBuf::from(artifacts_path),
                 config.speaker_id,
-                config.tensorrt_window_samples,
+                config.tensorrt_window(),
                 trt_config.runtime,
                 trt_config.diagnostics,
             );

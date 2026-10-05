@@ -11,7 +11,10 @@ mod config;
 mod error;
 mod state;
 
-pub use config::{ConfigStore, RUNTIME_CONFIG_SCHEMA_VERSION, RuntimeBackend, RuntimeConfig};
+pub use config::{
+    ConfigStore, RUNTIME_CONFIG_SCHEMA_VERSION, RuntimeBackend, RuntimeConfig,
+    TensorRtPipelineConfig,
+};
 pub use error::{RuntimeError, RuntimeResult};
 pub use state::{
     ModelCatalog, ModelCatalogEntry, ModelCatalogIssue, ModelSummary, RuntimeContext,

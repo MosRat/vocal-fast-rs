@@ -14,6 +14,58 @@ use crate::error::{RuntimeError, RuntimeResult, io_at};
 pub const RUNTIME_CONFIG_SCHEMA_VERSION: u32 = 1;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
+/// GUI-owned TensorRT pipeline policy. Paths are kept as strings at the
+/// runtime boundary so the same JSON can be consumed by the Tauri frontend;
+/// the engine converts them to `PathBuf` only when it constructs an engine.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+pub struct TensorRtPipelineConfig {
+    pub artifacts_path: Option<String>,
+    pub hubert_source: Option<String>,
+    pub rmvpe_source: Option<String>,
+    pub cache_directory: Option<String>,
+    pub profile: String,
+    pub window_samples: Option<usize>,
+    pub precision: String,
+    pub hubert_precision: String,
+    pub rmvpe_precision: String,
+    pub synth_precision: String,
+    pub graph_mode: String,
+    pub cuda_graph: bool,
+    pub native_cuda_graph: bool,
+    pub graph_cache_size: usize,
+    pub parallel_acoustic: bool,
+    pub async_audio_d2h: bool,
+    pub rmvpe_fft: String,
+    pub synth_full_fp16: bool,
+}
+
+impl Default for TensorRtPipelineConfig {
+    fn default() -> Self {
+        Self {
+            artifacts_path: None,
+            hubert_source: None,
+            rmvpe_source: None,
+            cache_directory: None,
+            profile: "reference".into(),
+            window_samples: None,
+            precision: "fp32".into(),
+            hubert_precision: "fp16".into(),
+            rmvpe_precision: "fp32".into(),
+            synth_precision: "fp16".into(),
+            graph_mode: "native_subgraphs".into(),
+            cuda_graph: true,
+            native_cuda_graph: true,
+            graph_cache_size: 2,
+            parallel_acoustic: false,
+            async_audio_d2h: true,
+            rmvpe_fft: "cufft".into(),
+            synth_full_fp16: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RuntimeBackend {
@@ -51,6 +103,11 @@ pub struct RuntimeConfig {
     /// TensorRT pipeline manifest produced by `compile-trt-pipeline`.
     pub tensorrt_artifacts_path: Option<String>,
     pub tensorrt_window_samples: Option<usize>,
+    /// Typed TensorRT settings used by the GUI and persisted with the rest of
+    /// the runtime configuration. The two legacy fields above remain accepted
+    /// for config files written before this group was introduced.
+    #[serde(default)]
+    pub tensorrt: TensorRtPipelineConfig,
     pub speaker_id: i32,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
@@ -70,6 +127,7 @@ impl Default for RuntimeConfig {
             model_directory: None,
             tensorrt_artifacts_path: None,
             tensorrt_window_samples: None,
+            tensorrt: TensorRtPipelineConfig::default(),
             speaker_id: 0,
             input_device: None,
             output_device: None,
@@ -109,22 +167,50 @@ impl RuntimeConfig {
                 "input and output formats must match for duplex streaming".into(),
             ));
         }
-        if self.backend == RuntimeBackend::TensorRtRtx
-            && self
-                .tensorrt_artifacts_path
-                .as_deref()
-                .is_none_or(str::is_empty)
-        {
+        let artifacts_path = self
+            .tensorrt
+            .artifacts_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .or_else(|| {
+                self.tensorrt_artifacts_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+            });
+        if self.backend == RuntimeBackend::TensorRtRtx && artifacts_path.is_none() {
             return Err(RuntimeError::Config(
                 "TensorRT backend requires tensorrt_artifacts_path".into(),
             ));
         }
-        if self.tensorrt_window_samples == Some(0) {
+        if self
+            .tensorrt
+            .window_samples
+            .or(self.tensorrt_window_samples)
+            == Some(0)
+        {
             return Err(RuntimeError::Config(
                 "tensorrt_window_samples must be non-zero when provided".into(),
             ));
         }
         Ok(())
+    }
+
+    pub fn tensorrt_artifacts(&self) -> Option<&str> {
+        self.tensorrt
+            .artifacts_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .or_else(|| {
+                self.tensorrt_artifacts_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+            })
+    }
+
+    pub fn tensorrt_window(&self) -> Option<usize> {
+        self.tensorrt
+            .window_samples
+            .or(self.tensorrt_window_samples)
     }
 }
 

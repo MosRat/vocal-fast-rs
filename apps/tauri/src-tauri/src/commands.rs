@@ -52,17 +52,20 @@ pub async fn pick_model_directory() -> GuiResult<Option<String>> {
 }
 
 #[tauri::command]
-pub fn get_snapshot(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
-    report(state.inner(), state.snapshot())
+pub async fn get_snapshot(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
+    run_blocking(state.inner().clone(), |state| state.snapshot()).await
 }
 
 #[tauri::command]
-pub fn subscribe(
+pub async fn subscribe(
     state: State<'_, AppState>,
     window_label: String,
     channel: Channel<BackendEvent>,
 ) -> GuiResult<UiSnapshot> {
-    report(state.inner(), state.attach_channel(window_label, channel))
+    run_blocking(state.inner().clone(), move |state| {
+        state.attach_channel(window_label, channel)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -80,9 +83,15 @@ pub async fn update_config(
 #[tauri::command]
 pub async fn load_model(state: State<'_, AppState>, path: String) -> GuiResult<UiSnapshot> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.load_model(path))
-        .await
-        .map_err(|error| crate::error::GuiError::Internal(error.to_string()))?
+    let reporter = state.clone();
+    match tauri::async_runtime::spawn_blocking(move || state.load_model(path)).await {
+        Ok(result) => result,
+        Err(error) => {
+            let error = crate::error::GuiError::Internal(error.to_string());
+            reporter.report(&error);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -188,13 +197,6 @@ fn harden_webview_impl(window: &WebviewWindow) -> GuiResult<()> {
     Ok(())
 }
 
-fn report<T>(state: &AppState, result: GuiResult<T>) -> GuiResult<T> {
-    if let Err(error) = &result {
-        state.report(error);
-    }
-    result
-}
-
 /// Execute filesystem, device and lifecycle operations away from Tauri's
 /// command executor. The helper owns the same AppState handle as the caller,
 /// so every failure still enters the central error/event path exactly once.
@@ -204,9 +206,14 @@ where
     F: FnOnce(&AppState) -> GuiResult<T> + Send + 'static,
 {
     let reporter = state.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || operation(&state))
-        .await
-        .map_err(|error| crate::error::GuiError::Internal(error.to_string()))?;
+    let result = match tauri::async_runtime::spawn_blocking(move || operation(&state)).await {
+        Ok(result) => result,
+        Err(error) => {
+            let error = crate::error::GuiError::Internal(error.to_string());
+            reporter.report(&error);
+            return Err(error);
+        }
+    };
     if let Err(error) = &result {
         reporter.report(error);
     }

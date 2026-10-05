@@ -234,6 +234,7 @@ impl RuntimeContext {
 
         const MAX_DEPTH: usize = 3;
         const MAX_ENTRIES: usize = 512;
+        const MAX_MODEL_FILES: usize = 4096;
         const MAX_ISSUES: usize = 512;
         const MAX_SCAN_METADATA_BYTES: u64 = 4 * 1024 * 1024;
         let load_config = ModelLoadConfig {
@@ -244,7 +245,11 @@ impl RuntimeContext {
         let mut visited = HashSet::new();
         let mut entries = Vec::new();
         let mut issues = Vec::new();
+        let mut model_files_seen = 0_usize;
         while let Some((directory, depth)) = directories.pop() {
+            if model_files_seen >= MAX_MODEL_FILES {
+                break;
+            }
             if !visited.insert(directory.clone()) {
                 continue;
             }
@@ -315,6 +320,16 @@ impl RuntimeContext {
                 }
                 if !metadata.is_file() || !is_model_catalog_file(&path) {
                     continue;
+                }
+                model_files_seen = model_files_seen.saturating_add(1);
+                if model_files_seen > MAX_MODEL_FILES {
+                    push_catalog_issue(
+                        &mut issues,
+                        MAX_ISSUES,
+                        root.display().to_string(),
+                        format!("model file scan limit reached ({MAX_MODEL_FILES} files)"),
+                    );
+                    break;
                 }
                 let canonical_path = match canonical_library_path(&path, &root) {
                     Ok(path) => path,

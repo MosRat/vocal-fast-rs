@@ -6,6 +6,7 @@ use crate::{
     error::GuiResult,
     events::BackendEvent,
     state::{AppState, UiSnapshot},
+    tensorrt::PrepareTensorRtRequest,
 };
 
 #[tauri::command]
@@ -76,6 +77,17 @@ pub async fn update_config(
 ) -> GuiResult<UiSnapshot> {
     run_blocking(state.inner().clone(), move |state| {
         state.update_config(config, expected_revision)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn prepare_tensorrt_pipeline(
+    state: State<'_, AppState>,
+    request: PrepareTensorRtRequest,
+) -> GuiResult<UiSnapshot> {
+    run_blocking(state.inner().clone(), move |state| {
+        state.prepare_tensorrt_pipeline(request)
     })
     .await
 }

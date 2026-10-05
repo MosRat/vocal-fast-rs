@@ -3,7 +3,7 @@ use std::{
     time::Instant,
 };
 
-use vocal_runtime::RuntimeContext;
+use vocal_runtime::{RuntimeContext, RuntimeBackend};
 use vocal_types::{AudioChunk, AudioFormat, LifecycleState};
 
 use crate::{
@@ -11,8 +11,13 @@ use crate::{
     config::{ConfigStore, GuiConfig},
     error::{GuiError, GuiResult},
     events::{BackendEvent, ErrorReport, EventSink},
-    snapshot::{BootPhase, UiBootStatus, UiEngineStatus, UiStatus},
+    snapshot::{
+        BootPhase, TensorRtPipelinePhase, TensorRtPipelineStatus, UiBootStatus, UiEngineStatus,
+        UiStatus,
+    },
 };
+
+use crate::tensorrt::PrepareTensorRtRequest;
 
 pub use crate::snapshot::{UiMetrics, UiSnapshot};
 pub use vocal_runtime::ModelCatalog;
@@ -22,6 +27,7 @@ struct RuntimeState {
     audio: Option<AudioSession>,
     last_error: Option<ErrorReport>,
     boot: BootState,
+    tensorrt_pipeline: TensorRtPipelineStatus,
 }
 
 struct BootState {
@@ -78,6 +84,7 @@ impl AppState {
                 audio: None,
                 last_error: None,
                 boot: BootState::new(),
+                tensorrt_pipeline: TensorRtPipelineStatus::default(),
             })),
             command_lock: Arc::new(Mutex::new(())),
             events: Arc::new(EventSink::default()),
@@ -87,6 +94,18 @@ impl AppState {
     pub fn set_config_store(&self, store: ConfigStore) -> GuiResult<()> {
         let runtime = self.lock()?.runtime.clone();
         runtime.set_config_store(store.runtime_store())?;
+        Ok(())
+    }
+
+    pub fn set_default_tensorrt_cache_directory(&self, path: std::path::PathBuf) -> GuiResult<()> {
+        let runtime = self.lock()?.runtime.clone();
+        let snapshot = runtime.snapshot()?;
+        if snapshot.config.tensorrt.cache_directory.is_some() {
+            return Ok(());
+        }
+        let mut config = snapshot.config;
+        config.tensorrt.cache_directory = Some(path.display().to_string());
+        runtime.update_config(config, snapshot.config_revision)?;
         Ok(())
     }
 
@@ -209,6 +228,86 @@ impl AppState {
         self.events
             .publish(BackendEvent::snapshot(snapshot.clone()));
         Ok(snapshot)
+    }
+
+    pub fn prepare_tensorrt_pipeline(
+        &self,
+        request: PrepareTensorRtRequest,
+    ) -> GuiResult<UiSnapshot> {
+        let _operation = self.operation()?;
+        let (runtime, mut config, revision) = {
+            let state = self.lock()?;
+            if state.audio.is_some() {
+                return Err(GuiError::InvalidState {
+                    state: "audio_session_active".into(),
+                    action: "prepare_tensorrt_pipeline".into(),
+                });
+            }
+            let snapshot = state.runtime.snapshot()?;
+            (state.runtime.clone(), snapshot.config, snapshot.config_revision)
+        };
+        if revision != request.expected_revision {
+            return Err(GuiError::ConfigConflict {
+                expected: request.expected_revision,
+                actual: revision,
+            });
+        }
+
+        self.set_tensorrt_pipeline(TensorRtPipelineStatus {
+            phase: TensorRtPipelinePhase::CheckingCache,
+            message: Some("Checking the TensorRT pipeline cache".into()),
+            artifacts_path: None,
+            cache_hit: false,
+            elapsed_ms: 0,
+        })?;
+        self.set_tensorrt_pipeline(TensorRtPipelineStatus {
+            phase: TensorRtPipelinePhase::Building,
+            message: Some("Preparing the TensorRT pipeline".into()),
+            artifacts_path: None,
+            cache_hit: false,
+            elapsed_ms: 0,
+        })?;
+        let started = Instant::now();
+        let prepared = crate::tensorrt::prepare(&config, request).map_err(|error| {
+            let _ = self.set_tensorrt_pipeline(TensorRtPipelineStatus {
+                phase: TensorRtPipelinePhase::Failed,
+                message: Some(error.to_string()),
+                artifacts_path: None,
+                cache_hit: false,
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+            error
+        })?;
+        config.backend = RuntimeBackend::TensorRtRtx;
+        config.tensorrt = prepared.config;
+        config.tensorrt.artifacts_path = Some(prepared.artifacts_path.display().to_string());
+        config.tensorrt_artifacts_path = config.tensorrt.artifacts_path.clone();
+        config.tensorrt_window_samples = config.tensorrt.window_samples;
+        config.model_path = Some(prepared.model_path.display().to_string());
+        if let Err(error) = runtime.update_config(config, revision) {
+            let error = GuiError::from(error);
+            let _ = self.set_tensorrt_pipeline(TensorRtPipelineStatus {
+                phase: TensorRtPipelinePhase::Failed,
+                message: Some(error.to_string()),
+                artifacts_path: Some(prepared.artifacts_path.display().to_string()),
+                cache_hit: prepared.cache_hit,
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+            return Err(error);
+        }
+        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.set_tensorrt_pipeline(TensorRtPipelineStatus {
+            phase: TensorRtPipelinePhase::Ready,
+            message: Some(if prepared.cache_hit {
+                "TensorRT pipeline ready (cache hit)".into()
+            } else {
+                "TensorRT pipeline ready".into()
+            }),
+            artifacts_path: Some(prepared.artifacts_path.display().to_string()),
+            cache_hit: prepared.cache_hit,
+            elapsed_ms,
+        })?;
+        self.snapshot()
     }
 
     pub fn load_model(&self, path: String) -> GuiResult<UiSnapshot> {
@@ -417,6 +516,16 @@ impl AppState {
         self.report(&error);
     }
 
+    fn set_tensorrt_pipeline(&self, status: TensorRtPipelineStatus) -> GuiResult<()> {
+        let snapshot = {
+            let mut state = self.lock()?;
+            state.tensorrt_pipeline = status;
+            state.snapshot()?
+        };
+        self.events.publish(BackendEvent::snapshot(snapshot));
+        Ok(())
+    }
+
     fn operation(&self) -> GuiResult<std::sync::MutexGuard<'_, ()>> {
         self.command_lock
             .lock()
@@ -497,6 +606,7 @@ impl RuntimeState {
             engine,
             last_error: self.last_error.clone().or(runtime_error),
             audio,
+            tensorrt_pipeline: self.tensorrt_pipeline.clone(),
         })
     }
 }

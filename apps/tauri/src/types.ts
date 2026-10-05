@@ -1,6 +1,6 @@
 export type Lifecycle = 'created' | 'loading' | 'ready' | 'running' | 'stopping' | 'stopped' | 'failed';
 export type BootPhase = 'starting' | 'restoringConfig' | 'restoringModel' | 'ready' | 'failed' | 'shuttingDown';
-export type Backend = 'passthrough' | 'rvcCpu';
+export type Backend = 'passthrough' | 'rvcCpu' | 'tensorRtRtx';
 export type ThemePreference = 'system' | 'light' | 'dark';
 export type WorkspaceRoute = 'studio' | 'audio' | 'tuning' | 'diagnostics';
 
@@ -17,6 +17,27 @@ export interface ConversionConfig {
   rmsMixRate: number;
 }
 
+export interface TensorRtPipelineConfig {
+  artifactsPath: string | null;
+  hubertSource: string | null;
+  rmvpeSource: string | null;
+  cacheDirectory: string | null;
+  profile: string;
+  windowSamples: number | null;
+  precision: string;
+  hubertPrecision: string;
+  rmvpePrecision: string;
+  synthPrecision: string;
+  graphMode: string;
+  cudaGraph: boolean;
+  nativeCudaGraph: boolean;
+  graphCacheSize: number;
+  parallelAcoustic: boolean;
+  asyncAudioD2h: boolean;
+  rmvpeFft: string;
+  synthFullFp16: boolean;
+}
+
 export interface GuiConfig {
   schemaVersion: number;
   inputFormat: { sampleRate: number; channels: number };
@@ -29,6 +50,9 @@ export interface GuiConfig {
   outputDevice: string | null;
   blockFrames: number;
   queueBlocks: number;
+  tensorrtArtifactsPath: string | null;
+  tensorrtWindowSamples: number | null;
+  tensorrt: TensorRtPipelineConfig;
 }
 
 export interface AudioDeviceInfo {
@@ -134,7 +158,17 @@ export interface Snapshot {
     lastError: string | null;
   } | null;
   audio: AudioTelemetry;
+  tensorrtPipeline: TensorRtPipelineStatus;
   lastError: ErrorReport | null;
+}
+
+export type TensorRtPipelinePhase = 'idle' | 'checkingCache' | 'building' | 'ready' | 'failed';
+export interface TensorRtPipelineStatus {
+  phase: TensorRtPipelinePhase;
+  message: string | null;
+  artifactsPath: string | null;
+  cacheHit: boolean;
+  elapsedMs: number;
 }
 
 export interface BackendEvent {
@@ -161,5 +195,27 @@ export function defaultConfig(): GuiConfig {
     outputDevice: null,
     blockFrames: 480,
     queueBlocks: 3,
+    tensorrtArtifactsPath: null,
+    tensorrtWindowSamples: null,
+    tensorrt: {
+      artifactsPath: null,
+      hubertSource: null,
+      rmvpeSource: null,
+      cacheDirectory: null,
+      profile: 'reference',
+      windowSamples: null,
+      precision: 'fp32',
+      hubertPrecision: 'fp16',
+      rmvpePrecision: 'fp32',
+      synthPrecision: 'fp16',
+      graphMode: 'native_subgraphs',
+      cudaGraph: true,
+      nativeCudaGraph: true,
+      graphCacheSize: 2,
+      parallelAcoustic: false,
+      asyncAudioD2h: true,
+      rmvpeFft: 'cufft',
+      synthFullFp16: false,
+    },
   };
 }

@@ -27,6 +27,28 @@ pub struct UiSnapshot {
     pub engine: Option<UiEngineStatus>,
     pub last_error: Option<ErrorReport>,
     pub audio: AudioTelemetry,
+    pub tensorrt_pipeline: TensorRtPipelineStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TensorRtPipelinePhase {
+    #[default]
+    Idle,
+    CheckingCache,
+    Building,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TensorRtPipelineStatus {
+    pub phase: TensorRtPipelinePhase,
+    pub message: Option<String>,
+    pub artifacts_path: Option<String>,
+    pub cache_hit: bool,
+    pub elapsed_ms: u64,
 }
 
 /// Application startup is intentionally separate from the runtime lifecycle.

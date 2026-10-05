@@ -3985,6 +3985,7 @@ dependencies = [
  "vocal-engine",
  "vocal-model",
  "vocal-runtime",
+ "vocal-tensorrt",
  "vocal-types",
  "webview2-com",
  "windows-core",

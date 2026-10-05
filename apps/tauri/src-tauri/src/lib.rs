@@ -6,6 +6,7 @@ mod events;
 mod snapshot;
 mod state;
 mod tray;
+mod tensorrt;
 
 use std::path::PathBuf;
 
@@ -58,6 +59,11 @@ pub fn run() {
                 state.fail_boot(&error);
                 reveal_main(&handle);
                 return Ok(());
+            }
+            if let Ok(cache_dir) = app.path().app_cache_dir() {
+                let _ = state.set_default_tensorrt_cache_directory(
+                    cache_dir.join("vocal-fast").join("tensorrt"),
+                );
             }
 
             match state.persisted_model_path() {
@@ -125,6 +131,7 @@ pub fn run() {
             commands::list_models,
             commands::pick_model_directory,
             commands::update_config,
+            commands::prepare_tensorrt_pipeline,
             commands::load_model,
             commands::unload_model,
             commands::start_session,

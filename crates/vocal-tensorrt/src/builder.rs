@@ -511,10 +511,8 @@ impl NativeTensorRtBuilder {
             })
             .collect::<Result<Vec<_>, NativeBuildError>>()?;
         let timing_cache = self.timing_cache_cstring()?;
-        let mut options = self.native_options(
-            timing_cache.as_ref(),
-            self.options.rmvpe_fft_cufft as i32,
-        );
+        let mut options =
+            self.native_options(timing_cache.as_ref(), self.options.rmvpe_fft_cufft as i32);
         // RMVPE's waveform binding is profiled in complete 160-sample hops.
         // Keep the measured application sample points exact; the graph itself
         // exposes the additional STFT boundary frame at runtime (`T/160+1`)

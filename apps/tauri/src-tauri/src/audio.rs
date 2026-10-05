@@ -179,7 +179,7 @@ impl AudioSession {
         // Once the device graph is ready, transfer the mutable engine to the
         // dedicated model worker. The control actor keeps only metadata and
         // receives the engine back after this worker exits.
-        let engine = runtime
+        let (worker_generation, engine) = runtime
             .take_engine_for_worker()
             .map_err(|error| error.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -197,6 +197,16 @@ impl AudioSession {
             .spawn(move || {
                 #[cfg(windows)]
                 let _mmcss = worker_io.register_mmcss("Pro Audio");
+                let mut engine = Some(engine);
+                let mut failure: Option<(String, String)> = None;
+                let mut report_message: Option<String> = None;
+                if let Err(error) = worker_runtime.activate_worker(worker_generation) {
+                    worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                    report_message = Some(error.to_string());
+                    failure = Some((error.code().into(), error.to_string()));
+                    worker_alive_flag.store(false, Ordering::Release);
+                    worker_stop.store(true, Ordering::Release);
+                }
                 let schedule = WorkerSchedule {
                     // Keep capture-to-render age bounded if inference briefly
                     // falls behind. The engine owns its short context, so
@@ -206,10 +216,10 @@ impl AudioSession {
                     timeout: Some(WORKER_WAIT),
                 };
                 let mut sequence = 0_u64;
-                let mut engine = Some(engine);
-                let mut failure: Option<(String, String)> = None;
-                let mut report_message: Option<String> = None;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if failure.is_some() {
+                        return;
+                    }
                     while !worker_stop.load(Ordering::Acquire) {
                         let result = worker_io.process_once(schedule, |input, output| {
                             let started = Instant::now();
@@ -275,7 +285,7 @@ impl AudioSession {
                 }
                 worker_alive_flag.store(false, Ordering::Release);
                 if let Some(engine) = engine.take() {
-                    let _ = worker_runtime.complete_worker(engine, failure);
+                    let _ = worker_runtime.complete_worker(worker_generation, engine, failure);
                 }
                 if let Some(message) = report_message {
                     worker_report(message);

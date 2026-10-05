@@ -9,10 +9,10 @@ use crate::{
 };
 
 #[tauri::command]
-pub fn list_audio_devices(
+pub async fn list_audio_devices(
     state: State<'_, AppState>,
 ) -> GuiResult<crate::audio::AudioDeviceCatalog> {
-    report(state.inner(), state.list_audio_devices())
+    run_blocking(state.inner().clone(), |state| state.list_audio_devices()).await
 }
 
 #[tauri::command]
@@ -20,16 +20,10 @@ pub async fn list_models(
     state: State<'_, AppState>,
     path: String,
 ) -> GuiResult<crate::state::ModelCatalog> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let result = state.scan_model_directory(path);
-        if let Err(error) = &result {
-            state.report(error);
-        }
-        result
+    run_blocking(state.inner().clone(), move |state| {
+        state.scan_model_directory(path)
     })
     .await
-    .map_err(|error| crate::error::GuiError::Internal(error.to_string()))?
 }
 
 /// Open the platform folder picker without blocking the Tauri command thread.
@@ -72,15 +66,15 @@ pub fn subscribe(
 }
 
 #[tauri::command]
-pub fn update_config(
+pub async fn update_config(
     state: State<'_, AppState>,
     config: GuiConfig,
     expected_revision: u64,
 ) -> GuiResult<UiSnapshot> {
-    report(
-        state.inner(),
-        state.update_config(config, expected_revision),
-    )
+    run_blocking(state.inner().clone(), move |state| {
+        state.update_config(config, expected_revision)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -92,35 +86,34 @@ pub async fn load_model(state: State<'_, AppState>, path: String) -> GuiResult<U
 }
 
 #[tauri::command]
-pub fn unload_model(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
-    report(state.inner(), state.unload_model())
+pub async fn unload_model(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
+    run_blocking(state.inner().clone(), |state| state.unload_model()).await
 }
 
 #[tauri::command]
-pub fn start_session(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
-    report(state.inner(), state.start())
+pub async fn start_session(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
+    run_blocking(state.inner().clone(), |state| state.start()).await
 }
 
 #[tauri::command]
-pub fn stop_session(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
-    report(state.inner(), state.stop())
+pub async fn stop_session(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
+    run_blocking(state.inner().clone(), |state| state.stop()).await
 }
 
 #[tauri::command]
-pub fn clear_error(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
-    report(state.inner(), state.clear_error())
+pub async fn clear_error(state: State<'_, AppState>) -> GuiResult<UiSnapshot> {
+    run_blocking(state.inner().clone(), |state| state.clear_error()).await
 }
 
 #[tauri::command]
-pub fn process_block(
+pub async fn process_block(
     state: State<'_, AppState>,
     samples: Vec<f32>,
     sample_rate: u32,
     channels: u16,
     sequence: u64,
 ) -> GuiResult<UiSnapshot> {
-    report(
-        state.inner(),
+    run_blocking(state.inner().clone(), move |state| {
         state.process(
             samples,
             AudioFormat {
@@ -128,8 +121,9 @@ pub fn process_block(
                 channels,
             },
             sequence,
-        ),
-    )
+        )
+    })
+    .await
 }
 
 /// Open the native WebView inspector on an explicit user action.
@@ -197,6 +191,24 @@ fn harden_webview_impl(window: &WebviewWindow) -> GuiResult<()> {
 fn report<T>(state: &AppState, result: GuiResult<T>) -> GuiResult<T> {
     if let Err(error) = &result {
         state.report(error);
+    }
+    result
+}
+
+/// Execute filesystem, device and lifecycle operations away from Tauri's
+/// command executor. The helper owns the same AppState handle as the caller,
+/// so every failure still enters the central error/event path exactly once.
+async fn run_blocking<T, F>(state: AppState, operation: F) -> GuiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState) -> GuiResult<T> + Send + 'static,
+{
+    let reporter = state.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || operation(&state))
+        .await
+        .map_err(|error| crate::error::GuiError::Internal(error.to_string()))?;
+    if let Err(error) = &result {
+        reporter.report(error);
     }
     result
 }

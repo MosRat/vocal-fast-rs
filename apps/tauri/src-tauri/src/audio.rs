@@ -198,7 +198,11 @@ impl AudioSession {
                 #[cfg(windows)]
                 let _mmcss = worker_io.register_mmcss("Pro Audio");
                 let schedule = WorkerSchedule {
-                    input_policy: WorkerInputPolicy::Fifo,
+                    // Keep capture-to-render age bounded if inference briefly
+                    // falls behind. The engine owns its short context, so
+                    // dropping stale queue blocks is preferable to replaying
+                    // an ever older voice stream.
+                    input_policy: WorkerInputPolicy::Latest,
                     timeout: Some(WORKER_WAIT),
                 };
                 let mut sequence = 0_u64;

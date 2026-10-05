@@ -567,9 +567,15 @@ impl RuntimeInner {
     }
 
     fn clear_error(&mut self) -> RuntimeResult<RuntimeSnapshot> {
+        if self.worker_status.is_some() {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.lifecycle),
+                action: "clear_error_while_worker_active".into(),
+            });
+        }
         self.last_error = None;
         if self.lifecycle == LifecycleState::Failed {
-            self.lifecycle = if self.engine.is_some() || self.worker_status.is_some() {
+            self.lifecycle = if self.engine.is_some() {
                 LifecycleState::Ready
             } else {
                 LifecycleState::Created
@@ -1102,6 +1108,37 @@ mod tests {
             context.take_engine_for_worker(),
             Err(RuntimeError::State { .. })
         ));
+    }
+
+    #[test]
+    fn clear_error_waits_until_worker_returns_engine() {
+        let format = vocal_types::AudioFormat::MONO_16K;
+        let context = RuntimeContext::new(RuntimeConfig {
+            input_format: format,
+            output_format: format,
+            ..RuntimeConfig::default()
+        })
+        .expect("context");
+        context.load_model_descriptor(descriptor()).expect("load");
+        context.start_processing().expect("start");
+        let (generation, engine) = context.take_engine_for_worker().expect("transfer");
+        context
+            .activate_worker(generation)
+            .expect("activate worker");
+        context
+            .report_failure("audio.worker", "worker stopped")
+            .expect("report failure");
+        assert!(matches!(
+            context.clear_error(),
+            Err(RuntimeError::State { .. })
+        ));
+        context
+            .complete_worker(generation, engine, None)
+            .expect("return engine");
+        assert_eq!(
+            context.clear_error().expect("clear error").lifecycle,
+            LifecycleState::Ready
+        );
     }
 
     #[test]

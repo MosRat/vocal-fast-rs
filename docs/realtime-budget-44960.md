@@ -29,33 +29,42 @@ sample plan and appends the new F0 frames to the 1,024-frame cache.
 
 ## RTX 3060 measurement
 
-The following run used 10 warmups, 30 iterations, `realtime_f0=1`,
-`advance_frames=25`, native TensorRT CUDA Graph replay, and the shared HuBERT /
-RMVPE plans.  Only the Synth plan changed between rows.
+The following fixed-profile run used `realtime_f0=1`, `advance_frames=25`,
+native TensorRT-RTX graph strategy, and the shared HuBERT/RMVPE plans.
 
-| Synth plan | mean total | last total | HuBERT | RMVPE realtime | frontend | Synth | output returned |
+| Synth plan | total | HuBERT | RMVPE realtime | frontend | Synth | Synth tail |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| mixed FP16 | 47.00 ms | 46.73 ms | 4.53 ms | 3.34 ms | 0.012 ms | 37.05 ms | 112,400 samples |
-| coherent FP16 `0x2` | 40.17 ms | 37.70 ms | 5.02 ms | 3.34 ms | 0.012 ms | 28.44 ms | 112,400 samples |
+| static tail FP32 | 69.48 ms | 26.89 ms | 22.81 ms | 0.042 ms | 19.42 ms | 12,400 samples |
 
-The steady callback budget is therefore about 40--47 ms of GPU/host pipeline
-time for 250 ms of newly playable audio.  This leaves roughly 5.3--6.2x
-compute headroom on the RTX 3060, before device scheduling and audio-driver
-buffering.
+The steady callback budget is therefore about 69 ms of GPU/host pipeline time
+for 250 ms of newly playable audio. This leaves roughly 3.6x compute headroom
+on the RTX 3060, before device scheduling and audio-driver buffering.
 
 ## Current API boundary
 
 `RvcTrtPipeline::process_realtime()` keeps the 44960-sample HuBERT/RMVPE
-context, but the Synth binding is now a trailing 31-frame view.  This is the
-same `skip_head=250`, `return_length=31` contract used by Applio: the graph
-produces 4960 internal samples (`4000 + 800 + 160`) instead of decoding the
-discarded 2.5-second prefix.  The engine adapter then performs normalized
-correlation over the 160-sample SOLA search, blends the 800-sample overlap, and
-publishes exactly the callback block (4000 samples at 16 kHz, or 12000 at
-48 kHz).  The Synth artifact records a separate `min/opt/max_synth_frames`
-profile so this shape is compiled and replayed directly.
+context. The fixed realtime Synth graph keeps the 281-frame encoder context,
+then crops flow/decoder at `skip_head=250` and returns the 31-frame playable
+tail (`4000 + 800 + 160 = 4960` internal samples),
+performs normalized correlation over the 160-sample SOLA search, blends the
+800-sample overlap, and publishes exactly the callback block (4000 samples at
+16 kHz, or 12000 at 48 kHz).  This keeps the encoder/flow context identical to
+Applio/WebUI; a tail-only Synth input changes that context and can produce
+mechanical artifacts.  The Synth artifact's `min/opt/max_synth_frames`
+profile now describes the complete RVC frame range used by the graph.
 
-Pipeline manifests produced before this field was added describe only the full
-RVC frame range. Recompile those artifacts before enabling realtime Synth
-cropping; the runtime deliberately rejects a cropped shape outside the older
-plan's profile instead of silently executing a mismatched binding.
+The `12,400` samples in the benchmark table are the device output copied from
+the Synth tail (`31 * 400` at the model's 40 kHz rate). The engine adapter then
+resamples that extended tail, runs SOLA/crossfade, and emits the 250 ms
+callback block; it does not publish the whole Synth tail as a callback.
+
+The 11200 voice-changer preset uses `skip_head=8`, `return_length=62`, and a
+fixed 70-frame Synth context. On the same RTX 3060, one eager fixed-profile
+call measured 55.9 ms (HuBERT 16.4 ms, RMVPE 11.1 ms, Synth 27.9 ms); after
+native subgraph capture the steady last call measured 32.4 ms. The first
+capture is included in the reported mean when a run uses multiple iterations.
+
+Pipeline manifests produced before the full-context realtime change may still
+contain the legacy tail-oriented min/opt values. They remain loadable when
+their maximum covers the complete RVC frame count, but should be recompiled so
+TensorRT's optimum tactic is selected for the actual realtime context shape.

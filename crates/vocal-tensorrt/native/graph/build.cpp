@@ -141,7 +141,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         auto length=input("p_len",DataType::kINT32,dims({1})),sid=input("sid",DataType::kINT32,dims({1}));
         auto rnd=input("rnd",DataType::kFLOAT,dims({1,c->latent,-1}));
         T pitch=nullptr,pitchf=nullptr,noise=nullptr,mask=nullptr;
-        if(c->uses_f0){int up=1;for(int i=0;i<c->upsample_count;i++)up*=c->rates[i];pitch=input("pitch",DataType::kINT32,dims({1,-1}));pitchf=input("pitchf",DataType::kFLOAT,dims({1,-1}));noise=input("nsf_noise",DataType::kFLOAT,dims({1,1,-1}),up);}
+        int up=1;for(int i=0;i<c->upsample_count;i++)up*=c->rates[i];
+        if(c->uses_f0){pitch=input("pitch",DataType::kINT32,dims({1,-1}));pitchf=input("pitchf",DataType::kFLOAT,dims({1,-1}));noise=input("nsf_noise",DataType::kFLOAT,dims({1,1,-1}),up);}
         // Keep encoder/flow in FP32: their normalization, affine coupling,
         // and exponential/log path are accuracy-sensitive. The selected
         // low-precision type is enabled only for the NSF/HiFi-GAN decoder
@@ -150,7 +151,38 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         auto rnd_internal=g.cast_real(rnd);
         auto z=g.encoder(feats_internal,pitch,length,rnd_internal,mask);
         auto speaker=g.reshape(g.gather(g.parameter("emb_g.weight",dims({c->speakers,c->speaker_channels})),sid,0),dims({1,c->speaker_channels,1}));
-        z=g.flow(z,mask,speaker);
+        // RVC's realtime implementations do not throw away context before
+        // the encoder.  They retain a small flow warmup (24 frames in the
+        // WebUI implementation), then decode only the requested tail.  This
+        // preserves the encoder statistics while avoiding the quadratic flow
+        // cost of the discarded 2.5 s prefix.
+        // TensorRT-RTX 1.6 has unstable runtime behavior for data-dependent
+        // ISlice shape inputs in a large Synth graph. Exact 11200/44960
+        // realtime profiles therefore use compile-time tail geometry selected
+        // by dispatch_tune; broad profiles retain the complete graph and the
+        // Rust adapter performs the compatibility crop after enqueue.
+        bool static_tail=options->dispatch_tune==1 || options->dispatch_tune==2;
+        int skip_head=0,return_frames=options->max_frames;
+        if(static_tail) {
+            require(options->min_frames==options->opt_frames && options->opt_frames==options->max_frames,
+                    "static Synth realtime crop requires a fixed frame profile");
+            skip_head=options->dispatch_tune==1?8:250;
+            return_frames=options->max_frames-skip_head;
+            require(return_frames>0,"static Synth realtime crop exceeds frame profile");
+            int flow_head=std::max(skip_head-24,0);
+            int flow_count=options->max_frames-flow_head;
+            auto z_flow=g.slice(z,2,flow_head,flow_count);
+            auto mask_flow=g.slice(mask,2,flow_head,flow_count);
+            z=g.flow(z_flow,mask_flow,speaker);
+            int decoder_head=skip_head-flow_head;
+            z=g.slice(z,2,decoder_head,return_frames);
+            if(c->uses_f0) {
+                pitchf=g.slice(pitchf,1,skip_head,return_frames);
+                noise=g.slice(noise,2,skip_head*up,return_frames*up);
+            }
+        } else {
+            z=g.flow(z,mask,speaker);
+        }
         if(options->precision!=0)
             g.use_low_precision();
         if(options->precision!=0 || options->synth_precision!=0) {

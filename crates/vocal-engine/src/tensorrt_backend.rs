@@ -102,6 +102,11 @@ pub struct TensorRtEngine {
     realtime_config: RvcRealtimeConfig,
     stream_config: RvcRealtimeConfig,
     realtime_buffers: RealtimeBufferState,
+    /// Reference workers execute the model while the context window is being
+    /// filled, but publish silence for these initial blocks. Keeping this
+    /// counter outside the TensorRT pipeline also clears SOLA state exactly
+    /// at a stream reset and avoids feeding zero-padded output into the joiner.
+    warmup_remaining: usize,
 }
 
 impl TensorRtEngine {
@@ -167,6 +172,7 @@ impl TensorRtEngine {
         let pipeline = load_pipeline(&artifacts, &synth_config, &backend)?;
         let window = StreamingWindow::new(window_samples)?;
         let realtime_config = realtime_config_for_window(window_samples);
+        let warmup_remaining = warmup_blocks_for_window(window_samples, realtime_config);
         Ok(Self {
             pipeline,
             window,
@@ -187,6 +193,7 @@ impl TensorRtEngine {
             realtime_config,
             stream_config: realtime_config,
             realtime_buffers: RealtimeBufferState::default(),
+            warmup_remaining,
         })
     }
 
@@ -194,6 +201,8 @@ impl TensorRtEngine {
         self.window.reset();
         self.output_joiner.reset();
         self.realtime_buffers.reset();
+        self.warmup_remaining =
+            warmup_blocks_for_window(self.window.target_samples(), self.realtime_config);
         self.pipeline
             .reset_streaming_state()
             .map_err(|error| backend_error("reset TensorRT pipeline", error))?;
@@ -261,6 +270,7 @@ impl TensorRtEngine {
             realtime_config.sola_search_samples_16k,
         );
         self.realtime_buffers.reset();
+        self.warmup_remaining = warmup_blocks_for_window(window_samples, realtime_config);
         self.speaker_id = backend.speaker_id;
         Ok(())
     }
@@ -335,25 +345,43 @@ impl TensorRtEngine {
             .process_realtime(&window, self.speaker_id, advance_frames)
             .map_err(|error| backend_error("TensorRT inference", error))?;
         self.last_timings = Some(output.timings);
-        let model_audio = if output.synth_frames >= output.rvc_frames {
+        let block_frames =
+            crate::pipeline::resampled_len(internal.len(), 16_000, format.sample_rate);
+        // New Synth plans crop after the encoder and already return the
+        // publishable tail. Legacy plans return the complete decode and still
+        // need the host-side skip_head crop. Length is the ABI-compatible
+        // discriminator because both plans report the full RVC frame count in
+        // `synth_frames`.
+        let full_audio_samples = output.rvc_frames.saturating_mul(
+            self.pipeline
+                .config
+                .upsample_rates
+                .iter()
+                .try_fold(1usize, |value, rate| value.checked_mul(*rate as usize))
+                .ok_or_else(|| {
+                    EngineError::BackendUnavailable(
+                        "TensorRT Synth upsample product overflow".into(),
+                    )
+                })?,
+        );
+        let model_audio = if output.audio.len() >= full_audio_samples {
             crop_realtime_audio(
                 &output.audio,
                 output.rvc_frames,
                 self.realtime_config,
-                self.pipeline
-                    .config
-                    .upsample_rates
-                    .iter()
-                    .try_fold(1usize, |value, rate| value.checked_mul(*rate as usize))
-                    .ok_or_else(|| {
-                        EngineError::BackendUnavailable(
-                            "TensorRT Synth upsample product overflow".into(),
-                        )
-                    })?,
+                full_audio_samples / output.rvc_frames.max(1),
             )
         } else {
             output.audio
         };
+        // Applio keeps the CUDA pipeline hot while the circular context is
+        // filling, then returns zero blocks for `ceil(window/chunk)+1`
+        // iterations. Do not pass these blocks through SOLA: its overlap
+        // buffer must remain zero until the first publishable block.
+        if self.warmup_remaining > 0 {
+            self.warmup_remaining -= 1;
+            return Ok(vec![0.0; block_frames]);
+        }
         let converted = crate::pipeline::resample_linear(
             &model_audio,
             self.model_sample_rate,
@@ -374,8 +402,6 @@ impl TensorRtEngine {
                 self.stream_config.sola_search_samples_16k,
             );
         }
-        let block_frames =
-            crate::pipeline::resampled_len(internal.len(), 16_000, format.sample_rate);
         let needed = self.output_joiner.required_samples(block_frames);
         let extended = head_with_length(&converted, needed);
         let mut output = self.output_joiner.process(&extended, block_frames);
@@ -505,6 +531,11 @@ fn realtime_config_for_window(window_samples: usize) -> RvcRealtimeConfig {
     }
 }
 
+fn warmup_blocks_for_window(window_samples: usize, realtime: RvcRealtimeConfig) -> usize {
+    let chunk = realtime.chunk_samples_16k.max(1);
+    window_samples.div_ceil(chunk).saturating_add(1)
+}
+
 fn crop_realtime_audio(
     audio: &[f32],
     rvc_frames: usize,
@@ -592,4 +623,34 @@ fn config_error(error: impl std::fmt::Display) -> EngineError {
 
 fn backend_error(stage: &str, error: impl std::fmt::Display) -> EngineError {
     EngineError::BackendUnavailable(format!("{stage}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{crop_realtime_audio, realtime_config_for_window, warmup_blocks_for_window};
+
+    #[test]
+    fn realtime_warmup_matches_reference_window_chunks() {
+        assert_eq!(
+            warmup_blocks_for_window(11_200, realtime_config_for_window(11_200)),
+            3
+        );
+        assert_eq!(
+            warmup_blocks_for_window(44_960, realtime_config_for_window(44_960)),
+            13
+        );
+    }
+
+    #[test]
+    fn host_crop_keeps_the_reference_tail_length() {
+        let audio: Vec<_> = (0..70 * 400).map(|sample| sample as f32).collect();
+        let cropped = crop_realtime_audio(&audio, 70, realtime_config_for_window(11_200), 400);
+        assert_eq!(cropped.len(), 62 * 400);
+        assert_eq!(cropped[0], 8.0 * 400.0);
+
+        let audio: Vec<_> = (0..281 * 400).map(|sample| sample as f32).collect();
+        let cropped = crop_realtime_audio(&audio, 281, realtime_config_for_window(44_960), 400);
+        assert_eq!(cropped.len(), 31 * 400);
+        assert_eq!(cropped[0], 250.0 * 400.0);
+    }
 }

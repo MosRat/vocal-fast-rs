@@ -470,19 +470,26 @@ impl RvcTrtPipelineArtifacts {
         profile.validate()?;
         fs::create_dir_all(output_dir.as_ref())?;
         let external_stft = builder_options.rmvpe_fft_cufft;
+        let is_vfrm = |path: &Path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("vfr") || extension.eq_ignore_ascii_case("vfrm")
+                })
+        };
         let compile = |name: &str,
                        options: NativeBuildOptions|
          -> Result<PathBuf, NativeBuildError> {
             let builder = NativeTensorRtBuilder::new(options);
             let result = match name {
-                "hubert" if hubert_onnx.as_ref().extension().is_some_and(|x| x == "vfr") => {
+                "hubert" if is_vfrm(hubert_onnx.as_ref()) => {
                     let package = vocal_model::load_cache_shared(hubert_onnx.as_ref())
                         .map_err(|e| NativeBuildError::Api(e.to_string()))?;
                     builder.compile_hubert_vfrm(&package)
                 }
                 "hubert" => builder
                     .compile_onnx_file_with_profile(hubert_onnx.as_ref(), OnnxProfileKind::Samples),
-                "rmvpe" if rmvpe_onnx.as_ref().extension().is_some_and(|x| x == "vfr") => {
+                "rmvpe" if is_vfrm(rmvpe_onnx.as_ref()) => {
                     let package = vocal_model::load_cache_shared(rmvpe_onnx.as_ref())
                         .map_err(|e| NativeBuildError::Api(e.to_string()))?;
                     builder.compile_rmvpe_vfrm(&package)

@@ -93,7 +93,9 @@ pub fn prepare(
     let package = if model_path
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("vfr"))
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("vfr") || extension.eq_ignore_ascii_case("vfrm")
+        })
     {
         load_cache_shared(&model_path).map_err(GuiError::from)?
     } else {

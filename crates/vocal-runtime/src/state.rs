@@ -7,7 +7,10 @@ use std::{
 };
 
 use serde::Serialize;
-use vocal_engine::{EngineConfig, EngineStatus, InferenceEngine, create_engine};
+use vocal_engine::{
+    EngineConfig, EngineReloadConfig, EngineStatus, InferenceEngine, TensorRtReloadConfig,
+    create_engine,
+};
 use vocal_model::{
     ModelArtifactKind, ModelLoadConfig, ModelLoader, ModelPackage, RvcModelManifest,
     inspect_model_manifest_with_config, model_artifact_kind, resolve_model_path,
@@ -15,7 +18,7 @@ use vocal_model::{
 use vocal_types::{AudioChunk, LatencyMetrics, LifecycleState, ModelDescriptor};
 
 use crate::{
-    RuntimeBackend, RuntimeConfig,
+    ConfigUpdateKind, RuntimeBackend, RuntimeConfig, classify_config_change,
     error::{RuntimeError, RuntimeResult},
 };
 
@@ -137,6 +140,7 @@ pub struct RuntimeSnapshot {
     pub lifecycle: LifecycleState,
     pub config: RuntimeConfig,
     pub config_revision: u64,
+    pub last_config_update: ConfigUpdateKind,
     pub model: Option<ModelSummary>,
     pub metrics: RuntimeMetrics,
     pub engine: Option<RuntimeEngineStatus>,
@@ -154,6 +158,7 @@ struct RuntimeInner {
     lifecycle: LifecycleState,
     config: RuntimeConfig,
     config_revision: u64,
+    last_config_update: ConfigUpdateKind,
     model: Option<ModelSummary>,
     descriptor: Option<ModelDescriptor>,
     /// Keep the parsed package alive while its engine is selected. The model
@@ -193,6 +198,7 @@ impl RuntimeContext {
             lifecycle: LifecycleState::Created,
             config,
             config_revision: 0,
+            last_config_update: ConfigUpdateKind::Unchanged,
             model: None,
             descriptor: None,
             model_package: None,
@@ -367,22 +373,61 @@ impl RuntimeInner {
                 action: "update_config".into(),
             });
         }
-        let replacement = self
-            .descriptor
-            .as_ref()
-            .map(|descriptor| {
-                create_runtime_engine(&config, descriptor, self.model_package.as_deref())
-            })
-            .transpose()?;
+        let change = classify_config_change(&self.config, &config, self.descriptor.is_some());
+        let replacement = if change == ConfigUpdateKind::RebuildEngine {
+            self.descriptor
+                .as_ref()
+                .map(|descriptor| {
+                    create_runtime_engine(&config, descriptor, self.model_package.as_deref())
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let previous = self.config.clone();
         if let Some(store) = &self.config_store {
             store.save(&config)?;
         }
+        if change == ConfigUpdateKind::ReloadTensorRtPipeline && self.engine.is_some() {
+            if let Err(error) = self.reload_idle_engine(&config) {
+                if let Some(store) = &self.config_store {
+                    let _ = store.save(&previous);
+                }
+                return Err(error);
+            }
+        }
         self.config = config;
         self.config_revision = self.config_revision.saturating_add(1);
+        self.last_config_update = change;
         if replacement.is_some() {
             self.engine = replacement;
         }
         Ok(self.snapshot())
+    }
+
+    fn reload_idle_engine(&mut self, config: &RuntimeConfig) -> RuntimeResult<()> {
+        let engine = self.engine.as_mut().ok_or_else(|| RuntimeError::State {
+            state: "engine_not_loaded".into(),
+            action: "reload_idle_engine".into(),
+        })?;
+        let artifacts_path = config.tensorrt_artifacts().ok_or_else(|| {
+            RuntimeError::Config("TensorRT artifacts path is not configured".into())
+        })?;
+        engine.reload_config(EngineReloadConfig {
+            backend: config.backend.engine_kind(),
+            tensorrt: Some(TensorRtReloadConfig {
+                artifacts_path: PathBuf::from(artifacts_path),
+                speaker_id: config.speaker_id,
+                window_samples: config.tensorrt_window(),
+                graph_mode: config.tensorrt.graph_mode.clone(),
+                cuda_graph: config.tensorrt.cuda_graph,
+                native_cuda_graph: config.tensorrt.native_cuda_graph,
+                graph_cache_size: config.tensorrt.graph_cache_size,
+                parallel_acoustic: config.tensorrt.parallel_acoustic,
+                async_audio_d2h: config.tensorrt.async_audio_d2h,
+            }),
+        })?;
+        Ok(())
     }
 
     fn load_model(&mut self, path: String) -> RuntimeResult<RuntimeSnapshot> {
@@ -1040,6 +1085,7 @@ impl RuntimeInner {
             lifecycle: self.lifecycle,
             config: self.config.clone(),
             config_revision: self.config_revision,
+            last_config_update: self.last_config_update,
             model: self.model.clone(),
             metrics: self.metrics.into(),
             engine: self

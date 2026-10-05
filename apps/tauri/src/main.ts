@@ -6,7 +6,7 @@ import { emit, listen } from '@tauri-apps/api/event';
 import './style.css';
 import './effects.css';
 import { icon, type IconName } from './icons';
-import { formatBytes, formatNumber, lifecycleLabel, statusTone, themeLabel } from './format';
+import { configUpdateLabel, formatBytes, formatNumber, lifecycleLabel, statusTone, themeLabel } from './format';
 import {
   defaultConfig,
   type AudioDeviceCatalog,
@@ -357,6 +357,7 @@ function renderSettingsPanel(config: GuiConfig): string {
   const inputDeviceCount = devices?.devices.filter((device) => device.input).length ?? 0;
   const outputDeviceCount = devices?.devices.filter((device) => device.output).length ?? 0;
   const revisionLabel = draftRevision === null ? `Revision ${snapshot?.configRevision ?? 0}` : `Editing revision ${draftRevision}`;
+  const applyLabel = snapshot ? configUpdateLabel(snapshot.lastConfigUpdate) : 'No engine change';
   const rates = [...new Set([16_000, 24_000, 44_100, 48_000, 96_000, config.inputFormat.sampleRate])].sort((a, b) => a - b);
   const rateOptions = rates
     .map((rate) => `<option value="${rate}" ${config.inputFormat.sampleRate === rate ? 'selected' : ''}>${rate.toLocaleString()} Hz</option>`)
@@ -373,7 +374,7 @@ function renderSettingsPanel(config: GuiConfig): string {
     : '';
   return `<section class="settings-panel panel ${activeSection === 'settings' ? 'is-active' : ''}" aria-labelledby="settings-title">
     <div class="settings-heading"><div class="kicker">APPLICATION SETTINGS</div><h2 id="settings-title">Control the session from one place.</h2><p>Audio, model library, and realtime budget share the same revisioned configuration as Studio.</p></div>
-    <div class="settings-toolbar"><div class="settings-save-state ${dirty ? 'dirty' : ''}"><span class="settings-save-dot"></span><div><strong>${dirty ? 'Unsaved changes' : 'All changes saved'}</strong><span>${draftConflict ? 'Resolve the revision conflict to continue.' : revisionLabel}</span></div></div><div class="settings-toolbar-actions">${button('settingsReset', 'Discard', 'refresh', 'ghost', !dirty)}${button('settingsSave', 'Save changes', 'check', 'primary', locked || !dirty || draftConflict)}</div></div>
+    <div class="settings-toolbar"><div class="settings-save-state ${dirty ? 'dirty' : ''}"><span class="settings-save-dot"></span><div><strong>${dirty ? 'Unsaved changes' : 'All changes saved'}</strong><span>${draftConflict ? 'Resolve the revision conflict to continue.' : `${revisionLabel} · ${applyLabel}`}</span></div></div><div class="settings-toolbar-actions">${button('settingsReset', 'Discard', 'refresh', 'ghost', !dirty)}${button('settingsSave', 'Save changes', 'check', 'primary', locked || !dirty || draftConflict)}</div></div>
     ${conflict}
     <div class="settings-grid">
       <article class="settings-card settings-card-wide settings-appearance"><div class="settings-card-heading"><div class="settings-card-icon">${icon(themePreference === 'dark' ? 'moon' : themePreference === 'light' ? 'sun' : 'desktop', 18)}</div><div><h3>Appearance</h3><p>Choose the surface contrast for every vocal-fast window.</p></div></div><div class="settings-choice-list" role="group" aria-label="Theme preference">${themeOptions}</div></article>

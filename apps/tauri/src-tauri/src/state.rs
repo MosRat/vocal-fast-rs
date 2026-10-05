@@ -3,7 +3,7 @@ use std::{
     time::Instant,
 };
 
-use vocal_runtime::{RuntimeContext, RuntimeBackend};
+use vocal_runtime::{RuntimeBackend, RuntimeContext};
 use vocal_types::{AudioChunk, AudioFormat, LifecycleState};
 
 use crate::{
@@ -244,7 +244,11 @@ impl AppState {
                 });
             }
             let snapshot = state.runtime.snapshot()?;
-            (state.runtime.clone(), snapshot.config, snapshot.config_revision)
+            (
+                state.runtime.clone(),
+                snapshot.config,
+                snapshot.config_revision,
+            )
         };
         if revision != request.expected_revision {
             return Err(GuiError::ConfigConflict {
@@ -601,6 +605,7 @@ impl RuntimeState {
             },
             config: runtime.config,
             config_revision: runtime.config_revision,
+            last_config_update: runtime.last_config_update,
             model: runtime.model,
             metrics,
             engine,

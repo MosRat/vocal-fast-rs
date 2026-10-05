@@ -18,7 +18,10 @@ pub mod offline;
 pub mod pipeline;
 pub mod tensorrt;
 
-pub use config::{BackendKind, EngineConfig, TensorRtEngineSpec, validate_conversion};
+pub use config::{
+    BackendKind, EngineConfig, EngineReloadConfig, TensorRtEngineSpec, TensorRtReloadConfig,
+    validate_conversion,
+};
 pub use error::EngineError;
 pub use state::{EngineLifecycle, EngineStatus};
 
@@ -26,6 +29,13 @@ pub use state::{EngineLifecycle, EngineStatus};
 pub use tensorrt_backend::{TensorRtBackendConfig, TensorRtEngine, create_tensorrt_engine};
 
 pub trait InferenceEngine: Send {
+    /// Apply execution-only changes while the engine is idle. Model/backend
+    /// changes are owned by the runtime and must replace the engine instead.
+    /// Backends that do not keep execution state can accept this as a no-op.
+    fn reload_config(&mut self, _config: EngineReloadConfig) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     fn process(
         &mut self,
         input: &AudioChunk,

@@ -12,8 +12,8 @@ mod error;
 mod state;
 
 pub use config::{
-    ConfigStore, RUNTIME_CONFIG_SCHEMA_VERSION, RuntimeBackend, RuntimeConfig,
-    TensorRtPipelineConfig,
+    ConfigStore, ConfigUpdateKind, RUNTIME_CONFIG_SCHEMA_VERSION, RuntimeBackend, RuntimeConfig,
+    TensorRtPipelineConfig, classify_config_change,
 };
 pub use error::{RuntimeError, RuntimeResult};
 pub use state::{

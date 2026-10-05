@@ -37,6 +37,28 @@ pub struct TensorRtEngineSpec {
     pub window_samples: Option<usize>,
 }
 
+/// Execution-only settings that can be applied to an already selected
+/// TensorRT engine while it is idle. Build-time precision/source/profile
+/// choices stay in the artifact manifest and are intentionally absent here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorRtReloadConfig {
+    pub artifacts_path: PathBuf,
+    pub speaker_id: i32,
+    pub window_samples: Option<usize>,
+    pub graph_mode: String,
+    pub cuda_graph: bool,
+    pub native_cuda_graph: bool,
+    pub graph_cache_size: usize,
+    pub parallel_acoustic: bool,
+    pub async_audio_d2h: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineReloadConfig {
+    pub backend: BackendKind,
+    pub tensorrt: Option<TensorRtReloadConfig>,
+}
+
 impl EngineConfig {
     pub fn portable(backend: BackendKind, model: ModelDescriptor) -> Self {
         Self {

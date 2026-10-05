@@ -1,4 +1,4 @@
-import type { Lifecycle, ThemePreference } from './types';
+import type { ConfigUpdateKind, Lifecycle, ThemePreference } from './types';
 
 export function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
@@ -33,4 +33,15 @@ export function statusTone(value: Lifecycle): string {
 
 export function themeLabel(preference: ThemePreference): string {
   return preference === 'system' ? 'System theme' : preference === 'dark' ? 'Dark theme' : 'Light theme';
+}
+
+export function configUpdateLabel(value: ConfigUpdateKind): string {
+  switch (value) {
+    case 'hotReload': return 'Idle settings applied';
+    case 'rebuildEngine': return 'Engine rebuilt';
+    case 'reloadTensorRtPipeline': return 'TensorRT pipeline reloaded';
+    case 'planBuildRequired': return 'TensorRT build required';
+    case 'loadModelRequired': return 'Load model to apply';
+    default: return 'No engine change';
+  }
 }

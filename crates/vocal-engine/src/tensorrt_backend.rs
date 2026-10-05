@@ -8,15 +8,15 @@
 use std::time::Instant;
 use std::{fs, path::Path};
 
-use vocal_model::{ModelPackage, load_cache_shared};
+use vocal_model::{ModelPackage, RvcSynthConfig, load_cache_shared};
 use vocal_types::{AudioChunk, AudioFormat, ConversionConfig, LatencyMetrics, ModelDescriptor};
 
 use crate::{
-    EngineError, InferenceEngine,
+    EngineError, EngineReloadConfig, InferenceEngine,
     audio_adapter::{
         StreamingWindow, apply_rms_mix, from_model_rate, interleave, to_internal_rate, to_mono,
     },
-    config::TensorRtEngineSpec,
+    config::{TensorRtEngineSpec, TensorRtReloadConfig},
     logging,
     state::{EngineLifecycle, EngineStatus},
 };
@@ -91,6 +91,7 @@ impl TensorRtBackendConfig {
 pub struct TensorRtEngine {
     pipeline: RvcTrtPipeline,
     window: StreamingWindow,
+    synth_config: RvcSynthConfig,
     model_sample_rate: u32,
     speaker_id: i32,
     metrics: LatencyMetrics,
@@ -158,17 +159,12 @@ impl TensorRtEngine {
             .window_samples
             .unwrap_or_else(|| artifacts.profile.opt_samples.max(1) as usize);
         validate_window(&artifacts, window_samples)?;
-        let pipeline = RvcTrtPipeline::load_with_runtime_config(
-            &artifacts,
-            synth_config,
-            backend.runtime,
-            backend.diagnostics,
-        )
-        .map_err(|error| backend_error("load TensorRT pipeline", error))?;
+        let pipeline = load_pipeline(&artifacts, &synth_config, &backend)?;
         let window = StreamingWindow::new(window_samples)?;
         Ok(Self {
             pipeline,
             window,
+            synth_config,
             model_sample_rate: model.sample_rate,
             speaker_id: backend.speaker_id,
             metrics: LatencyMetrics::default(),
@@ -199,6 +195,49 @@ impl TensorRtEngine {
 
     pub fn window_samples(&self) -> usize {
         self.window.target_samples()
+    }
+
+    /// Rebuild the internal TensorRT pipeline while keeping the owning engine
+    /// object stable. The caller must ensure the worker is idle; construction
+    /// happens entirely in locals so a failed reload leaves the old pipeline
+    /// usable.
+    fn reload_pipeline(&mut self, config: TensorRtReloadConfig) -> Result<(), EngineError> {
+        let env = TensorRtConfig::from_env().map_err(config_error)?;
+        let graph_mode =
+            vocal_tensorrt::GraphReplayMode::parse(&config.graph_mode).ok_or_else(|| {
+                EngineError::InvalidConfig(format!(
+                    "invalid TensorRT graph mode: {}",
+                    config.graph_mode
+                ))
+            })?;
+        let mut runtime = env.runtime;
+        runtime.graph_mode = graph_mode;
+        runtime.cuda_graph = config.cuda_graph;
+        runtime.native_cuda_graph = config.native_cuda_graph;
+        runtime.graph_cache_size = config.graph_cache_size;
+        runtime.parallel_acoustic = config.parallel_acoustic;
+        runtime.async_audio_d2h = config.async_audio_d2h;
+        let backend = TensorRtBackendConfig::with_runtime(
+            TensorRtEngineSpec {
+                artifacts_path: config.artifacts_path,
+                model_package_path: std::path::PathBuf::new(),
+                speaker_id: config.speaker_id,
+                window_samples: config.window_samples,
+            },
+            runtime,
+            env.diagnostics,
+        );
+        let artifacts = read_artifacts(&backend.artifacts_path)?;
+        let window_samples = backend
+            .window_samples
+            .unwrap_or_else(|| artifacts.profile.opt_samples.max(1) as usize);
+        validate_window(&artifacts, window_samples)?;
+        let pipeline = load_pipeline(&artifacts, &self.synth_config, &backend)?;
+        let window = StreamingWindow::new(window_samples)?;
+        self.pipeline = pipeline;
+        self.window = window;
+        self.speaker_id = backend.speaker_id;
+        Ok(())
     }
 
     fn process_block(
@@ -249,6 +288,18 @@ impl TensorRtEngine {
 }
 
 impl InferenceEngine for TensorRtEngine {
+    fn reload_config(&mut self, config: EngineReloadConfig) -> Result<(), EngineError> {
+        if config.backend != crate::BackendKind::TensorRtRtx {
+            return Err(EngineError::InvalidConfig(
+                "TensorRT engine cannot switch backend in place".into(),
+            ));
+        }
+        let spec = config.tensorrt.ok_or_else(|| {
+            EngineError::InvalidConfig("TensorRT reload requires execution settings".into())
+        })?;
+        self.reload_pipeline(spec)
+    }
+
     fn process(
         &mut self,
         input: &AudioChunk,
@@ -314,6 +365,20 @@ fn read_artifacts(path: &Path) -> Result<RvcTrtPipelineArtifacts, EngineError> {
             path.display()
         ))
     })
+}
+
+fn load_pipeline(
+    artifacts: &RvcTrtPipelineArtifacts,
+    synth_config: &RvcSynthConfig,
+    backend: &TensorRtBackendConfig,
+) -> Result<RvcTrtPipeline, EngineError> {
+    RvcTrtPipeline::load_with_runtime_config(
+        artifacts,
+        synth_config.clone(),
+        backend.runtime.clone(),
+        backend.diagnostics.clone(),
+    )
+    .map_err(|error| backend_error("load TensorRT pipeline", error))
 }
 
 fn validate_window(

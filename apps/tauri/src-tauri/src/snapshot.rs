@@ -22,6 +22,7 @@ pub struct UiSnapshot {
     pub status: UiStatus,
     pub config: GuiConfig,
     pub config_revision: u64,
+    pub last_config_update: vocal_runtime::ConfigUpdateKind,
     pub model: Option<ModelSummary>,
     pub metrics: UiMetrics,
     pub engine: Option<UiEngineStatus>,

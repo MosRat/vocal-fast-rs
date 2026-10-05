@@ -1,6 +1,13 @@
 export type Lifecycle = 'created' | 'loading' | 'ready' | 'running' | 'stopping' | 'stopped' | 'failed';
 export type BootPhase = 'starting' | 'restoringConfig' | 'restoringModel' | 'ready' | 'failed' | 'shuttingDown';
 export type Backend = 'passthrough' | 'rvcCpu' | 'tensorRtRtx';
+export type ConfigUpdateKind =
+  | 'unchanged'
+  | 'hotReload'
+  | 'rebuildEngine'
+  | 'reloadTensorRtPipeline'
+  | 'planBuildRequired'
+  | 'loadModelRequired';
 export type ThemePreference = 'system' | 'light' | 'dark';
 export type WorkspaceRoute = 'studio' | 'audio' | 'tuning' | 'diagnostics';
 
@@ -137,6 +144,7 @@ export interface Snapshot {
   };
   config: GuiConfig;
   configRevision: number;
+  lastConfigUpdate: ConfigUpdateKind;
   model: {
     id: string;
     displayName: string;

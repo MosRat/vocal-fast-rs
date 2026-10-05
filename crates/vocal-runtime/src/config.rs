@@ -75,6 +75,25 @@ pub enum RuntimeBackend {
     TensorRtRtx,
 }
 
+/// Result of applying a configuration edit to an idle runtime.
+///
+/// `HotReload` changes values consumed on the next block without touching the
+/// selected engine. `ReloadTensorRtPipeline` recreates TensorRT's internal
+/// contexts/plans from an already published artifact manifest while keeping
+/// the owning engine object stable. `PlanBuildRequired` means the JSON config
+/// was accepted but the active TensorRT plans still need an explicit build.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigUpdateKind {
+    #[default]
+    Unchanged,
+    HotReload,
+    RebuildEngine,
+    ReloadTensorRtPipeline,
+    PlanBuildRequired,
+    LoadModelRequired,
+}
+
 impl RuntimeBackend {
     pub const fn engine_kind(self) -> BackendKind {
         match self {
@@ -214,6 +233,67 @@ impl RuntimeConfig {
     }
 }
 
+/// Classify a validated configuration edit before mutating runtime state.
+/// This is deliberately independent of the current engine implementation so
+/// controllers can explain whether Save is a cheap idle update, an engine
+/// replacement, or requires a fresh TensorRT artifact build.
+pub fn classify_config_change(
+    old: &RuntimeConfig,
+    next: &RuntimeConfig,
+    _model_loaded: bool,
+) -> ConfigUpdateKind {
+    if old.backend != next.backend {
+        return ConfigUpdateKind::RebuildEngine;
+    }
+    if old.model_path != next.model_path {
+        return ConfigUpdateKind::LoadModelRequired;
+    }
+    if old.backend == RuntimeBackend::TensorRtRtx {
+        let artifacts_changed = old.tensorrt_artifacts() != next.tensorrt_artifacts();
+        let runtime_changed = old.speaker_id != next.speaker_id
+            || old.tensorrt_window() != next.tensorrt_window()
+            || old.tensorrt.graph_mode != next.tensorrt.graph_mode
+            || old.tensorrt.cuda_graph != next.tensorrt.cuda_graph
+            || old.tensorrt.native_cuda_graph != next.tensorrt.native_cuda_graph
+            || old.tensorrt.graph_cache_size != next.tensorrt.graph_cache_size
+            || old.tensorrt.parallel_acoustic != next.tensorrt.parallel_acoustic
+            || old.tensorrt.async_audio_d2h != next.tensorrt.async_audio_d2h;
+        if artifacts_changed || runtime_changed {
+            return ConfigUpdateKind::ReloadTensorRtPipeline;
+        }
+        if trt_plan_config_changed(old, next) {
+            return ConfigUpdateKind::PlanBuildRequired;
+        }
+    }
+    if old.input_format != next.input_format
+        || old.output_format != next.output_format
+        || old.conversion.pitch_semitones != next.conversion.pitch_semitones
+        || old.conversion.index_ratio != next.conversion.index_ratio
+        || old.conversion.protect != next.conversion.protect
+        || old.conversion.rms_mix_rate != next.conversion.rms_mix_rate
+        || old.input_device != next.input_device
+        || old.output_device != next.output_device
+        || old.block_frames != next.block_frames
+        || old.queue_blocks != next.queue_blocks
+        || old.model_directory != next.model_directory
+    {
+        return ConfigUpdateKind::HotReload;
+    }
+    ConfigUpdateKind::Unchanged
+}
+
+fn trt_plan_config_changed(old: &RuntimeConfig, next: &RuntimeConfig) -> bool {
+    old.tensorrt.hubert_source != next.tensorrt.hubert_source
+        || old.tensorrt.rmvpe_source != next.tensorrt.rmvpe_source
+        || old.tensorrt.profile != next.tensorrt.profile
+        || old.tensorrt.precision != next.tensorrt.precision
+        || old.tensorrt.hubert_precision != next.tensorrt.hubert_precision
+        || old.tensorrt.rmvpe_precision != next.tensorrt.rmvpe_precision
+        || old.tensorrt.synth_precision != next.tensorrt.synth_precision
+        || old.tensorrt.rmvpe_fft != next.tensorrt.rmvpe_fft
+        || old.tensorrt.synth_full_fp16 != next.tensorrt.synth_full_fp16
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigStore {
     path: PathBuf,
@@ -315,6 +395,53 @@ fn sync_parent(parent: Option<&Path>) -> RuntimeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_idle_updates_without_rebuilding_engine() {
+        let old = RuntimeConfig::default();
+        let mut next = old.clone();
+        next.conversion.pitch_semitones = 2.0;
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::HotReload
+        );
+    }
+
+    #[test]
+    fn classifies_model_and_backend_changes_separately() {
+        let old = RuntimeConfig::default();
+        let mut model = old.clone();
+        model.model_path = Some("voice.vfrm".into());
+        assert_eq!(
+            classify_config_change(&old, &model, false),
+            ConfigUpdateKind::LoadModelRequired
+        );
+        let mut backend = old.clone();
+        backend.backend = RuntimeBackend::RvcCpu;
+        assert_eq!(
+            classify_config_change(&old, &backend, true),
+            ConfigUpdateKind::RebuildEngine
+        );
+    }
+
+    #[test]
+    fn classifies_tensorrt_plan_and_runtime_changes() {
+        let mut old = RuntimeConfig::default();
+        old.backend = RuntimeBackend::TensorRtRtx;
+        old.tensorrt.artifacts_path = Some("old/pipeline.json".into());
+        let mut plan = old.clone();
+        plan.tensorrt.profile = "realtime_44960".into();
+        assert_eq!(
+            classify_config_change(&old, &plan, true),
+            ConfigUpdateKind::PlanBuildRequired
+        );
+        let mut runtime = old.clone();
+        runtime.tensorrt.graph_mode = "whole_pipeline".into();
+        assert_eq!(
+            classify_config_change(&old, &runtime, true),
+            ConfigUpdateKind::ReloadTensorRtPipeline
+        );
+    }
 
     #[test]
     fn config_store_round_trips_and_migrates_unversioned_data() {

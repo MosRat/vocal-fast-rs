@@ -2,8 +2,8 @@
 
 The `vocal-tensorrt` build script links the TensorRT-RTX and CUDA import
 libraries and, on Windows, copies the runtime DLLs next to the Cargo profile
-output. This keeps `cargo run`, CLI binaries, tests, and packaged development
-builds independent of the machine-wide `PATH`.
+output. This keeps `cargo run`, CLI binaries, and packaged development builds
+independent of the machine-wide `PATH`.
 
 ## Default build
 

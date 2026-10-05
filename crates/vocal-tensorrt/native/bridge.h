@@ -42,6 +42,7 @@ struct LayerProfiler final : nvinfer1::IProfiler {
 };
 struct Context {
     nvinfer1::IExecutionContext* context{};
+    nvinfer1::ICudaEngine* engine{};
     // Runtime configuration must outlive the execution context.  Keeping it
     // in the ABI handle makes the TensorRT-RTX CUDA graph strategy an
     // explicit, owned part of context lifetime rather than a process-global

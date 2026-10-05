@@ -206,6 +206,12 @@ unsafe extern "C" {
         rank: *mut i32,
         error: *mut *mut c_char,
     ) -> i32;
+    pub(crate) fn vocal_trt_context_has_tensor(
+        context: *mut Context,
+        name: *const c_char,
+        found: *mut i32,
+        error: *mut *mut c_char,
+    ) -> i32;
     #[allow(dead_code)]
     pub(crate) fn vocal_trt_enqueue(
         context: *mut Context,

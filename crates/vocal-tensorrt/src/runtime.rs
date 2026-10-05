@@ -332,6 +332,25 @@ impl OwnedContext {
             .to_vec())
     }
 
+    /// Check whether an input/output tensor exists without asking TensorRT for
+    /// a shape.  This is used for optional parity outputs so probing a
+    /// production plan does not emit an internal TensorRT error.
+    pub fn has_tensor(&mut self, name: &str) -> Result<bool, NativeBuildError> {
+        let name = crate::cstring(name)?;
+        let mut found = 0_i32;
+        let mut error = ptr::null_mut();
+        let code = unsafe {
+            ffi::vocal_trt_context_has_tensor(self.raw, name.as_ptr(), &mut found, &mut error)
+        };
+        if code != 0 {
+            return Err(NativeBuildError::Api(ffi::native_message(
+                error,
+                "check tensor existence failed",
+            )));
+        }
+        Ok(found != 0)
+    }
+
     pub fn enqueue(&mut self, stream: &CudaStream) -> Result<(), NativeBuildError> {
         self.enqueue_named(stream, None)
     }

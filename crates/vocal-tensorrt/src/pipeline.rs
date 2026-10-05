@@ -40,6 +40,15 @@ pub struct RvcTrtProfile {
     pub min_rvc_frames: i32,
     pub opt_rvc_frames: i32,
     pub max_rvc_frames: i32,
+    /// Synth execution profile for realtime rate cropping. The frontend still
+    /// produces `rvc_frames`; the Synth graph consumes the trailing
+    /// `synth_frames` after the reference worker's `skip_head`.
+    #[serde(default)]
+    pub min_synth_frames: i32,
+    #[serde(default)]
+    pub opt_synth_frames: i32,
+    #[serde(default)]
+    pub max_synth_frames: i32,
 }
 
 /// The host-side realtime window used by the reference applications, expressed
@@ -215,6 +224,15 @@ impl RvcTrtProfile {
             min_rvc_frames: a.rvc as i32,
             opt_rvc_frames: o.rvc as i32,
             max_rvc_frames: z.rvc as i32,
+            min_synth_frames: realtime_synth_frames(samples[1], o.rvc)
+                .min(realtime_synth_frames(samples[0], a.rvc))
+                .min(realtime_synth_frames(samples[2], z.rvc)) as i32,
+            // The current WebUI/Applio shape receives the tactic priority in
+            // the broad reference profile.
+            opt_synth_frames: realtime_synth_frames(samples[2], z.rvc) as i32,
+            // Keep the full context as the profile maximum so the explicit
+            // non-realtime `process` entry point remains available.
+            max_synth_frames: z.rvc as i32,
         }
     }
 
@@ -235,6 +253,9 @@ impl RvcTrtProfile {
             min_rvc_frames: 8,
             opt_rvc_frames: 48,
             max_rvc_frames: 128,
+            min_synth_frames: 8,
+            opt_synth_frames: 48,
+            max_synth_frames: 128,
         }
     }
 
@@ -309,6 +330,16 @@ impl RvcTrtProfile {
                 return Err(NativeBuildError::Argument(format!(
                     "invalid {name} profile"
                 )));
+            }
+        }
+        if self.min_synth_frames != 0 || self.opt_synth_frames != 0 || self.max_synth_frames != 0 {
+            if self.min_synth_frames <= 0
+                || self.min_synth_frames > self.opt_synth_frames
+                || self.opt_synth_frames > self.max_synth_frames
+            {
+                return Err(NativeBuildError::Argument(
+                    "invalid Synth frame profile".into(),
+                ));
             }
         }
         for (name, samples) in [
@@ -631,9 +662,21 @@ impl RvcTrtPipelineArtifacts {
         let frontend_plan = compile("frontend", options)?;
         let mut options = builder_options.clone();
         options.output = output_dir.as_ref().join("synth.plan");
-        options.min_frames = profile.min_rvc_frames;
-        options.opt_frames = profile.opt_rvc_frames;
-        options.max_frames = profile.max_rvc_frames;
+        options.min_frames = if profile.min_synth_frames > 0 {
+            profile.min_synth_frames
+        } else {
+            profile.min_rvc_frames
+        };
+        options.opt_frames = if profile.opt_synth_frames > 0 {
+            profile.opt_synth_frames
+        } else {
+            profile.opt_rvc_frames
+        };
+        options.max_frames = if profile.max_synth_frames > 0 {
+            profile.max_synth_frames
+        } else {
+            profile.max_rvc_frames
+        };
         // Keep the acoustic encoder/flow precision independent from the
         // decoder. The native ABI carries `synth_precision` separately, so a
         // Synth FP16 plan must not silently lower the RVC front half.
@@ -725,6 +768,10 @@ pub struct RvcTrtOutput {
     pub hubert_frames: usize,
     pub pitch_frames: usize,
     pub rvc_frames: usize,
+    /// Number of frames consumed by the Synth graph. In realtime mode this
+    /// is the trailing `return_length` after the reference `skip_head`; in a
+    /// full pass it equals `rvc_frames`.
+    pub synth_frames: usize,
     pub timings: RvcTrtTimings,
 }
 
@@ -736,6 +783,7 @@ struct PipelineShapeKey {
     pitch_frames: usize,
     frontend_pitch_frames: usize,
     rvc_frames: usize,
+    synth_frames: usize,
     f0_advance_frames: usize,
     streaming_f0: bool,
 }
@@ -850,6 +898,7 @@ pub struct RvcTrtPipeline {
     rmvpe_debug_logits: CudaBuffer,
     pitch_cache: CudaBuffer,
     pitch_cache_scratch: CudaBuffer,
+    pitch_cache_initialized: bool,
     rnd: CudaBuffer,
     nsf_noise: CudaBuffer,
     audio: CudaBuffer,
@@ -857,6 +906,7 @@ pub struct RvcTrtPipeline {
     // fixtures. Keeping these vectors across calls removes allocator and
     // per-element byte-conversion work from the realtime hot path.
     host_rnd: Vec<f32>,
+    host_rnd_active: Vec<f32>,
     host_noise: Vec<f32>,
     last_sid: Option<i32>,
     last_p_len: Option<i32>,
@@ -867,6 +917,7 @@ pub struct RvcTrtPipeline {
     // machine through FFI on every invocation.
     hubert_frame_shape: Option<(usize, usize)>,
     pitch_frame_shape: Option<(usize, bool, usize)>,
+    rnd_frame_shape: Option<(usize, usize)>,
     shape_key: Option<PipelineShapeKey>,
     native_cuda_graphs: bool,
     graph_mode: GraphReplayMode,
@@ -1064,8 +1115,8 @@ impl RvcTrtPipeline {
         // receive an address for every declared output. New manifests keep
         // the explicit flag, while production plans without these tensors
         // simply return an API error from the probe and remain unchanged.
-        let plan_has_rmvpe_debug_outputs = rmvpe_full.tensor_shape("rmvpe_debug_mel").is_ok()
-            || rmvpe_realtime.tensor_shape("rmvpe_debug_mel").is_ok();
+        let plan_has_rmvpe_debug_outputs = rmvpe_full.has_tensor("rmvpe_debug_mel")?
+            || rmvpe_realtime.has_tensor("rmvpe_debug_mel")?;
         let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs || plan_has_rmvpe_debug_outputs;
         let debug_intermediates = diagnostics.debug_intermediates;
         let rmvpe_max_padded_frames = ((p.max_pitch_frames as usize + 31) / 32) * 32;
@@ -1110,10 +1161,12 @@ impl RvcTrtPipeline {
             rmvpe_debug_logits: alloc(rmvpe_max_padded_frames * 360 * 4)?,
             pitch_cache,
             pitch_cache_scratch,
+            pitch_cache_initialized: false,
             rnd: alloc(latent * p.max_rvc_frames as usize * 4)?,
             nsf_noise: alloc(p.max_rvc_frames as usize * up * 4)?,
             audio: alloc(p.max_rvc_frames as usize * up * 4)?,
             host_rnd: Vec::with_capacity(latent * p.max_rvc_frames as usize),
+            host_rnd_active: Vec::with_capacity(latent * p.max_rvc_frames as usize),
             host_noise: Vec::with_capacity(p.max_rvc_frames as usize * up),
             last_sid: None,
             last_p_len: None,
@@ -1121,6 +1174,7 @@ impl RvcTrtPipeline {
             rmvpe_debug_outputs,
             hubert_frame_shape: None,
             pitch_frame_shape: None,
+            rnd_frame_shape: None,
             shape_key: None,
             native_cuda_graphs,
             graph_mode,
@@ -1227,8 +1281,10 @@ impl RvcTrtPipeline {
     pub fn reset_streaming_state(&mut self) -> Result<(), NativeBuildError> {
         self.pitch_cache.zero()?;
         self.pitch_cache_scratch.zero()?;
+        self.pitch_cache_initialized = false;
         self.last_sid = None;
         self.last_p_len = None;
+        self.rnd_frame_shape = None;
         self.shape_key = None;
         self.native_graph_shape = None;
         self.native_graph_invalidations = self.native_graph_invalidations.saturating_add(1);
@@ -1244,8 +1300,9 @@ impl RvcTrtPipeline {
 
     /// Run one complete waveform window through HuBERT, RMVPE, frontend, and
     /// Synth. `waveform` is the entire inference window in internal 16 kHz
-    /// samples; this method currently has no chunk crop, overlap crossfade,
-    /// or SOLA alignment stage.
+    /// samples. The non-realtime entry point consumes and returns the full
+    /// aligned RVC frame range; realtime cropping is handled by
+    /// [`Self::process_realtime`].
     pub fn process(
         &mut self,
         waveform: &[f32],
@@ -1255,10 +1312,12 @@ impl RvcTrtPipeline {
     }
 
     /// Realtime entry point matching RVC WebUI/Applio's stateful worker. The
-    /// full HuBERT window is retained, while RMVPE consumes the fixed recent
-    /// context and its 3:-1 output is appended to a 1024-frame device cache.
-    /// `advance_frames` is the number of 10 ms RVC hops represented by the new
-    /// callback block.
+    /// full HuBERT window is retained, RMVPE consumes the fixed recent
+    /// context, and its 3:-1 output is appended to a 1024-frame device cache.
+    /// The Synth binding receives only the trailing `return_length` frames
+    /// after `skip_head`; the host adapter performs SOLA and publishes the
+    /// callback block. `advance_frames` is the number of 10 ms RVC hops
+    /// represented by the new callback block.
     pub fn process_realtime(
         &mut self,
         waveform: &[f32],
@@ -1338,7 +1397,7 @@ impl RvcTrtPipeline {
         if trace {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue rmvpe streaming={streaming_f0}");
         }
-        if streaming_f0 {
+        if streaming_f0 && rmvpe_samples == RMVPE_REALTIME_SAMPLES {
             self.rmvpe_realtime
                 .enqueue_named(&self.stream, Some("rvc.rmvpe.realtime"))?;
         } else {
@@ -1459,7 +1518,7 @@ impl RvcTrtPipeline {
         if trace {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue rmvpe parallel streaming={streaming_f0}");
         }
-        if streaming_f0 {
+        if streaming_f0 && rmvpe_samples == RMVPE_REALTIME_SAMPLES {
             self.rmvpe_realtime
                 .enqueue_named(&self.acoustic_rmvpe_stream, Some("rvc.rmvpe.realtime"))?;
         } else {
@@ -1666,14 +1725,22 @@ impl RvcTrtPipeline {
         let upload_ms = start.elapsed().as_secs_f64() * 1000.0;
         let streaming_f0 = realtime_advance_frames.is_some() && self.config.uses_f0;
         let rmvpe_samples = if streaming_f0 {
-            if waveform.len() < RMVPE_REALTIME_SAMPLES {
-                return Err(NativeBuildError::Argument(format!(
-                    "realtime waveform length {} is shorter than RMVPE context {}",
-                    waveform.len(),
-                    RMVPE_REALTIME_SAMPLES
-                )));
+            if !self.pitch_cache_initialized {
+                // Prime the device cache with a full RMVPE window. The
+                // realtime plan emits only the newest 28 interior frames;
+                // starting it from an empty 1024-frame cache would leave the
+                // first several callbacks mostly unvoiced.
+                waveform.len()
+            } else {
+                if waveform.len() < RMVPE_REALTIME_SAMPLES {
+                    return Err(NativeBuildError::Argument(format!(
+                        "realtime waveform length {} is shorter than RMVPE context {}",
+                        waveform.len(),
+                        RMVPE_REALTIME_SAMPLES
+                    )));
+                }
+                RMVPE_REALTIME_SAMPLES
             }
-            RMVPE_REALTIME_SAMPLES
         } else {
             waveform.len()
         };
@@ -1715,7 +1782,7 @@ impl RvcTrtPipeline {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: hubert frames={hubert_frames}");
         }
 
-        let rmvpe = if streaming_f0 {
+        let rmvpe = if streaming_f0 && rmvpe_samples == RMVPE_REALTIME_SAMPLES {
             &mut self.rmvpe_realtime
         } else {
             &mut self.rmvpe_full
@@ -1795,6 +1862,26 @@ impl RvcTrtPipeline {
                 "aligned RVC frame count {rvc_frames} outside profile"
             )));
         }
+        let synth_frames = if streaming_f0 {
+            realtime_synth_frames(waveform.len(), rvc_frames)
+        } else {
+            rvc_frames
+        };
+        let synth_min = if p.min_synth_frames > 0 {
+            p.min_synth_frames as usize
+        } else {
+            p.min_rvc_frames as usize
+        };
+        let synth_max = if p.max_synth_frames > 0 {
+            p.max_synth_frames as usize
+        } else {
+            p.max_rvc_frames as usize
+        };
+        if synth_frames < synth_min || synth_frames > synth_max {
+            return Err(NativeBuildError::Argument(format!(
+                "Synth frame count {synth_frames} outside profile [{synth_min}..={synth_max}]"
+            )));
+        }
         // Bind the RVC-valid prefix of F0 to the frontend in both modes.
         // RMVPE produces one boundary frame beyond p_len for the full window
         // (282 vs 281 at 44960); using the prefix makes the crop explicit in
@@ -1810,6 +1897,7 @@ impl RvcTrtPipeline {
                 && key.pitch_frames == pitch_frames
                 && key.frontend_pitch_frames == frontend_pitch_frames
                 && key.rvc_frames == rvc_frames
+                && key.synth_frames == synth_frames
                 && key.f0_advance_frames == advance_frames
                 && key.streaming_f0 == streaming_f0
         });
@@ -1853,27 +1941,27 @@ impl RvcTrtPipeline {
         if !same_shape {
             self.synth.set_input_shape(
                 "feats",
-                &[1, rvc_frames as i64, self.config.feature_width as i64],
+                &[1, synth_frames as i64, self.config.feature_width as i64],
             )?;
             self.synth.set_input_shape("p_len", &[1])?;
             self.synth.set_input_shape("sid", &[1])?;
             self.synth.set_input_shape(
                 "rnd",
-                &[1, self.config.latent_channels as i64, rvc_frames as i64],
+                &[1, self.config.latent_channels as i64, synth_frames as i64],
             )?;
             if self.config.uses_f0 {
                 self.synth
-                    .set_input_shape("pitch", &[1, rvc_frames as i64])?;
+                    .set_input_shape("pitch", &[1, synth_frames as i64])?;
                 self.synth
-                    .set_input_shape("pitchf", &[1, rvc_frames as i64])?;
+                    .set_input_shape("pitchf", &[1, synth_frames as i64])?;
                 self.synth
-                    .set_input_shape("nsf_noise", &[1, 1, (rvc_frames * up) as i64])?;
+                    .set_input_shape("nsf_noise", &[1, 1, (synth_frames * up) as i64])?;
             }
         }
         if trace {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: synth shapes set");
         }
-        let p_len_value = i32::try_from(p_len_frames)
+        let p_len_value = i32::try_from(synth_frames)
             .map_err(|_| NativeBuildError::Argument("RVC frame length exceeds i32".into()))?;
         if self.last_p_len != Some(p_len_value) {
             self.control_host_ring.upload_bytes(
@@ -1888,8 +1976,37 @@ impl RvcTrtPipeline {
                 .upload_bytes(&self.sid, &sid.to_le_bytes(), &self.stream)?;
             self.last_sid = Some(sid);
         }
-        self.synth
-            .set_tensor_address_cached("feats", self.feats.device_ptr())?;
+        let frame_offset = rvc_frames.saturating_sub(synth_frames);
+        if self.rnd_frame_shape != Some((rvc_frames, synth_frames)) {
+            self.host_rnd_active.clear();
+            let max_frames = self.profile.max_rvc_frames as usize;
+            let latent = self.config.latent_channels as usize;
+            self.host_rnd_active
+                .reserve(latent.saturating_mul(synth_frames));
+            for channel in 0..latent {
+                let start = channel
+                    .saturating_mul(max_frames)
+                    .saturating_add(frame_offset);
+                let end = start.saturating_add(synth_frames);
+                if end > self.host_rnd.len() {
+                    return Err(NativeBuildError::Argument(
+                        "Synth latent slice exceeds seeded random buffer".into(),
+                    ));
+                }
+                self.host_rnd_active
+                    .extend_from_slice(&self.host_rnd[start..end]);
+            }
+            self.rnd.upload_f32(&self.host_rnd_active)?;
+            self.rnd_frame_shape = Some((rvc_frames, synth_frames));
+        }
+        self.synth.set_tensor_address_cached(
+            "feats",
+            self.feats.device_ptr_offset(
+                frame_offset
+                    .saturating_mul(self.config.feature_width as usize)
+                    .saturating_mul(4),
+            ),
+        )?;
         self.synth
             .set_tensor_address_cached("p_len", self.p_len.device_ptr())?;
         self.synth
@@ -1899,12 +2016,19 @@ impl RvcTrtPipeline {
         self.synth
             .set_tensor_address_cached("audio", self.audio.device_ptr())?;
         if self.config.uses_f0 {
-            self.synth
-                .set_tensor_address_cached("pitch", self.pitch.device_ptr())?;
-            self.synth
-                .set_tensor_address_cached("pitchf", self.pitchf.device_ptr())?;
-            self.synth
-                .set_tensor_address_cached("nsf_noise", self.nsf_noise.device_ptr())?;
+            self.synth.set_tensor_address_cached(
+                "pitch",
+                self.pitch.device_ptr_offset(frame_offset * 4),
+            )?;
+            self.synth.set_tensor_address_cached(
+                "pitchf",
+                self.pitchf.device_ptr_offset(frame_offset * 4),
+            )?;
+            self.synth.set_tensor_address_cached(
+                "nsf_noise",
+                self.nsf_noise
+                    .device_ptr_offset(frame_offset.saturating_mul(up) * 4),
+            )?;
         }
         let graph_key = PipelineShapeKey {
             samples: waveform.len(),
@@ -1913,6 +2037,7 @@ impl RvcTrtPipeline {
             pitch_frames,
             frontend_pitch_frames,
             rvc_frames,
+            synth_frames,
             f0_advance_frames: advance_frames,
             streaming_f0,
         };
@@ -1959,7 +2084,7 @@ impl RvcTrtPipeline {
                     .hubert
                     .is_stream_capturable(&self.stream)
                     .unwrap_or(false);
-                let rmvpe = if streaming_f0 {
+                let rmvpe = if streaming_f0 && rmvpe_samples == RMVPE_REALTIME_SAMPLES {
                     self.rmvpe_realtime
                         .is_stream_capturable(&self.stream)
                         .unwrap_or(false)
@@ -2187,7 +2312,7 @@ impl RvcTrtPipeline {
         // Pageable cudaMemcpy after synchronization adds a second host-side
         // synchronization point on every callback.  A pinned ring keeps the
         // copy ordered with the graph while retaining an owned Vec API.
-        let audio_samples = rvc_frames
+        let audio_samples = synth_frames
             .checked_mul(up)
             .ok_or_else(|| NativeBuildError::Argument("audio sample length overflow".into()))?;
         let audio_bytes_len = audio_samples
@@ -2347,6 +2472,9 @@ impl RvcTrtPipeline {
                 "TensorRT pipeline produced non-finite output".into(),
             ));
         }
+        if streaming_f0 {
+            self.pitch_cache_initialized = true;
+        }
         Ok(RvcTrtOutput {
             audio,
             hubert_features,
@@ -2362,6 +2490,7 @@ impl RvcTrtPipeline {
             hubert_frames,
             pitch_frames,
             rvc_frames,
+            synth_frames,
             timings: RvcTrtTimings {
                 upload_ms,
                 hubert_enqueue_ms,
@@ -2412,6 +2541,18 @@ fn pitch_frames_for_samples(samples: usize) -> usize {
     samples / RVC_HOP_SAMPLES + 1
 }
 
+fn realtime_synth_frames(samples: usize, rvc_frames: usize) -> usize {
+    let config = match samples {
+        11_200 => RvcRealtimeConfig::voice_changer(),
+        35_520 => RvcRealtimeConfig::rvc_webui_legacy(),
+        44_960 => RvcRealtimeConfig::applio(),
+        _ => RvcRealtimeConfig::applio(),
+    };
+    rvc_frames
+        .saturating_sub(config.extra_samples_16k / RVC_HOP_SAMPLES)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2453,6 +2594,14 @@ mod tests {
             ),
             (70, 222, 281)
         );
+        assert_eq!(
+            (
+                profile.min_synth_frames,
+                profile.opt_synth_frames,
+                profile.max_synth_frames
+            ),
+            (22, 31, 281)
+        );
         profile.validate().expect("reference profile is ordered");
     }
 
@@ -2485,6 +2634,14 @@ mod tests {
                 profile.min_rvc_frames
             ),
             (34, 71, 70)
+        );
+        assert_eq!(
+            (
+                profile.min_synth_frames,
+                profile.opt_synth_frames,
+                profile.max_synth_frames
+            ),
+            (62, 62, 70)
         );
         assert_eq!(RvcRealtimeConfig::rvc_webui().inference_samples(), 44_960);
         assert_eq!(

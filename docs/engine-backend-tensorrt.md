@@ -12,9 +12,11 @@ AudioChunk (interleaved, caller rate)
   -> linear resample to 16 kHz
   -> fixed profile StreamingWindow (left zero pad, latest context)
   -> RvcTrtPipeline
-       waveform H2D -> HuBERT -> RMVPE -> frontend -> Synth -> audio D2H
+       waveform H2D -> HuBERT/RMVPE/frontend (full context)
+       -> Synth (trailing skip_head/return_length frames) -> audio D2H
   -> model-rate resample to caller rate
-  -> tail crop to input frame count + optional RMS mix
+  -> SOLA search + crossfade of the extended block
+  -> exact callback crop + optional RMS mix
   -> channel interleave, preserving sequence
 ```
 

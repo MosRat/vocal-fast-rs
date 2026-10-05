@@ -51,7 +51,7 @@ static int create_context(
         }
         auto* context = runtime->engine->createExecutionContext(runtime_config.get());
         vocal::require(context != nullptr, "createExecutionContext failed");
-        *out = new vocal::Context{context, runtime_config.release()};
+        *out = new vocal::Context{context, runtime->engine, runtime_config.release()};
     });
 }
 
@@ -119,6 +119,24 @@ extern "C" int vocal_trt_get_tensor_shape(
                        "tensor shape buffer is too small");
         *rank = shape.nbDims;
         for (int32_t i = 0; i < shape.nbDims; ++i) dimensions[i] = shape.d[i];
+    });
+}
+
+extern "C" int vocal_trt_context_has_tensor(
+    vocal::Context* context, char const* name, int32_t* found,
+    char** error) noexcept {
+    return vocal::guarded(error, [&] {
+        vocal::require(context && context->context && context->engine && name && found,
+                       "invalid tensor existence arguments");
+        *found = 0;
+        int32_t count = context->engine->getNbIOTensors();
+        for (int32_t index = 0; index < count; ++index) {
+            auto const* tensor_name = context->engine->getIOTensorName(index);
+            if (tensor_name && std::strcmp(tensor_name, name) == 0) {
+                *found = 1;
+                break;
+            }
+        }
     });
 }
 

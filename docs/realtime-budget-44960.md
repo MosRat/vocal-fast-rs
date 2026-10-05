@@ -45,11 +45,17 @@ buffering.
 
 ## Current API boundary
 
-`RvcTrtPipeline::process_realtime()` currently returns the complete Synth audio
-window (`112400` samples for 281 RVC frames).  It maintains the F0 cache and
-accepts `advance_frames`, but it does not yet crop the returned waveform or
-apply host-side overlap, crossfade, and SOLA alignment.  A production playback
-worker must publish the 25-frame/10,000-sample tail (after its overlap policy)
-instead of enqueueing all 112,400 samples.  Until that output joiner is added,
-the graph benchmark demonstrates compute real-time capability but is not the
-final device callback integration.
+`RvcTrtPipeline::process_realtime()` keeps the 44960-sample HuBERT/RMVPE
+context, but the Synth binding is now a trailing 31-frame view.  This is the
+same `skip_head=250`, `return_length=31` contract used by Applio: the graph
+produces 4960 internal samples (`4000 + 800 + 160`) instead of decoding the
+discarded 2.5-second prefix.  The engine adapter then performs normalized
+correlation over the 160-sample SOLA search, blends the 800-sample overlap, and
+publishes exactly the callback block (4000 samples at 16 kHz, or 12000 at
+48 kHz).  The Synth artifact records a separate `min/opt/max_synth_frames`
+profile so this shape is compiled and replayed directly.
+
+Pipeline manifests produced before this field was added describe only the full
+RVC frame range. Recompile those artifacts before enabling realtime Synth
+cropping; the runtime deliberately rejects a cropped shape outside the older
+plan's profile instead of silently executing a mismatched binding.

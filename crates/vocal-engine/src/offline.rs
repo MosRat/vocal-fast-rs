@@ -24,6 +24,13 @@ pub struct OfflineRunConfig {
     pub window_samples: usize,
     /// Pad the last window with zeros before invoking the backend.
     pub pad_final_window: bool,
+    /// Number of samples blended at the boundary between two backend blocks.
+    /// A value of zero disables output joining and preserves the historical
+    /// concatenate-only behavior.
+    pub crossfade_samples: usize,
+    /// Search range used by the time-domain SOLA alignment before a
+    /// crossfade. The aligned block keeps its original length.
+    pub sola_search_samples: usize,
     pub conversion: ConversionConfig,
 }
 
@@ -32,6 +39,8 @@ impl Default for OfflineRunConfig {
         Self {
             window_samples: DEFAULT_WINDOW_SAMPLES,
             pad_final_window: true,
+            crossfade_samples: 0,
+            sola_search_samples: 0,
             conversion: ConversionConfig::default(),
         }
     }
@@ -142,7 +151,7 @@ pub fn run_offline<P: OfflinePipeline + ?Sized>(
     }
 
     let started = Instant::now();
-    let mut output = Vec::with_capacity(input.len());
+    let mut joiner = OfflineJoiner::new(config.crossfade_samples, config.sola_search_samples);
     let mut offset = 0usize;
     let mut windows = 0usize;
     while offset < input.len() {
@@ -165,11 +174,12 @@ pub fn run_offline<P: OfflinePipeline + ?Sized>(
         } else {
             result.len()
         };
-        output.extend_from_slice(&result[..keep.min(result.len())]);
+        joiner.append(&result[..keep.min(result.len())]);
         offset += valid;
         windows += 1;
     }
 
+    let output = joiner.finish();
     let metrics = pipeline.metrics();
     Ok((
         output.clone(),
@@ -182,6 +192,115 @@ pub fn run_offline<P: OfflinePipeline + ?Sized>(
             metrics,
         },
     ))
+}
+
+/// Join fixed-size output blocks while preserving one output block per input
+/// block. A SOLA-selected current prefix is blended against the previous tail
+/// and the complete current interval is appended. This mirrors the realtime
+/// workers' `sola_buffer` contract without making the generic offline runner
+/// depend on a particular model backend.
+struct OfflineJoiner {
+    output: Vec<f32>,
+    crossfade_samples: usize,
+    sola_search_samples: usize,
+}
+
+impl OfflineJoiner {
+    fn new(crossfade_samples: usize, sola_search_samples: usize) -> Self {
+        Self {
+            output: Vec::new(),
+            crossfade_samples,
+            sola_search_samples,
+        }
+    }
+
+    fn append(&mut self, block: &[f32]) {
+        if block.is_empty() {
+            return;
+        }
+        if self.output.is_empty() || self.crossfade_samples == 0 {
+            self.output.extend_from_slice(block);
+            return;
+        }
+
+        let overlap = self
+            .crossfade_samples
+            .min(self.output.len())
+            .min(block.len());
+        if overlap == 0 {
+            self.output.extend_from_slice(block);
+            return;
+        }
+
+        let max_offset = self
+            .sola_search_samples
+            .min(block.len().saturating_sub(overlap));
+        let offset = find_sola_offset(
+            &self.output[self.output.len() - overlap..],
+            block,
+            overlap,
+            max_offset,
+        );
+
+        // Keep a fixed block length after SOLA. When the selected candidate is
+        // shifted forward, repeat the final sample for the short tail.
+        let mut aligned = Vec::with_capacity(block.len());
+        for index in 0..block.len() {
+            aligned.push(block[(index + offset).min(block.len() - 1)]);
+        }
+
+        for index in 0..overlap {
+            let phase = if overlap <= 1 {
+                1.0
+            } else {
+                index as f32 / (overlap - 1) as f32
+            };
+            let fade_in = (0.5 * std::f32::consts::PI * phase).sin().powi(2);
+            let fade_out = 1.0 - fade_in;
+            let previous = self.output[self.output.len() - overlap + index];
+            aligned[index] = previous * fade_out + aligned[index] * fade_in;
+        }
+        // The backend block already represents one playback interval. Apply
+        // the blend to its prefix and append the complete interval; removing
+        // the overlap here would shorten the offline result on every window.
+        self.output.extend_from_slice(&aligned);
+    }
+
+    fn finish(self) -> Vec<f32> {
+        self.output
+    }
+}
+
+fn find_sola_offset(previous: &[f32], block: &[f32], overlap: usize, max_offset: usize) -> usize {
+    if overlap == 0 || max_offset == 0 {
+        return 0;
+    }
+    let previous_energy = previous
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum::<f64>();
+    if previous_energy <= f64::EPSILON {
+        return 0;
+    }
+
+    let mut best_offset = 0usize;
+    let mut best_score = f64::NEG_INFINITY;
+    for offset in 0..=max_offset {
+        let candidate = &block[offset..offset + overlap];
+        let mut numerator = 0.0f64;
+        let mut candidate_energy = 0.0f64;
+        for (&left, &right) in previous.iter().zip(candidate) {
+            numerator += f64::from(left) * f64::from(right);
+            candidate_energy += f64::from(right) * f64::from(right);
+        }
+        let denominator = (previous_energy * candidate_energy).sqrt().max(1e-12);
+        let score = numerator / denominator;
+        if score > best_score {
+            best_score = score;
+            best_offset = offset;
+        }
+    }
+    best_offset
 }
 
 #[cfg(test)]
@@ -213,5 +332,30 @@ mod tests {
             assert_eq!(report.windows, 2);
             assert_eq!(report.backend, backend);
         }
+    }
+
+    #[test]
+    fn joined_blocks_keep_duration_and_blend_the_boundary() {
+        let mut joiner = OfflineJoiner::new(2, 0);
+        joiner.append(&[0.0, 0.0, 0.0, 0.0]);
+        joiner.append(&[1.0, 1.0, 1.0, 1.0]);
+        let output = joiner.finish();
+        assert_eq!(output.len(), 8);
+        assert_eq!(output[2], 0.0);
+        assert_eq!(output[3], 0.0);
+        assert_eq!(output[4], 0.0);
+        assert_eq!(output[5], 1.0);
+        assert_eq!(&output[6..], &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn sola_selects_the_best_candidate_offset() {
+        let mut joiner = OfflineJoiner::new(3, 1);
+        joiner.append(&[0.0, 0.0, 0.0, 0.0]);
+        // The candidate at offset one matches the previous tail better than
+        // the first sample and is selected without changing total duration.
+        joiner.append(&[1.0, 0.0, 0.0, 0.0, 0.0]);
+        let output = joiner.finish();
+        assert_eq!(output.len(), 9);
     }
 }

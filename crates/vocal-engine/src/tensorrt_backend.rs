@@ -14,7 +14,8 @@ use vocal_types::{AudioChunk, AudioFormat, ConversionConfig, LatencyMetrics, Mod
 use crate::{
     EngineError, EngineReloadConfig, InferenceEngine,
     audio_adapter::{
-        StreamingWindow, apply_rms_mix, from_model_rate, interleave, to_internal_rate, to_mono,
+        RealtimeBufferState, StreamingOutputJoiner, StreamingWindow, apply_rms_mix, interleave,
+        tail_with_length, to_internal_rate, to_mono,
     },
     config::{TensorRtEngineSpec, TensorRtReloadConfig},
     logging,
@@ -22,8 +23,8 @@ use crate::{
 };
 
 use vocal_tensorrt::{
-    DiagnosticsConfig, PipelineRuntimeConfig, RvcTrtPipeline, RvcTrtPipelineArtifacts,
-    TensorRtConfig,
+    DiagnosticsConfig, PipelineRuntimeConfig, RvcRealtimeConfig, RvcTrtPipeline,
+    RvcTrtPipelineArtifacts, TensorRtConfig,
 };
 
 /// Runtime-owned TensorRT backend configuration.  Build options stay in the
@@ -97,6 +98,10 @@ pub struct TensorRtEngine {
     metrics: LatencyMetrics,
     status: EngineStatus,
     last_timings: Option<vocal_tensorrt::RvcTrtTimings>,
+    output_joiner: StreamingOutputJoiner,
+    realtime_config: RvcRealtimeConfig,
+    stream_config: RvcRealtimeConfig,
+    realtime_buffers: RealtimeBufferState,
 }
 
 impl TensorRtEngine {
@@ -161,6 +166,7 @@ impl TensorRtEngine {
         validate_window(&artifacts, window_samples)?;
         let pipeline = load_pipeline(&artifacts, &synth_config, &backend)?;
         let window = StreamingWindow::new(window_samples)?;
+        let realtime_config = realtime_config_for_window(window_samples);
         Ok(Self {
             pipeline,
             window,
@@ -173,11 +179,21 @@ impl TensorRtEngine {
                 ..Default::default()
             },
             last_timings: None,
+            output_joiner: StreamingOutputJoiner::new(
+                16_000,
+                realtime_config.crossfade_samples_16k,
+                realtime_config.sola_search_samples_16k,
+            ),
+            realtime_config,
+            stream_config: realtime_config,
+            realtime_buffers: RealtimeBufferState::default(),
         })
     }
 
     pub fn reset(&mut self) -> Result<(), EngineError> {
         self.window.reset();
+        self.output_joiner.reset();
+        self.realtime_buffers.reset();
         self.pipeline
             .reset_streaming_state()
             .map_err(|error| backend_error("reset TensorRT pipeline", error))?;
@@ -234,8 +250,17 @@ impl TensorRtEngine {
         validate_window(&artifacts, window_samples)?;
         let pipeline = load_pipeline(&artifacts, &self.synth_config, &backend)?;
         let window = StreamingWindow::new(window_samples)?;
+        let realtime_config = realtime_config_for_window(window_samples);
         self.pipeline = pipeline;
         self.window = window;
+        self.realtime_config = realtime_config;
+        self.stream_config = realtime_config;
+        self.output_joiner = StreamingOutputJoiner::new(
+            16_000,
+            realtime_config.crossfade_samples_16k,
+            realtime_config.sola_search_samples_16k,
+        );
+        self.realtime_buffers.reset();
         self.speaker_id = backend.speaker_id;
         Ok(())
     }
@@ -251,21 +276,30 @@ impl TensorRtEngine {
         let started = Instant::now();
         let mono = to_mono(format, samples);
         let internal = to_internal_rate(&mono, format.sample_rate);
-        let advance_frames = internal.len().div_ceil(160).clamp(1, 1023);
-        let window = self.window.push(&internal)?;
-        let output = if self.pipeline.config.uses_f0 {
-            self.pipeline
-                .process_realtime(&window, self.speaker_id, advance_frames)
+        let output_mono = if self.pipeline.config.uses_f0 {
+            self.realtime_buffers.append_input(&internal, &mono);
+            let target_internal = self.stream_config.chunk_samples_16k.max(160);
+            let target_source =
+                crate::pipeline::resampled_len(target_internal, 16_000, format.sample_rate);
+            let mut chunk_count = 0usize;
+            while let Some((chunk_internal, chunk_source)) = self
+                .realtime_buffers
+                .take_input_chunk(target_internal, target_source)
+            {
+                let converted = self.infer_realtime_chunk(
+                    format,
+                    &chunk_internal,
+                    &chunk_source,
+                    sequence.saturating_add(chunk_count as u64),
+                    config,
+                )?;
+                self.realtime_buffers.append_output(&converted);
+                chunk_count = chunk_count.saturating_add(1);
+            }
+            self.realtime_buffers.take_output(mono.len())
         } else {
-            self.pipeline.process(&window, self.speaker_id)
-        }
-        .map_err(|error| backend_error("TensorRT inference", error))?;
-        self.last_timings = Some(output.timings);
-        let mut output_mono =
-            from_model_rate(&output.audio, self.model_sample_rate, format, mono.len());
-        if config.rms_mix_rate < 1.0 {
-            apply_rms_mix(&mono, &mut output_mono, config.rms_mix_rate);
-        }
+            self.infer_non_realtime_chunk(format, &internal, &mono, sequence, config)?
+        };
         if output_mono.iter().any(|sample| !sample.is_finite()) {
             return Err(EngineError::BackendUnavailable(
                 "TensorRT inference produced non-finite audio".into(),
@@ -284,6 +318,97 @@ impl TensorRtEngine {
             samples,
             sequence,
         })
+    }
+
+    fn infer_realtime_chunk(
+        &mut self,
+        format: AudioFormat,
+        internal: &[f32],
+        source: &[f32],
+        sequence: u64,
+        config: ConversionConfig,
+    ) -> Result<Vec<f32>, EngineError> {
+        let advance_frames = internal.len().div_ceil(160).clamp(1, 1023);
+        let window = self.window.push(internal)?;
+        let output = self
+            .pipeline
+            .process_realtime(&window, self.speaker_id, advance_frames)
+            .map_err(|error| backend_error("TensorRT inference", error))?;
+        self.last_timings = Some(output.timings);
+        let model_audio = if output.synth_frames >= output.rvc_frames {
+            crop_realtime_audio(
+                &output.audio,
+                output.rvc_frames,
+                self.realtime_config,
+                self.pipeline
+                    .config
+                    .upsample_rates
+                    .iter()
+                    .try_fold(1usize, |value, rate| value.checked_mul(*rate as usize))
+                    .ok_or_else(|| {
+                        EngineError::BackendUnavailable(
+                            "TensorRT Synth upsample product overflow".into(),
+                        )
+                    })?,
+            )
+        } else {
+            output.audio
+        };
+        let converted = crate::pipeline::resample_linear(
+            &model_audio,
+            self.model_sample_rate,
+            format.sample_rate,
+        );
+        if let Some(directory) = std::env::var_os("VOCAL_TRT_DUMP_STREAM_BLOCKS") {
+            let path = std::path::PathBuf::from(directory).join(format!("block-{sequence:04}.f32"));
+            let bytes = converted
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect::<Vec<_>>();
+            let _ = std::fs::write(path, bytes);
+        }
+        if self.output_joiner.sample_rate() != format.sample_rate {
+            self.output_joiner = StreamingOutputJoiner::new(
+                format.sample_rate,
+                self.stream_config.crossfade_samples_16k,
+                self.stream_config.sola_search_samples_16k,
+            );
+        }
+        let block_frames =
+            crate::pipeline::resampled_len(internal.len(), 16_000, format.sample_rate);
+        let needed = self.output_joiner.required_samples(block_frames);
+        let extended = head_with_length(&converted, needed);
+        let mut output = self.output_joiner.process(&extended, block_frames);
+        if config.rms_mix_rate < 1.0 && !source.is_empty() {
+            apply_rms_mix(source, &mut output, config.rms_mix_rate);
+        }
+        Ok(output)
+    }
+
+    fn infer_non_realtime_chunk(
+        &mut self,
+        format: AudioFormat,
+        internal: &[f32],
+        source: &[f32],
+        _sequence: u64,
+        config: ConversionConfig,
+    ) -> Result<Vec<f32>, EngineError> {
+        let window = self.window.push(internal)?;
+        let output = self
+            .pipeline
+            .process(&window, self.speaker_id)
+            .map_err(|error| backend_error("TensorRT inference", error))?;
+        self.last_timings = Some(output.timings);
+        let converted = crate::pipeline::resample_linear(
+            &output.audio,
+            self.model_sample_rate,
+            format.sample_rate,
+        );
+        let mut result = tail_with_length(&converted, source.len());
+        if config.rms_mix_rate < 1.0 {
+            apply_rms_mix(source, &mut result, config.rms_mix_rate);
+        }
+        Ok(result)
     }
 }
 
@@ -365,6 +490,48 @@ fn read_artifacts(path: &Path) -> Result<RvcTrtPipelineArtifacts, EngineError> {
             path.display()
         ))
     })
+}
+
+fn realtime_config_for_window(window_samples: usize) -> RvcRealtimeConfig {
+    match window_samples {
+        11_200 => RvcRealtimeConfig::voice_changer(),
+        35_520 => RvcRealtimeConfig::rvc_webui_legacy(),
+        44_960 => RvcRealtimeConfig::applio(),
+        // Custom profiles still use the current WebUI/Applio overlap policy.
+        // The model-specific extra context is derived from the profile's
+        // output frame count below, so this fallback remains safe for a
+        // deployment with a non-standard fixed profile.
+        _ => RvcRealtimeConfig::applio(),
+    }
+}
+
+fn crop_realtime_audio(
+    audio: &[f32],
+    rvc_frames: usize,
+    realtime: RvcRealtimeConfig,
+    upsample: usize,
+) -> Vec<f32> {
+    let skip_head = realtime.extra_samples_16k / 160;
+    let return_frames = rvc_frames.saturating_sub(skip_head).max(1);
+    let start = rvc_frames
+        .saturating_sub(return_frames)
+        .saturating_mul(upsample);
+    let expected = return_frames.saturating_mul(upsample);
+    let mut output = vec![0.0; expected];
+    if start < audio.len() {
+        let copied = (audio.len() - start).min(expected);
+        output[..copied].copy_from_slice(&audio[start..start + copied]);
+    }
+    output
+}
+
+fn head_with_length(samples: &[f32], frames: usize) -> Vec<f32> {
+    if samples.len() >= frames {
+        return samples[..frames].to_vec();
+    }
+    let mut output = samples.to_vec();
+    output.resize(frames, 0.0);
+    output
 }
 
 fn load_pipeline(

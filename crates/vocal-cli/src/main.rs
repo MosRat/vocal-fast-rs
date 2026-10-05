@@ -264,7 +264,7 @@ fn compile_trt_pipeline(
     let manifest = output.join("pipeline.json");
     fs::write(&manifest, serde_json::to_vec_pretty(&artifacts)?)?;
     println!(
-        "compiled HuBERT/RMVPE/frontend/Synth plans; samples=[{}..={}..={}], hubert=[{}..={}..={}], pitch=[{}..={}..={}], rvc=[{}..={}..={}]; manifest={}",
+        "compiled HuBERT/RMVPE/frontend/Synth plans; samples=[{}..={}..={}], hubert=[{}..={}..={}], pitch=[{}..={}..={}], rvc=[{}..={}..={}], synth=[{}..={}..={}]; manifest={}",
         profile.min_samples,
         profile.opt_samples,
         profile.max_samples,
@@ -277,6 +277,9 @@ fn compile_trt_pipeline(
         profile.min_rvc_frames,
         profile.opt_rvc_frames,
         profile.max_rvc_frames,
+        profile.min_synth_frames,
+        profile.opt_synth_frames,
+        profile.max_synth_frames,
         manifest.display()
     );
     Ok(())
@@ -364,7 +367,8 @@ fn test_trt_pipeline(
             &debug_path,
             serde_json::to_vec(&serde_json::json!({
                 "hubert_frames": result.hubert_frames, "pitch_frames": result.pitch_frames,
-                "rvc_frames": result.rvc_frames, "hubert_features": result.hubert_features,
+                "rvc_frames": result.rvc_frames, "synth_frames": result.synth_frames,
+                "hubert_features": result.hubert_features,
                 "rvc_features": result.rvc_features, "pitchf": result.pitchf,
                 "aligned_pitchf": result.aligned_pitchf, "pitch": result.pitch,
                 "rmvpe_mel": result.rmvpe_mel, "rmvpe_gru": result.rmvpe_gru,
@@ -382,6 +386,7 @@ fn test_trt_pipeline(
             "iterations": iterations, "mean_total_ms": mean_total,
             "input_samples": samples.len(), "hubert_frames": result.hubert_frames,
             "pitch_frames": result.pitch_frames, "rvc_frames": result.rvc_frames,
+            "synth_frames": result.synth_frames,
             "output_samples": result.audio.len(), "timings_ms": {
                 "upload": result.timings.upload_ms, "hubert": result.timings.hubert_enqueue_ms,
                 "rmvpe": result.timings.rmvpe_enqueue_ms, "frontend": result.timings.frontend_enqueue_ms,
@@ -498,6 +503,10 @@ fn run_offline_pipeline(
     let mut pipeline = EngineOfflinePipeline::new(backend, engine, AudioFormat::MONO_16K)?;
     let mut config = OfflineRunConfig::default();
     config.window_samples = window_samples;
+    // TensorRT performs SOLA/crossfade in its streaming engine because it
+    // needs the extended model output before cropping each callback. The
+    // shared runner concatenates the already-cropped blocks here; future
+    // backends may opt into OfflineRunConfig's generic join policy directly.
     let (audio_16k, report) = run_offline(&mut pipeline, &samples, &config)?;
     let output_rate = descriptor.sample_rate;
     if let Some(output_path) = output {
@@ -515,6 +524,9 @@ fn run_offline_pipeline(
             "input_samples_16k": report.input_samples,
             "output_samples_16k": report.output_samples,
             "windows": report.windows,
+            "window_samples": config.window_samples,
+            "crossfade_samples": config.crossfade_samples,
+            "sola_search_samples": config.sola_search_samples,
             "elapsed_ms": report.elapsed_ms,
             "engine_metrics": report.metrics,
             "artifacts": artifacts,
@@ -556,11 +568,22 @@ fn create_offline_engine(
                     EngineConfig::with_tensorrt(descriptor, artifacts_path.clone(), cache);
                 let profile: vocal_tensorrt::RvcTrtPipelineArtifacts =
                     serde_json::from_slice(&fs::read(&artifacts_path)?)?;
-                let window_samples = offline_window_from_env()
-                    .max(profile.profile.min_samples.max(1) as usize)
-                    .min(profile.profile.max_samples.max(1) as usize);
+                let model_window_samples = profile.profile.max_samples.max(1) as usize;
+                let window_samples = offline_window_from_env_with_default(
+                    vocal_tensorrt::RvcRealtimeConfig::applio().chunk_samples_16k,
+                );
+                if window_samples > model_window_samples {
+                    return Err(format!(
+                        "TensorRT offline block {} exceeds model context window {}",
+                        window_samples, model_window_samples
+                    )
+                    .into());
+                }
                 if let Some(spec) = config.tensorrt.as_mut() {
-                    spec.window_samples = Some(window_samples);
+                    // `window_samples` in the engine spec is the TensorRT
+                    // context shape. The offline runner advances the
+                    // realtime worker by the smaller playback block above.
+                    spec.window_samples = Some(model_window_samples);
                 }
                 let engine = vocal_engine::create_engine(config)?;
                 Ok((engine, window_samples))
@@ -575,11 +598,15 @@ fn create_offline_engine(
 }
 
 fn offline_window_from_env() -> usize {
+    offline_window_from_env_with_default(vocal_engine::offline::DEFAULT_WINDOW_SAMPLES)
+}
+
+fn offline_window_from_env_with_default(default: usize) -> usize {
     env::var("VOCAL_OFFLINE_WINDOW_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|value: &usize| *value > 0)
-        .unwrap_or(vocal_engine::offline::DEFAULT_WINDOW_SAMPLES)
+        .unwrap_or(default)
 }
 
 #[cfg(not(feature = "tensorrt-rtx"))]
@@ -692,6 +719,8 @@ fn compare_trt_pipeline(
                 "synth": mean(|r| r.timings.synth_enqueue_ms),
             },
             "output_samples": audio.len(),
+            "rvc_frames": result.rvc_frames,
+            "synth_frames": result.synth_frames,
             "output_delta_vs_native": delta,
             "cuda_graph": pipeline.cuda_graph_stats(),
         }));

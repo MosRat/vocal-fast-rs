@@ -1,12 +1,14 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 #[cfg(feature = "tensorrt-rtx")]
 use std::{io::Read, time::Instant};
-use vocal_audio::{AudioRing, StreamConfig};
-#[cfg(feature = "tensorrt-rtx")]
-use vocal_audio::{read_wav, write_wav_pcm16};
+use vocal_audio::{AudioRing, StreamConfig, read_wav, resample_linear, write_wav_pcm16};
 #[cfg(not(feature = "tensorrt-rtx"))]
 use vocal_engine::tensorrt::{TensorRtCompiler, TrtExecCompiler};
 use vocal_engine::tensorrt::{TensorRtGraphOptions, build_rvc_graph};
+use vocal_engine::{
+    BackendKind, EngineConfig, InferenceEngine,
+    offline::{EngineOfflinePipeline, OfflineRunConfig, run_offline},
+};
 use vocal_model::{
     ACOUSTIC_TENSOR_SCHEMA, load_cache, load_directory, load_manifest, load_rvc_directory,
     load_rvc_onnx, load_rvc_pth, write_cache,
@@ -31,7 +33,7 @@ use cli_state::CliStatus;
 
 fn usage() {
     eprintln!(
-        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model run-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> <output.wav>\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
+        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model run-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> <output.wav>\n  model test-pipeline <passthrough|cpu|tensorrt> <model.vfr> <input.wav|input.f32> [pipeline.json]\n  model run-pipeline <passthrough|cpu|tensorrt> <model.vfr> <input.wav|input.f32> <output.wav> [pipeline.json]\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
     );
     eprintln!("  model benchmark-trt <output.plan> <input.vin> <output.bin> [iterations]");
 }
@@ -140,6 +142,48 @@ fn run(args: Vec<String>) -> CliResult<()> {
         {
             test_trt_pipeline(artifacts.into(), cache.into(), input.into(), false)
         }
+        [command, subcommand, backend, cache, input]
+            if command == "model" && subcommand == "test-pipeline" =>
+        {
+            run_offline_pipeline(backend, cache.into(), input.into(), None, None)
+        }
+        [command, subcommand, backend, cache, input, artifacts]
+            if command == "model" && subcommand == "test-pipeline" =>
+        {
+            run_offline_pipeline(
+                backend,
+                cache.into(),
+                input.into(),
+                None,
+                Some(artifacts.into()),
+            )
+        }
+        [command, subcommand, backend, cache, input, output]
+            if command == "model" && subcommand == "run-pipeline" =>
+        {
+            run_offline_pipeline(
+                backend,
+                cache.into(),
+                input.into(),
+                Some(output.into()),
+                None,
+            )
+        }
+        [
+            command,
+            subcommand,
+            backend,
+            cache,
+            input,
+            output,
+            artifacts,
+        ] if command == "model" && subcommand == "run-pipeline" => run_offline_pipeline(
+            backend,
+            cache.into(),
+            input.into(),
+            Some(output.into()),
+            Some(artifacts.into()),
+        ),
         [command, subcommand, artifacts, cache, input, output]
             if command == "model" && subcommand == "run-trt-pipeline" =>
         {
@@ -428,6 +472,116 @@ fn run_trt_pipeline(
     Ok(())
 }
 
+/// Run any backend through the shared offline window runner.  The optional
+/// TensorRT artifact path is only interpreted for the `tensorrt` backend;
+/// passthrough and CPU RVC use the same command and model package format.
+fn run_offline_pipeline(
+    backend_name: &str,
+    cache: PathBuf,
+    input: PathBuf,
+    output: Option<PathBuf>,
+    artifacts: Option<PathBuf>,
+) -> CliResult<()> {
+    let backend = parse_offline_backend(backend_name)?;
+    let package = load_cache(&cache)?;
+    let descriptor = package.manifest.descriptor();
+    let (engine, window_samples) = create_offline_engine(
+        backend,
+        descriptor.clone(),
+        cache.clone(),
+        artifacts.clone(),
+    )?;
+    let samples = read_f32_audio(&input)?;
+    if samples.is_empty() {
+        return Err("offline input contains no samples".into());
+    }
+    let mut pipeline = EngineOfflinePipeline::new(backend, engine, AudioFormat::MONO_16K)?;
+    let mut config = OfflineRunConfig::default();
+    config.window_samples = window_samples;
+    let (audio_16k, report) = run_offline(&mut pipeline, &samples, &config)?;
+    let output_rate = descriptor.sample_rate;
+    if let Some(output_path) = output {
+        let audio = resample_linear(&audio_16k, 16_000, output_rate);
+        write_wav_pcm16(&output_path, output_rate, &audio)
+            .map_err(|error| format!("write output WAV {}: {error}", output_path.display()))?;
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "backend": backend_name,
+            "model": cache,
+            "input": input,
+            "output_sample_rate": output_rate,
+            "input_samples_16k": report.input_samples,
+            "output_samples_16k": report.output_samples,
+            "windows": report.windows,
+            "elapsed_ms": report.elapsed_ms,
+            "engine_metrics": report.metrics,
+            "artifacts": artifacts,
+        })
+    );
+    Ok(())
+}
+
+fn parse_offline_backend(value: &str) -> CliResult<BackendKind> {
+    match value.to_ascii_lowercase().as_str() {
+        "passthrough" | "pass" => Ok(BackendKind::Passthrough),
+        "cpu" | "rvc-cpu" | "rvc_cpu" => Ok(BackendKind::RvcCpuPipeline),
+        "tensorrt" | "trt" | "tensorrt-rtx" | "tensorrt_rtx" => Ok(BackendKind::TensorRtRtx),
+        _ => Err(format!(
+            "unknown offline backend {value}; expected passthrough, cpu, or tensorrt"
+        )
+        .into()),
+    }
+}
+
+fn create_offline_engine(
+    backend: BackendKind,
+    descriptor: ModelDescriptor,
+    cache: PathBuf,
+    artifacts: Option<PathBuf>,
+) -> CliResult<(Box<dyn InferenceEngine>, usize)> {
+    match backend {
+        BackendKind::Passthrough | BackendKind::RvcCpuPipeline => {
+            let engine = vocal_engine::create_engine(EngineConfig::portable(backend, descriptor))?;
+            Ok((engine, offline_window_from_env()))
+        }
+        BackendKind::TensorRtRtx => {
+            #[cfg(feature = "tensorrt-rtx")]
+            {
+                let artifacts_path = artifacts.ok_or(
+                    "TensorRT offline execution requires the compiled pipeline.json artifact",
+                )?;
+                let mut config =
+                    EngineConfig::with_tensorrt(descriptor, artifacts_path.clone(), cache);
+                let profile: vocal_tensorrt::RvcTrtPipelineArtifacts =
+                    serde_json::from_slice(&fs::read(&artifacts_path)?)?;
+                let window_samples = offline_window_from_env()
+                    .max(profile.profile.min_samples.max(1) as usize)
+                    .min(profile.profile.max_samples.max(1) as usize);
+                if let Some(spec) = config.tensorrt.as_mut() {
+                    spec.window_samples = Some(window_samples);
+                }
+                let engine = vocal_engine::create_engine(config)?;
+                Ok((engine, window_samples))
+            }
+            #[cfg(not(feature = "tensorrt-rtx"))]
+            {
+                let _ = (descriptor, cache, artifacts);
+                Err("TensorRT offline execution requires --features tensorrt-rtx".into())
+            }
+        }
+    }
+}
+
+fn offline_window_from_env() -> usize {
+    env::var("VOCAL_OFFLINE_WINDOW_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value: &usize| *value > 0)
+        .unwrap_or(vocal_engine::offline::DEFAULT_WINDOW_SAMPLES)
+}
+
 #[cfg(not(feature = "tensorrt-rtx"))]
 fn run_trt_pipeline(
     _artifacts: PathBuf,
@@ -617,7 +771,6 @@ fn compare_trt_pipeline(
     Err("TensorRT-RTX feature is disabled; rebuild with --features tensorrt-rtx".into())
 }
 
-#[cfg(feature = "tensorrt-rtx")]
 fn read_f32_audio(path: &PathBuf) -> CliResult<Vec<f32>> {
     let bytes = fs::read(path)?;
     if bytes.len() >= 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {

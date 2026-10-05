@@ -997,9 +997,9 @@ impl RvcTrtPipeline {
         // enqueue is not supported by the SDK.
         let native_cuda_graphs = graph_mode == GraphReplayMode::NativeSubgraphs;
         let hubert = OwnedContext::create_with_cuda_graphs(hubert_runtime, native_cuda_graphs)?;
-        let rmvpe_realtime =
+        let mut rmvpe_realtime =
             OwnedContext::create_with_cuda_graphs(rmvpe_realtime_runtime, native_cuda_graphs)?;
-        let rmvpe_full =
+        let mut rmvpe_full =
             OwnedContext::create_with_cuda_graphs(rmvpe_full_runtime, native_cuda_graphs)?;
         let frontend = OwnedContext::create_with_cuda_graphs(frontend_runtime, native_cuda_graphs)?;
         let synth = OwnedContext::create_with_cuda_graphs(synth_runtime, native_cuda_graphs)?;
@@ -1059,7 +1059,14 @@ impl RvcTrtPipeline {
         // though public pitch is cropped to 282 frames. Buffers are allocated
         // once so parity diagnostics never introduce an undersized output
         // binding or a per-call device allocation.
-        let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs;
+        // Older pipeline manifests did not persist the debug-output flag.
+        // Infer it from the loaded execution context so such plans still
+        // receive an address for every declared output. New manifests keep
+        // the explicit flag, while production plans without these tensors
+        // simply return an API error from the probe and remain unchanged.
+        let plan_has_rmvpe_debug_outputs = rmvpe_full.tensor_shape("rmvpe_debug_mel").is_ok()
+            || rmvpe_realtime.tensor_shape("rmvpe_debug_mel").is_ok();
+        let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs || plan_has_rmvpe_debug_outputs;
         let debug_intermediates = diagnostics.debug_intermediates;
         let rmvpe_max_padded_frames = ((p.max_pitch_frames as usize + 31) / 32) * 32;
         let pitch_cache = alloc(RVC_F0_CACHE_FRAMES * 4)?;

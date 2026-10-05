@@ -14,6 +14,7 @@ mod state;
 #[cfg(feature = "tensorrt-rtx")]
 mod tensorrt_backend;
 
+pub mod offline;
 pub mod pipeline;
 pub mod tensorrt;
 

@@ -433,7 +433,7 @@ impl AppState {
 impl RuntimeState {
     fn snapshot(&mut self) -> GuiResult<UiSnapshot> {
         if let Some(audio) = self.audio.as_mut() {
-            audio.reap_if_dead();
+            audio.reap_if_unhealthy();
         }
         let runtime = self.runtime.snapshot()?;
         let audio = self

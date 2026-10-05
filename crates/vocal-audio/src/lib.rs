@@ -5,8 +5,10 @@
 //! only sees [`WorkerIo`] and its slot leases.
 
 mod audio_core;
+pub mod wav;
 
 pub use audio_core::*;
+pub use wav::{WavData, WavError, read_wav, read_wav_bytes, resample_linear, write_wav_pcm16};
 
 #[cfg(feature = "cpal-backend")]
 pub mod cpal_backend;

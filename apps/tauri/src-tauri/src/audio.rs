@@ -45,6 +45,14 @@ impl AudioStream {
         }
     }
 
+    fn take_errors(&self) -> Vec<String> {
+        match self {
+            Self::Cpal(stream) => stream.take_errors(),
+            #[cfg(windows)]
+            Self::Wasapi(stream) => stream.take_errors(),
+        }
+    }
+
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -350,20 +358,39 @@ impl AudioSession {
         }
     }
 
-    /// Reclaim a stream whose worker or device graph has already exited. This
-    /// is called from the control-plane snapshot path, so it never runs on a
-    /// real-time callback. It deliberately does not join here: Drop owns the
-    /// final join once the control-plane call has returned.
-    pub fn reap_if_unhealthy(&mut self) {
+    /// Stop a stream whose worker or device graph has already exited. This is
+    /// called from the control-plane snapshot path, and also from a terminal
+    /// worker error report; the caller may then drop the session to reclaim its
+    /// join handle.
+    pub fn reap_if_unhealthy(&mut self) -> Option<String> {
         let worker_dead = !self.worker_alive.load(Ordering::Acquire);
-        let stream_dead = self.stream.as_ref().is_some_and(|stream| {
-            !matches!(stream.status().lifecycle, StreamLifecycle::Running)
+        let stream_status = self.stream.as_ref().map(AudioStream::status);
+        let stream_dead = stream_status.is_some_and(|status| {
+            !matches!(status.lifecycle, StreamLifecycle::Running)
         });
         if !worker_dead && !stream_dead {
-            return;
+            return None;
         }
+        let message = if worker_dead {
+            "audio model worker exited unexpectedly".to_owned()
+        } else {
+            let detail = self
+                .stream
+                .as_ref()
+                .map(AudioStream::take_errors)
+                .into_iter()
+                .flatten()
+                .next();
+            detail.unwrap_or_else(|| {
+                let state = stream_status
+                    .map(|status| format!("{:?}", status.lifecycle))
+                    .unwrap_or_else(|| "unknown".into());
+                format!("audio device stream stopped unexpectedly ({state})")
+            })
+        };
         self.stop.store(true, Ordering::Release);
         self.stream.take();
+        Some(message)
     }
 }
 
@@ -480,7 +507,12 @@ impl Drop for AudioSession {
         // queued audio.
         self.stream.take();
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            // A worker can publish its terminal error through AppState before
+            // its closure returns. That report may reap this session from the
+            // worker thread itself; joining the current thread would panic.
+            if join.thread().id() != thread::current().id() {
+                let _ = join.join();
+            }
         }
     }
 }

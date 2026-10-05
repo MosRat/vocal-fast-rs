@@ -432,8 +432,26 @@ impl AppState {
 
 impl RuntimeState {
     fn snapshot(&mut self) -> GuiResult<UiSnapshot> {
-        if let Some(audio) = self.audio.as_mut() {
-            audio.reap_if_unhealthy();
+        let audio_failure = self
+            .audio
+            .as_mut()
+            .and_then(AudioSession::reap_if_unhealthy);
+        if let Some(message) = audio_failure {
+            // Drop outside the audio callback and before changing the runtime
+            // state. AudioSession::Drop joins the worker after its engine lease
+            // has been returned, so a subsequent start can safely acquire a
+            // fresh lease instead of seeing a stale session handle.
+            self.audio.take();
+            let runtime = self.runtime.snapshot()?;
+            if runtime.lifecycle != LifecycleState::Failed {
+                self.runtime
+                    .report_failure("audio.session", message.clone())?;
+                self.last_error = Some(ErrorReport {
+                    code: "audio_session".into(),
+                    message,
+                    recoverable: true,
+                });
+            }
         }
         let runtime = self.runtime.snapshot()?;
         let audio = self

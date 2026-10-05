@@ -8,13 +8,44 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use serde::Serialize;
 use vocal_audio::cpal_backend::{CpalDuplexStream, build_duplex_profiled, recommended_host};
 use vocal_audio::{
-    AudioClock, AudioError, StreamConfig, StreamIo, StreamQueueConfig, WorkerInputPolicy,
-    WorkerSchedule,
+    AudioClock, AudioError, StreamConfig, StreamIo, StreamLifecycle, StreamQueueConfig, StreamStatus,
+    WorkerInputPolicy, WorkerIo, WorkerSchedule,
 };
+#[cfg(windows)]
+use vocal_audio::wasapi_backend::{WasapiMode, WasapiStream};
 use vocal_runtime::{RuntimeConfig, RuntimeContext};
-use vocal_types::{AudioChunk, LifecycleState};
+use vocal_types::LifecycleState;
 
-const WORKER_WAIT: Duration = Duration::from_millis(100);
+const WORKER_WAIT: Duration = Duration::from_millis(20);
+
+/// A device graph selected by the control plane. Windows uses the native
+/// `IAudioClient3` graph when both endpoints are default devices; explicit
+/// device selections stay on cpal so their stable device-id contract remains
+/// available. The worker only receives `WorkerIo`, never this value.
+enum AudioStream {
+    Cpal(CpalDuplexStream),
+    #[cfg(windows)]
+    Wasapi(WasapiStream),
+}
+
+impl AudioStream {
+    fn latency(&self) -> Option<vocal_audio::AudioLatencySnapshot> {
+        match self {
+            Self::Cpal(stream) => stream.latency(),
+            #[cfg(windows)]
+            Self::Wasapi(stream) => stream.latency(),
+        }
+    }
+
+    fn status(&self) -> StreamStatus {
+        match self {
+            Self::Cpal(stream) => stream.status(),
+            #[cfg(windows)]
+            Self::Wasapi(stream) => stream.status(),
+        }
+    }
+
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,7 +103,7 @@ struct WorkerTelemetry {
 }
 
 pub struct AudioSession {
-    stream: Option<CpalDuplexStream>,
+    stream: Option<AudioStream>,
     stop: Arc<AtomicBool>,
     worker_alive: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
@@ -137,40 +168,20 @@ impl AudioSession {
         runtime: RuntimeContext,
         report: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<Self, String> {
-        let host = recommended_host();
-        let input = select_device(&host, config.input_device.as_deref(), true)?;
-        let output = select_device(&host, config.output_device.as_deref(), false)?;
-        let input_name = input
-            .description()
-            .map_err(|error| error.to_string())?
-            .name()
-            .to_owned();
-        let output_name = output
-            .description()
-            .map_err(|error| error.to_string())?
-            .name()
-            .to_owned();
         let stream_config = StreamConfig {
             format: config.input_format,
             block_frames: config.block_frames,
             queue_blocks: config.queue_blocks,
         };
         let queues = StreamQueueConfig::new(config.queue_blocks, config.queue_blocks.min(2).max(1));
-        let io = StreamIo::new_with_queue_config(stream_config, queues)
+        let (stream, mut worker_io, input_name, output_name) =
+            open_audio_stream(config, stream_config, queues, Arc::clone(&report))?;
+        // Once the device graph is ready, transfer the mutable engine to the
+        // dedicated model worker. The control actor keeps only metadata and
+        // receives the engine back after this worker exits.
+        let engine = runtime
+            .take_engine_for_worker()
             .map_err(|error| error.to_string())?;
-        let (device_io, worker_io) = io.split();
-        let callback_report = Arc::clone(&report);
-        let clock = AudioClock::new();
-        let (stream, mut worker_io) = build_duplex_profiled(
-            &input,
-            &output,
-            stream_config,
-            device_io,
-            worker_io,
-            clock,
-            move |error| callback_report(error.to_string()),
-        )
-        .map_err(|error| error.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_alive = Arc::new(AtomicBool::new(true));
@@ -178,27 +189,37 @@ impl AudioSession {
         let telemetry = Arc::new(WorkerTelemetry::default());
         let worker_telemetry = Arc::clone(&telemetry);
         let format = config.input_format;
+        let conversion = config.conversion;
         let worker_report = Arc::clone(&report);
+        let worker_runtime = runtime.clone();
         let join = thread::Builder::new()
-            .name("vocal-gui-audio-worker".into())
+            .name("vocal-gui-model-worker".into())
             .spawn(move || {
+                #[cfg(windows)]
+                let _mmcss = worker_io.register_mmcss("Pro Audio");
                 let schedule = WorkerSchedule {
                     input_policy: WorkerInputPolicy::Fifo,
                     timeout: Some(WORKER_WAIT),
                 };
                 let mut sequence = 0_u64;
+                let mut engine = Some(engine);
+                let mut failure: Option<(String, String)> = None;
+                let mut report_message: Option<String> = None;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !worker_stop.load(Ordering::Acquire) {
                         let result = worker_io.process_once(schedule, |input, output| {
                             let started = Instant::now();
-                            let chunk = AudioChunk {
-                                format,
-                                samples: input.to_vec(),
-                                sequence,
+                            let converted = match engine
+                                .as_mut()
+                                .expect("model worker engine must remain owned by worker")
+                                .process_samples(format, input, sequence, conversion)
+                            {
+                                Ok(converted) => converted,
+                                Err(error) => {
+                                    failure = Some((error.code().into(), error.to_string()));
+                                    return Err(AudioError::Processing(error.to_string()));
+                                }
                             };
-                            let converted = runtime
-                                .process(&chunk)
-                                .map_err(|error| AudioError::Processing(error.to_string()))?;
                             if converted.samples.len() != output.len() {
                                 return Err(AudioError::BlockSizeMismatch {
                                     expected: output.len(),
@@ -208,7 +229,7 @@ impl AudioSession {
                             output.copy_from_slice(&converted.samples);
                             worker_telemetry
                                 .input_frames
-                                .fetch_add(chunk.frames() as u64, Ordering::Relaxed);
+                                .fetch_add((input.len() / format.channels as usize) as u64, Ordering::Relaxed);
                             worker_telemetry
                                 .output_frames
                                 .fetch_add(converted.frames() as u64, Ordering::Relaxed);
@@ -227,8 +248,11 @@ impl AudioSession {
                             ) => {}
                             Err(error) => {
                                 worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                                if failure.is_none() {
+                                    failure = Some(("audio.worker".into(), error.to_string()));
+                                }
                                 worker_alive_flag.store(false, Ordering::Release);
-                                worker_report(error.to_string());
+                                report_message = Some(error.to_string());
                                 worker_stop.store(true, Ordering::Release);
                                 break;
                             }
@@ -237,11 +261,21 @@ impl AudioSession {
                 }));
                 if result.is_err() {
                     worker_telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                    failure = Some((
+                        "audio.worker_panic".into(),
+                        "audio model worker panicked".into(),
+                    ));
                     worker_alive_flag.store(false, Ordering::Release);
-                    worker_report("audio worker panicked".into());
+                    report_message = Some("audio worker panicked".into());
                     worker_stop.store(true, Ordering::Release);
                 }
                 worker_alive_flag.store(false, Ordering::Release);
+                if let Some(engine) = engine.take() {
+                    let _ = worker_runtime.complete_worker(engine, failure);
+                }
+                if let Some(message) = report_message {
+                    worker_report(message);
+                }
             })
             .map_err(|error| error.to_string())?;
 
@@ -274,6 +308,10 @@ impl AudioSession {
             })
             .unwrap_or_else(|| (0, 0, None, "Stopped".into()));
         let worker_alive = self.worker_alive.load(Ordering::Acquire);
+        let stream_running = self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.status().lifecycle == StreamLifecycle::Running);
         let state = if !worker_alive {
             LifecycleState::Failed
         } else {
@@ -283,7 +321,7 @@ impl AudioSession {
                 .unwrap_or(LifecycleState::Stopped)
         };
         AudioTelemetry {
-            active: self.stream.is_some() && worker_alive,
+            active: self.stream.is_some() && worker_alive && stream_running,
             state,
             input_device: Some(self.input_device.clone()),
             output_device: Some(self.output_device.clone()),
@@ -298,18 +336,114 @@ impl AudioSession {
         }
     }
 
-    /// Reclaim a stream whose worker has already exited. This is called from
-    /// the control-plane snapshot path, so it never runs on the real-time
-    /// callbacks. It deliberately does not join here: a worker may be waiting
-    /// for the application state lock while publishing its failure. Drop owns
-    /// the final join once the control-plane call has returned.
-    pub fn reap_if_dead(&mut self) {
-        if self.worker_alive.load(Ordering::Acquire) {
+    /// Reclaim a stream whose worker or device graph has already exited. This
+    /// is called from the control-plane snapshot path, so it never runs on a
+    /// real-time callback. It deliberately does not join here: Drop owns the
+    /// final join once the control-plane call has returned.
+    pub fn reap_if_unhealthy(&mut self) {
+        let worker_dead = !self.worker_alive.load(Ordering::Acquire);
+        let stream_dead = self.stream.as_ref().is_some_and(|stream| {
+            !matches!(stream.status().lifecycle, StreamLifecycle::Running)
+        });
+        if !worker_dead && !stream_dead {
             return;
         }
         self.stop.store(true, Ordering::Release);
         self.stream.take();
     }
+}
+
+fn open_audio_stream(
+    config: &RuntimeConfig,
+    stream_config: StreamConfig,
+    queues: StreamQueueConfig,
+    report: Arc<dyn Fn(String) + Send + Sync>,
+) -> Result<(AudioStream, WorkerIo, String, String), String> {
+    #[cfg(windows)]
+    {
+        if config.input_device.is_none() && config.output_device.is_none() {
+            let clock = AudioClock::new();
+            match WasapiStream::open_profiled_with_queue_config(
+                stream_config,
+                WasapiMode::SharedEvent,
+                queues,
+                clock,
+            ) {
+                Ok((stream, worker_io)) => {
+                    let host = recommended_host();
+                    let input_name = host
+                        .default_input_device()
+                        .and_then(|device| device.description().ok())
+                        .map(|description| description.name().to_owned())
+                        .unwrap_or_else(|| "Default input".into());
+                    let output_name = host
+                        .default_output_device()
+                        .and_then(|device| device.description().ok())
+                        .map(|description| description.name().to_owned())
+                        .unwrap_or_else(|| "Default output".into());
+                    return Ok((
+                        AudioStream::Wasapi(stream),
+                        worker_io,
+                        input_name,
+                        output_name,
+                    ));
+                }
+                Err(error) => {
+                    // Keep the portable adapter as an explicit runtime
+                    // fallback for drivers that do not expose a compatible
+                    // shared mix format or IAudioClient3 period range.
+                    tracing::warn!(
+                        target: "vocal.gui.audio",
+                        error = %error,
+                        "native WASAPI unavailable; falling back to cpal"
+                    );
+                }
+            }
+        }
+    }
+
+    open_cpal_stream(config, stream_config, queues, report)
+}
+
+fn open_cpal_stream(
+    config: &RuntimeConfig,
+    stream_config: StreamConfig,
+    queues: StreamQueueConfig,
+    report: Arc<dyn Fn(String) + Send + Sync>,
+) -> Result<(AudioStream, WorkerIo, String, String), String> {
+    let host = recommended_host();
+    let input = select_device(&host, config.input_device.as_deref(), true)?;
+    let output = select_device(&host, config.output_device.as_deref(), false)?;
+    let input_name = input
+        .description()
+        .map_err(|error| error.to_string())?
+        .name()
+        .to_owned();
+    let output_name = output
+        .description()
+        .map_err(|error| error.to_string())?
+        .name()
+        .to_owned();
+    let io = StreamIo::new_with_queue_config(stream_config, queues)
+        .map_err(|error| error.to_string())?;
+    let (device_io, worker_io) = io.split();
+    let callback_report = Arc::clone(&report);
+    let (stream, worker_io) = build_duplex_profiled(
+        &input,
+        &output,
+        stream_config,
+        device_io,
+        worker_io,
+        AudioClock::new(),
+        move |error| callback_report(error.to_string()),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((
+        AudioStream::Cpal(stream),
+        worker_io,
+        input_name,
+        output_name,
+    ))
 }
 
 fn map_stream_state(state: vocal_audio::StreamLifecycle) -> LifecycleState {
@@ -326,10 +460,14 @@ fn map_stream_state(state: vocal_audio::StreamLifecycle) -> LifecycleState {
 impl Drop for AudioSession {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        // Stop device callbacks before waiting for the model worker. This
+        // prevents a final callback burst from filling the SPSC rings while
+        // the worker is unwinding and bounds shutdown work to the already
+        // queued audio.
+        self.stream.take();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        self.stream.take();
     }
 }
 

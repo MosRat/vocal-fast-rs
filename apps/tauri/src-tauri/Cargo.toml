@@ -23,7 +23,7 @@ tauri = { version = "2", features = ["tray-icon", "devtools"] }
 vocal-engine = { path = "../../../crates/vocal-engine" }
 vocal-model = { path = "../../../crates/vocal-model" }
 vocal-runtime = { path = "../../../crates/vocal-runtime" }
-vocal-audio = { path = "../../../crates/vocal-audio", features = ["cpal-backend"] }
+vocal-audio = { path = "../../../crates/vocal-audio", features = ["cpal-backend", "wasapi-backend"] }
 cpal = "0.18"
 
 [target.'cfg(windows)'.dependencies]

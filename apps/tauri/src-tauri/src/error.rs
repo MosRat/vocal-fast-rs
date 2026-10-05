@@ -63,6 +63,7 @@ impl From<vocal_runtime::RuntimeError> for GuiError {
                 Self::ConfigConflict { expected, actual }
             }
             vocal_runtime::RuntimeError::Lock => Self::Internal("runtime lock poisoned".into()),
+            vocal_runtime::RuntimeError::ControlClosed(message) => Self::Internal(message),
             vocal_runtime::RuntimeError::Model(error) => Self::from(error),
             vocal_runtime::RuntimeError::Engine(error) => Self::from(error),
             vocal_runtime::RuntimeError::Types(error) => Self::InvalidAudio(error.to_string()),

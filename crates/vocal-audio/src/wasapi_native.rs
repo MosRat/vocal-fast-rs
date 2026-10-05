@@ -464,6 +464,14 @@ fn spawn_render(
 
 struct EventHandle(HANDLE);
 
+// A kernel event handle is process-global and may be transferred between
+// threads. `NativeWasapiStream` only closes it after both endpoint threads
+// have joined, while endpoint threads use it exclusively through the Win32
+// wait/set APIs. The Windows binding intentionally omits these auto traits
+// for raw pointers, so make the ownership guarantee explicit here.
+unsafe impl Send for EventHandle {}
+unsafe impl Sync for EventHandle {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaitResult {
     Audio,

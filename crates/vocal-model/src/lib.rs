@@ -3,6 +3,7 @@
 //! VFRM v1 is close to GGUF's layout: a fixed header, compact JSON
 //! configuration, a binary tensor directory, and aligned tensor bytes.
 
+use serde::Serialize;
 use serde_json::Value;
 use std::{
     fs,
@@ -35,6 +36,73 @@ pub use error::ModelError;
 pub use package::{ModelPackage, RvcModelManifest, Tensor, TensorDType};
 pub use schema::{RVC_TENSOR_SCHEMA, RvcSynthConfig};
 pub use state::{ModelLoadState, ModelLoadStatus};
+
+/// The artifact selected by a model path. Directory inputs are resolved to a
+/// manifest or a unique VFRM cache before loading, so callers share one path
+/// policy instead of implementing subtly different directory heuristics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelArtifactKind {
+    Vfrm,
+    Manifest,
+}
+
+pub fn model_artifact_kind(path: impl AsRef<Path>) -> Option<ModelArtifactKind> {
+    let extension = path
+        .as_ref()
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("vfr") | Some("vfrm") => Some(ModelArtifactKind::Vfrm),
+        Some("json") => Some(ModelArtifactKind::Manifest),
+        _ => None,
+    }
+}
+
+/// Resolve a user supplied model file or model directory to one canonical
+/// artifact. A directory must contain a well-known manifest, or exactly one
+/// VFRM cache. This keeps startup restoration and GUI selection consistent.
+pub fn resolve_model_path(path: impl AsRef<Path>) -> Result<std::path::PathBuf, ModelError> {
+    let input = path.as_ref();
+    if input.is_file() {
+        return Ok(fs::canonicalize(input)?);
+    }
+    if !input.is_dir() {
+        return Err(ModelError::MissingFile(input.to_path_buf()));
+    }
+    for name in ["manifest.json", "model.json", "vocal-fast.json"] {
+        let candidate = input.join(name);
+        if candidate.is_file() {
+            return Ok(fs::canonicalize(candidate)?);
+        }
+    }
+    let mut cache = None;
+    for entry in fs::read_dir(input)? {
+        let candidate = entry?.path();
+        if !candidate.is_file()
+            || !matches!(
+                model_artifact_kind(&candidate),
+                Some(ModelArtifactKind::Vfrm)
+            )
+        {
+            continue;
+        }
+        if cache.replace(candidate).is_some() {
+            return Err(ModelError::UnsupportedModel(format!(
+                "model directory has more than one VFRM cache: {}",
+                input.display()
+            )));
+        }
+    }
+    if let Some(path) = cache {
+        return Ok(fs::canonicalize(path)?);
+    }
+    Err(ModelError::UnsupportedModel(format!(
+        "model directory has no manifest.json, model.json, or unique VFRM cache: {}",
+        input.display()
+    )))
+}
 
 /// Stateful model access facade. It keeps policy and lifecycle information
 /// together while the free functions remain available for simple callers.
@@ -158,6 +226,75 @@ pub fn load_manifest_with_config(
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+/// Read only the manifest embedded in a VFRM cache.
+///
+/// Directory views use this instead of `load_cache_with_config`, so scanning a
+/// model library never allocates the model tensors just to render metadata.
+pub fn inspect_cache_manifest_with_config(
+    path: impl AsRef<Path>,
+    load_config: &ModelLoadConfig,
+) -> Result<RvcModelManifest, ModelError> {
+    load_config.validate()?;
+    let path = path.as_ref();
+    let file_len = fs::metadata(path)?.len();
+    let mut input = io::BufReader::new(fs::File::open(path)?);
+    let mut magic = [0_u8; 8];
+    input.read_exact(&mut magic)?;
+    if &magic != CACHE_MAGIC {
+        return Err(ModelError::InvalidCache("bad magic/version".into()));
+    }
+    let _flags = read_u32(&mut input)?;
+    let header_size = read_u32(&mut input)? as u64;
+    let metadata_len = read_u64(&mut input)?;
+    let tensor_count = read_u64(&mut input)?;
+    let directory_len = read_u64(&mut input)?;
+    let data_offset = read_u64(&mut input)?;
+    let _reserved0 = read_u64(&mut input)?;
+    let _reserved1 = read_u64(&mut input)?;
+    let metadata_end = CACHE_HEADER_BYTES
+        .checked_add(metadata_len)
+        .ok_or_else(|| ModelError::InvalidCache("metadata range overflows".into()))?;
+    let directory_end = metadata_end
+        .checked_add(directory_len)
+        .ok_or_else(|| ModelError::InvalidCache("directory range overflows".into()))?;
+    if header_size != CACHE_HEADER_BYTES
+        || metadata_len > load_config.max_metadata_bytes
+        || tensor_count > load_config.max_tensors
+        || directory_len > load_config.max_tensor_bytes
+        || data_offset < directory_end
+        || data_offset > file_len
+    {
+        return Err(ModelError::InvalidCache("invalid header bounds".into()));
+    }
+    let mut config_bytes = vec![0; metadata_len as usize];
+    input.read_exact(&mut config_bytes)?;
+    let config: Value = serde_json::from_slice(&config_bytes)?;
+    serde_json::from_value(
+        config
+            .get("manifest")
+            .cloned()
+            .ok_or_else(|| ModelError::InvalidCache("config has no manifest".into()))?,
+    )
+    .map_err(ModelError::from)
+}
+
+/// Inspect a supported model artifact without loading its tensor payload.
+pub fn inspect_model_manifest_with_config(
+    path: impl AsRef<Path>,
+    load_config: &ModelLoadConfig,
+) -> Result<RvcModelManifest, ModelError> {
+    let path = path.as_ref();
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("vfr") | Some("vfrm") => inspect_cache_manifest_with_config(path, load_config),
+        _ => load_manifest_with_config(path, load_config),
+    }
+}
+
 pub fn load_directory(
     root: impl AsRef<Path>,
     manifest: RvcModelManifest,
@@ -172,19 +309,13 @@ pub fn load_directory_with_config(
 ) -> Result<ModelPackage, ModelError> {
     load_config.validate()?;
     let root = root.as_ref();
-    let model_path = root.join(&manifest.model_file);
-    if !model_path.is_file() {
-        return Err(ModelError::MissingFile(model_path));
-    }
+    let model_path = manifest_path(root, &manifest.model_file)?;
     let mut tensors = vec![Tensor::byte_tensor(
         "rvc.pth",
         read_bounded_file(&model_path, load_config.max_tensor_bytes)?,
     )];
     if let Some(file) = &manifest.index_file {
-        let path = root.join(file);
-        if !path.is_file() {
-            return Err(ModelError::MissingFile(path));
-        }
+        let path = manifest_path(root, file)?;
         tensors.push(Tensor::byte_tensor(
             "aux.retrieval.faiss",
             read_bounded_file(&path, load_config.max_tensor_bytes)?,
@@ -241,7 +372,7 @@ pub fn load_rvc_directory_with_config(
 ) -> Result<ModelPackage, ModelError> {
     load_config.validate()?;
     let root = root.as_ref();
-    let model_path = root.join(&manifest.model_file);
+    let model_path = manifest_path(root, &manifest.model_file)?;
     let mut package = match model_path
         .extension()
         .and_then(|x| x.to_str())
@@ -260,16 +391,28 @@ pub fn load_rvc_directory_with_config(
         }
     };
     if let Some(file) = &manifest.index_file {
-        let path = root.join(file);
-        if !path.is_file() {
-            return Err(ModelError::MissingFile(path));
-        }
+        let path = manifest_path(root, file)?;
         package.tensors.push(Tensor::byte_tensor(
             "aux.retrieval.faiss",
             read_bounded_file(&path, load_config.max_tensor_bytes)?,
         ));
     }
     Ok(package)
+}
+
+fn manifest_path(root: &Path, relative: &str) -> Result<std::path::PathBuf, ModelError> {
+    let root = fs::canonicalize(root)?;
+    let candidate = root.join(relative);
+    let canonical = match fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(_) => return Err(ModelError::MissingFile(candidate)),
+    };
+    if !canonical.starts_with(&root) {
+        return Err(ModelError::UnsupportedModel(format!(
+            "manifest file escapes model directory: {relative}"
+        )));
+    }
+    Ok(canonical)
 }
 
 /// Parse a known RVC Synthesizer ONNX export. The graph is represented by a
@@ -691,6 +834,53 @@ mod tests {
         assert_eq!(shared_model_cache().len(), 0);
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn inspect_cache_manifest_does_not_load_tensor_payload() {
+        let package = fixture();
+        let path = std::env::temp_dir().join(format!(
+            "vocal-fast-inspect-{}-{}.vfrm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_cache(&path, &package).unwrap();
+        let manifest = inspect_cache_manifest_with_config(&path, &ModelLoadConfig::default())
+            .expect("inspect manifest");
+        assert_eq!(manifest.id, package.manifest.id);
+        assert_eq!(manifest.model_file, package.manifest.model_file);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_model_path_accepts_directory_manifest_and_unique_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "vocal-fast-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("manifest.json");
+        fs::write(&manifest_path, b"{}").unwrap();
+        assert_eq!(
+            resolve_model_path(&root).unwrap(),
+            fs::canonicalize(&manifest_path).unwrap()
+        );
+        fs::remove_file(&manifest_path).unwrap();
+        let cache_path = root.join("voice.vfrm");
+        write_cache(&cache_path, &fixture()).unwrap();
+        assert_eq!(
+            resolve_model_path(&root).unwrap(),
+            fs::canonicalize(&cache_path).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn rejects_shape_byte_mismatch() {
         let tensor = Tensor {

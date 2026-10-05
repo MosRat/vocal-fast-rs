@@ -223,9 +223,11 @@ impl TensorRtConfig {
             precision("VOCAL_TRT_RMVPE_ENCODER_PRECISION", build.rmvpe_precision)?;
         build.rmvpe_decoder_precision =
             precision("VOCAL_TRT_RMVPE_DECODER_PRECISION", build.rmvpe_precision)?;
-        build.synth_precision = precision("VOCAL_TRT_SYNTH_PRECISION", PrecisionMode::Fp32)?;
-        build.synth_resblock_precision =
-            precision("VOCAL_TRT_SYNTH_RESBLOCK_PRECISION", PrecisionMode::Fp32)?;
+        build.synth_precision = precision("VOCAL_TRT_SYNTH_PRECISION", build.synth_precision)?;
+        build.synth_resblock_precision = precision(
+            "VOCAL_TRT_SYNTH_RESBLOCK_PRECISION",
+            build.synth_resblock_precision,
+        )?;
         build.synth_resblock_stage_mask = mask(
             "VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK",
             build.synth_resblock_stage_mask,
@@ -278,7 +280,10 @@ impl TensorRtConfig {
         )?;
         build.synth_fp16_residual_accum = bool_value("VOCAL_TRT_SYNTH_FP16_RESIDUAL_ACCUM", false)?;
         build.synth_fp16_source = bool_value("VOCAL_TRT_SYNTH_FP16_SOURCE", false)?;
-        build.synth_fp16_noise = bool_value("VOCAL_TRT_SYNTH_FP16_NOISE", false)?;
+        build.synth_fp16_noise = bool_value(
+            "VOCAL_TRT_SYNTH_FP16_NOISE",
+            build.synth_precision == PrecisionMode::Fp16 && build.synth_fp16_noise,
+        )?;
         build.synth_fp16_noise_stage_mask = mask(
             "VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK",
             build.synth_fp16_noise_stage_mask,
@@ -286,6 +291,10 @@ impl TensorRtConfig {
         build.synth_fp16_coherent_stage_mask = mask(
             "VOCAL_TRT_SYNTH_FP16_COHERENT_STAGE_MASK",
             build.synth_fp16_coherent_stage_mask,
+        )?;
+        build.synth_fp16_fp32_stage_mask = mask(
+            "VOCAL_TRT_SYNTH_FP16_FP32_STAGE_MASK",
+            build.synth_fp16_fp32_stage_mask,
         )?;
         build.synth_fp16_post = bool_value("VOCAL_TRT_SYNTH_FP16_POST", false)?;
         build.log_build_options = bool_value("VOCAL_TRT_LOG_BUILD_OPTIONS", false)?;
@@ -438,6 +447,11 @@ impl TensorRtConfig {
         if self.build.synth_fp16_coherent_stage_mask & !0x0f != 0 {
             return Err(ConfigError::InvalidCombination(
                 "Synth coherent FP16 stage mask must select only upsample stages 0..=3".into(),
+            ));
+        }
+        if self.build.synth_fp16_fp32_stage_mask & !0x0f != 0 {
+            return Err(ConfigError::InvalidCombination(
+                "Synth FP32 stage mask must select only upsample stages 0..=3".into(),
             ));
         }
         if !self.build.synth_fp16_input_scale.is_finite()
@@ -628,6 +642,7 @@ mod tests {
             "VOCAL_TRT_SYNTH_FP16_NOISE",
             "VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK",
             "VOCAL_TRT_SYNTH_FP16_COHERENT_STAGE_MASK",
+            "VOCAL_TRT_SYNTH_FP16_FP32_STAGE_MASK",
             "VOCAL_TRT_SYNTH_FP16_POST",
         ] {
             unsafe { env::remove_var(name) };
@@ -640,6 +655,11 @@ mod tests {
         clear();
         let config = TensorRtConfig::from_env().expect("default config");
         assert_eq!(config.profile.max_samples, 44_960);
+        assert_eq!(config.build.synth_precision, PrecisionMode::Fp16);
+        assert_eq!(config.build.synth_resblock_precision, PrecisionMode::Fp16);
+        assert_eq!(config.build.synth_resblock_stage_mask, 0x7);
+        assert!(config.build.synth_fp16_noise);
+        assert_eq!(config.build.synth_fp16_fp32_stage_mask, 0x8);
         assert_eq!(config.build.tactic_sources, 3);
         assert!(config.runtime.cuda_graph);
         assert_eq!(config.runtime.graph_cache_size, 2);
@@ -647,6 +667,17 @@ mod tests {
             config.runtime.resolved_graph_mode(),
             GraphReplayMode::NativeSubgraphs
         );
+    }
+
+    #[test]
+    fn fp32_synth_baseline_disables_fp16_noise_by_default() {
+        let _guard = env_lock();
+        clear();
+        unsafe { env::set_var("VOCAL_TRT_SYNTH_PRECISION", "fp32") };
+        let config = TensorRtConfig::from_env().expect("fp32 Synth baseline");
+        assert_eq!(config.build.synth_precision, PrecisionMode::Fp32);
+        assert!(!config.build.synth_fp16_noise);
+        clear();
     }
 
     #[test]
@@ -668,6 +699,7 @@ mod tests {
             env::set_var("VOCAL_TRT_SYNTH_FP16_NOISE", "1");
             env::set_var("VOCAL_TRT_SYNTH_FP16_NOISE_STAGE_MASK", "0x4");
             env::set_var("VOCAL_TRT_SYNTH_FP16_COHERENT_STAGE_MASK", "0x2");
+            env::set_var("VOCAL_TRT_SYNTH_FP16_FP32_STAGE_MASK", "0x8");
             env::set_var("VOCAL_TRT_SYNTH_FP16_POST", "1");
             env::set_var("VOCAL_TRT_GRAPH_CACHE_SIZE", "4");
             env::set_var("VOCAL_TRT_GRAPH_MODE", "hybrid");
@@ -685,6 +717,7 @@ mod tests {
         assert!(config.build.synth_fp16_noise);
         assert_eq!(config.build.synth_fp16_noise_stage_mask, 4);
         assert_eq!(config.build.synth_fp16_coherent_stage_mask, 2);
+        assert_eq!(config.build.synth_fp16_fp32_stage_mask, 8);
         assert!(config.build.synth_fp16_post);
         assert_eq!(config.profile.min_samples, 44_960);
         assert_eq!(config.runtime.graph_cache_size, 4);

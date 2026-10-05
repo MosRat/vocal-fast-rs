@@ -8,6 +8,10 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         require(c&&weights&&options&&out&&c->abi_version==2,"invalid RVC build ABI");
         require(options->min_frames>0&&options->min_frames<=options->opt_frames&&options->opt_frames<=options->max_frames,"invalid frame profile");
         require(options->synth_resblock_stage_mask>=0,"invalid Synth residual stage mask");
+        require(options->precision>=0 && options->precision<=2,
+                "invalid acoustic precision");
+        require(options->synth_precision>=0 && options->synth_precision<=2,
+                "invalid Synth precision");
         require(options->tactic_sources>=0 && options->tactic_sources<=3,
                 "invalid TensorRT tactic source mask");
         require(options->synth_resblock_conv1_precision>=0 && options->synth_resblock_conv1_precision<=2,
@@ -26,6 +30,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 "invalid Synth FP16 noise stage mask");
         require(options->synth_fp16_coherent_stage_mask>=0,
                 "invalid Synth coherent FP16 stage mask");
+        require(options->synth_fp16_fp32_stage_mask>=0,
+                "invalid Synth FP32 stage mask");
         require(options->synth_fp16_post==0 || options->synth_fp16_post==1,
                 "invalid Synth FP16 post option");
         require(std::isfinite(options->synth_fp16_input_scale) &&
@@ -34,22 +40,22 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         if(options->synth_full_fp16 || options->synth_fp16_residual_accum ||
            options->synth_fp16_source || options->synth_fp16_noise ||
            options->synth_fp16_coherent_stage_mask || options->synth_fp16_post) {
-            require(options->precision==1,
+            require(options->synth_precision==1,
                     "Synth FP16 decoder options require FP16 Synth precision");
         }
-        if(options->synth_fp16_noise_stage_mask!=0 && options->precision!=1)
+        if(options->synth_fp16_noise_stage_mask!=0 && options->synth_precision!=1)
             require(false,"Synth FP16 noise stage mask requires FP16 Synth precision");
         require(options->synth_fp16_residual_accum==0 || options->synth_full_fp16!=0,
                 "Synth FP16 residual accumulation requires full FP16 decoder");
         if(options->synth_w8a16_conv2_mask!=0) {
-            require(options->precision==1,
+            require(options->synth_precision==1,
                     "Synth W8A16 requires Synth FP16 activation precision");
             require(options->quantize_weights==0,
                     "Synth W8A16 mask cannot be combined with global weight-only INT8");
         }
         auto w8a8_mask=options->synth_w8a8_conv1_mask|options->synth_w8a8_conv2_mask;
         if(w8a8_mask!=0) {
-            require(options->precision==1,
+            require(options->synth_precision==1,
                     "Synth W8A8 requires Synth FP16 activation precision");
             require(options->quantize_weights==0,
                     "Synth W8A8 mask cannot be combined with global weight-only INT8");
@@ -71,6 +77,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                 "Synth FP16 noise stage mask exceeds upsample stages");
         require((static_cast<uint32_t>(options->synth_fp16_coherent_stage_mask)&~valid_stage_mask)==0,
                 "Synth coherent FP16 stage mask exceeds upsample stages");
+        require((static_cast<uint32_t>(options->synth_fp16_fp32_stage_mask)&~valid_stage_mask)==0,
+                "Synth FP32 stage mask exceeds upsample stages");
         require((static_cast<uint32_t>(options->synth_resblock_conv1_stage_mask)&~valid_stage_mask)==0 &&
                     (static_cast<uint32_t>(options->synth_resblock_conv2_stage_mask)&~valid_stage_mask)==0,
                 "Synth residual operation mask exceeds upsample stages");
@@ -143,8 +151,10 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         auto z=g.encoder(feats_internal,pitch,length,rnd_internal,mask);
         auto speaker=g.reshape(g.gather(g.parameter("emb_g.weight",dims({c->speakers,c->speaker_channels})),sid,0),dims({1,c->speaker_channels,1}));
         z=g.flow(z,mask,speaker);
-        if(options->precision!=0) {
+        if(options->precision!=0)
             g.use_low_precision();
+        if(options->precision!=0 || options->synth_precision!=0) {
+            g.use_synth_precision();
             z=g.cast_real(z);
             speaker=g.cast_real(speaker);
         // Keep F0 and deterministic NSF noise in FP32 by default. The
@@ -153,7 +163,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
         // phase accumulation is more sensitive than Conv arithmetic.
         }
         auto audio=g.decoder(z,speaker,pitchf,noise);
-        if(options->precision!=0) audio=g.cast(audio,DataType::kFLOAT);
+        if(options->precision!=0 || options->synth_precision!=0)
+            audio=g.cast(audio,DataType::kFLOAT);
         g.mark(audio,"audio");
         require(g.used.size()==count,"not every canonical weight was consumed");
         require(bc->addOptimizationProfile(profile)>=0,"addOptimizationProfile");
@@ -168,6 +179,8 @@ extern "C" int vocal_trt_build_rvc(Config const* c,Weight const* weights,size_t 
                     ", synth_fp16_noise=" + std::to_string(options->synth_fp16_noise) +
                     ", synth_fp16_noise_stage_mask=" + std::to_string(options->synth_fp16_noise_stage_mask) +
                     ", synth_fp16_coherent_stage_mask=" + std::to_string(options->synth_fp16_coherent_stage_mask) +
+                    ", synth_fp16_fp32_stage_mask=" + std::to_string(options->synth_fp16_fp32_stage_mask) +
+                    ", synth_precision=" + std::to_string(options->synth_precision) +
                     ", synth_fp16_post=" + std::to_string(options->synth_fp16_post) +
                     ", fused_hubert_qkv=" + std::to_string(options->fused_qkv) +
                     ", fused_rvc_qkv=" + std::to_string(options->fused_rvc_qkv) +

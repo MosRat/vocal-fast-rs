@@ -33,6 +33,63 @@ impl NativeTensorRtBuilder {
         Self { options }
     }
 
+    /// Convert the public typed build policy into the stable native ABI once.
+    /// All graph entry points use the same option layout; only their profile
+    /// dimensions and graph-specific weight directories differ.
+    fn native_options(
+        &self,
+        timing_cache: Option<&CString>,
+        rmvpe_external_stft: i32,
+    ) -> NativeOptions {
+        NativeOptions {
+            workspace: self.options.workspace_bytes,
+            min_frames: self.options.min_frames,
+            opt_frames: self.options.opt_frames,
+            max_frames: self.options.max_frames,
+            debug_outputs: self.options.debug_outputs as i32,
+            fp16: self.options.fp16 as i32,
+            fused_attention: self.options.fused_attention as i32,
+            precision: self.options.precision.code(),
+            synth_precision: self.options.synth_precision.code(),
+            quantize_weights: self.options.quantize_weights as i32,
+            fused_qkv: self.options.fused_qkv as i32,
+            dispatch_tune: self.options.dispatch_tune.code(),
+            synth_resblock_precision: self.options.synth_resblock_precision.code(),
+            synth_resblock_stage_mask: self.options.synth_resblock_stage_mask as i32,
+            synth_resblock_conv1_precision: self.options.synth_resblock_conv1_precision.code(),
+            synth_resblock_conv1_stage_mask: self.options.synth_resblock_conv1_stage_mask as i32,
+            synth_resblock_conv2_precision: self.options.synth_resblock_conv2_precision.code(),
+            synth_resblock_conv2_stage_mask: self.options.synth_resblock_conv2_stage_mask as i32,
+            synth_w8a16_conv2_mask: self.options.synth_w8a16_conv2_mask,
+            synth_w8a8_conv1_mask: self.options.synth_w8a8_conv1_mask,
+            synth_w8a8_conv2_mask: self.options.synth_w8a8_conv2_mask,
+            synth_w8a8_activation_scale: self.options.synth_w8a8_activation_scale,
+            synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
+            synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
+            synth_full_fp16: self.options.synth_full_fp16 as i32,
+            synth_fp16_input_scale: self.options.synth_fp16_input_scale,
+            synth_fp16_residual_accum: self.options.synth_fp16_residual_accum as i32,
+            synth_fp16_source: self.options.synth_fp16_source as i32,
+            synth_fp16_noise: self.options.synth_fp16_noise as i32,
+            synth_fp16_noise_stage_mask: self.options.synth_fp16_noise_stage_mask as i32,
+            synth_fp16_coherent_stage_mask: self.options.synth_fp16_coherent_stage_mask as i32,
+            synth_fp16_fp32_stage_mask: self.options.synth_fp16_fp32_stage_mask as i32,
+            synth_fp16_post: self.options.synth_fp16_post as i32,
+            rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
+            rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
+            rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
+            rmvpe_gru_precision: self.options.rmvpe_gru_precision.code(),
+            rmvpe_logits_precision: self.options.rmvpe_logits_precision.code(),
+            rmvpe_debug_outputs: self.options.rmvpe_debug_outputs as i32,
+            rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
+            fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
+            hubert_feature_precision: self.options.hubert_feature_precision.code(),
+            rmvpe_external_stft,
+            tactic_sources: self.options.tactic_sources as i32,
+            timing_cache_path: timing_cache.map_or(ptr::null(), |path| path.as_ptr()),
+        }
+    }
+
     pub fn compile_onnx_file(&self, onnx: impl AsRef<Path>) -> Result<PathBuf, NativeBuildError> {
         self.compile_onnx_file_with_profile(onnx, OnnxProfileKind::Frames)
     }
@@ -121,6 +178,7 @@ impl NativeTensorRtBuilder {
                 synth_fp16_noise = self.options.synth_fp16_noise,
                 synth_fp16_noise_stage_mask = format_args!("0x{:x}", self.options.synth_fp16_noise_stage_mask),
                 synth_fp16_coherent_stage_mask = format_args!("0x{:x}", self.options.synth_fp16_coherent_stage_mask),
+                synth_fp16_fp32_stage_mask = format_args!("0x{:x}", self.options.synth_fp16_fp32_stage_mask),
                 synth_fp16_post = self.options.synth_fp16_post,
                 "building native RVC Synth plan"
             );
@@ -133,53 +191,7 @@ impl NativeTensorRtBuilder {
             .ok_or_else(|| NativeBuildError::Argument("missing rvc_config".into()))?;
         let native_config = abi::native_config(&config)?;
         let timing_cache = self.timing_cache_cstring()?;
-        let options = NativeOptions {
-            workspace: self.options.workspace_bytes,
-            min_frames: self.options.min_frames,
-            opt_frames: self.options.opt_frames,
-            max_frames: self.options.max_frames,
-            debug_outputs: self.options.debug_outputs as i32,
-            fp16: self.options.fp16 as i32,
-            fused_attention: self.options.fused_attention as i32,
-            precision: self.options.precision.code(),
-            quantize_weights: self.options.quantize_weights as i32,
-            fused_qkv: self.options.fused_qkv as i32,
-            dispatch_tune: self.options.dispatch_tune.code(),
-            synth_resblock_precision: self.options.synth_resblock_precision.code(),
-            synth_resblock_stage_mask: self.options.synth_resblock_stage_mask as i32,
-            synth_resblock_conv1_precision: self.options.synth_resblock_conv1_precision.code(),
-            synth_resblock_conv1_stage_mask: self.options.synth_resblock_conv1_stage_mask as i32,
-            synth_resblock_conv2_precision: self.options.synth_resblock_conv2_precision.code(),
-            synth_resblock_conv2_stage_mask: self.options.synth_resblock_conv2_stage_mask as i32,
-            synth_w8a16_conv2_mask: self.options.synth_w8a16_conv2_mask,
-            synth_w8a8_conv1_mask: self.options.synth_w8a8_conv1_mask,
-            synth_w8a8_conv2_mask: self.options.synth_w8a8_conv2_mask,
-            synth_w8a8_activation_scale: self.options.synth_w8a8_activation_scale,
-            synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
-            synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
-            synth_full_fp16: self.options.synth_full_fp16 as i32,
-            synth_fp16_input_scale: self.options.synth_fp16_input_scale,
-            synth_fp16_residual_accum: self.options.synth_fp16_residual_accum as i32,
-            synth_fp16_source: self.options.synth_fp16_source as i32,
-            synth_fp16_noise: self.options.synth_fp16_noise as i32,
-            synth_fp16_noise_stage_mask: self.options.synth_fp16_noise_stage_mask as i32,
-            synth_fp16_coherent_stage_mask: self.options.synth_fp16_coherent_stage_mask as i32,
-            synth_fp16_post: self.options.synth_fp16_post as i32,
-            rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
-            rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
-            rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
-            rmvpe_gru_precision: self.options.rmvpe_gru_precision.code(),
-            rmvpe_logits_precision: self.options.rmvpe_logits_precision.code(),
-            rmvpe_debug_outputs: self.options.rmvpe_debug_outputs as i32,
-            rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
-            fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
-            hubert_feature_precision: self.options.hubert_feature_precision.code(),
-            rmvpe_external_stft: 0,
-            tactic_sources: self.options.tactic_sources as i32,
-            timing_cache_path: timing_cache
-                .as_ref()
-                .map_or(ptr::null(), |path| path.as_ptr()),
-        };
+        let options = self.native_options(timing_cache.as_ref(), 0);
 
         let canonical = package
             .tensors
@@ -277,53 +289,7 @@ impl NativeTensorRtBuilder {
         let _plan =
             crate::acoustic::AcousticGraphPlan::from_package(package, AcousticKind::Hubert)?;
         let timing_cache = self.timing_cache_cstring()?;
-        let mut options = abi::NativeOptions {
-            workspace: self.options.workspace_bytes,
-            min_frames: self.options.min_frames,
-            opt_frames: self.options.opt_frames,
-            max_frames: self.options.max_frames,
-            debug_outputs: self.options.debug_outputs as i32,
-            fp16: self.options.fp16 as i32,
-            fused_attention: self.options.fused_attention as i32,
-            precision: self.options.precision.code(),
-            quantize_weights: self.options.quantize_weights as i32,
-            fused_qkv: self.options.fused_qkv as i32,
-            dispatch_tune: self.options.dispatch_tune.code(),
-            synth_resblock_precision: self.options.synth_resblock_precision.code(),
-            synth_resblock_stage_mask: self.options.synth_resblock_stage_mask as i32,
-            synth_resblock_conv1_precision: self.options.synth_resblock_conv1_precision.code(),
-            synth_resblock_conv1_stage_mask: self.options.synth_resblock_conv1_stage_mask as i32,
-            synth_resblock_conv2_precision: self.options.synth_resblock_conv2_precision.code(),
-            synth_resblock_conv2_stage_mask: self.options.synth_resblock_conv2_stage_mask as i32,
-            synth_w8a16_conv2_mask: self.options.synth_w8a16_conv2_mask,
-            synth_w8a8_conv1_mask: self.options.synth_w8a8_conv1_mask,
-            synth_w8a8_conv2_mask: self.options.synth_w8a8_conv2_mask,
-            synth_w8a8_activation_scale: self.options.synth_w8a8_activation_scale,
-            synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
-            synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
-            synth_full_fp16: self.options.synth_full_fp16 as i32,
-            synth_fp16_input_scale: self.options.synth_fp16_input_scale,
-            synth_fp16_residual_accum: self.options.synth_fp16_residual_accum as i32,
-            synth_fp16_source: self.options.synth_fp16_source as i32,
-            synth_fp16_noise: self.options.synth_fp16_noise as i32,
-            synth_fp16_noise_stage_mask: self.options.synth_fp16_noise_stage_mask as i32,
-            synth_fp16_coherent_stage_mask: self.options.synth_fp16_coherent_stage_mask as i32,
-            synth_fp16_post: self.options.synth_fp16_post as i32,
-            rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
-            rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
-            rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
-            rmvpe_gru_precision: self.options.rmvpe_gru_precision.code(),
-            rmvpe_logits_precision: self.options.rmvpe_logits_precision.code(),
-            rmvpe_debug_outputs: self.options.rmvpe_debug_outputs as i32,
-            rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
-            fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
-            hubert_feature_precision: self.options.hubert_feature_precision.code(),
-            rmvpe_external_stft: 0,
-            tactic_sources: self.options.tactic_sources as i32,
-            timing_cache_path: timing_cache
-                .as_ref()
-                .map_or(ptr::null(), |path| path.as_ptr()),
-        };
+        let mut options = self.native_options(timing_cache.as_ref(), 0);
         options.min_frames = self.options.min_samples;
         options.opt_frames = self.options.opt_samples;
         options.max_frames = self.options.max_samples;
@@ -545,53 +511,10 @@ impl NativeTensorRtBuilder {
             })
             .collect::<Result<Vec<_>, NativeBuildError>>()?;
         let timing_cache = self.timing_cache_cstring()?;
-        let mut options = abi::NativeOptions {
-            workspace: self.options.workspace_bytes,
-            min_frames: self.options.min_frames,
-            opt_frames: self.options.opt_frames,
-            max_frames: self.options.max_frames,
-            debug_outputs: self.options.debug_outputs as i32,
-            fp16: self.options.fp16 as i32,
-            fused_attention: self.options.fused_attention as i32,
-            precision: self.options.precision.code(),
-            quantize_weights: self.options.quantize_weights as i32,
-            fused_qkv: self.options.fused_qkv as i32,
-            dispatch_tune: self.options.dispatch_tune.code(),
-            synth_resblock_precision: self.options.synth_resblock_precision.code(),
-            synth_resblock_stage_mask: self.options.synth_resblock_stage_mask as i32,
-            synth_resblock_conv1_precision: self.options.synth_resblock_conv1_precision.code(),
-            synth_resblock_conv1_stage_mask: self.options.synth_resblock_conv1_stage_mask as i32,
-            synth_resblock_conv2_precision: self.options.synth_resblock_conv2_precision.code(),
-            synth_resblock_conv2_stage_mask: self.options.synth_resblock_conv2_stage_mask as i32,
-            synth_w8a16_conv2_mask: self.options.synth_w8a16_conv2_mask,
-            synth_w8a8_conv1_mask: self.options.synth_w8a8_conv1_mask,
-            synth_w8a8_conv2_mask: self.options.synth_w8a8_conv2_mask,
-            synth_w8a8_activation_scale: self.options.synth_w8a8_activation_scale,
-            synth_fuse_resblock_scale: self.options.synth_fuse_resblock_scale as i32,
-            synth_polyphase_upsample: self.options.synth_polyphase_upsample as i32,
-            synth_full_fp16: self.options.synth_full_fp16 as i32,
-            synth_fp16_input_scale: self.options.synth_fp16_input_scale,
-            synth_fp16_residual_accum: self.options.synth_fp16_residual_accum as i32,
-            synth_fp16_source: self.options.synth_fp16_source as i32,
-            synth_fp16_noise: self.options.synth_fp16_noise as i32,
-            synth_fp16_noise_stage_mask: self.options.synth_fp16_noise_stage_mask as i32,
-            synth_fp16_coherent_stage_mask: self.options.synth_fp16_coherent_stage_mask as i32,
-            synth_fp16_post: self.options.synth_fp16_post as i32,
-            rmvpe_encoder_precision: self.options.rmvpe_encoder_precision.code(),
-            rmvpe_decoder_precision: self.options.rmvpe_decoder_precision.code(),
-            rmvpe_stft_precision: self.options.rmvpe_stft_precision.code(),
-            rmvpe_gru_precision: self.options.rmvpe_gru_precision.code(),
-            rmvpe_logits_precision: self.options.rmvpe_logits_precision.code(),
-            rmvpe_debug_outputs: self.options.rmvpe_debug_outputs as i32,
-            rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
-            fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
-            hubert_feature_precision: self.options.hubert_feature_precision.code(),
-            rmvpe_external_stft: self.options.rmvpe_fft_cufft as i32,
-            tactic_sources: self.options.tactic_sources as i32,
-            timing_cache_path: timing_cache
-                .as_ref()
-                .map_or(ptr::null(), |path| path.as_ptr()),
-        };
+        let mut options = self.native_options(
+            timing_cache.as_ref(),
+            self.options.rmvpe_fft_cufft as i32,
+        );
         // RMVPE's waveform binding is profiled in complete 160-sample hops.
         // Keep the measured application sample points exact; the graph itself
         // exposes the additional STFT boundary frame at runtime (`T/160+1`)

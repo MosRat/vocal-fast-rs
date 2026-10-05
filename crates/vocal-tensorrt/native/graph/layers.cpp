@@ -21,8 +21,12 @@ T Layers::cast_real(T x) {
 void Layers::use_low_precision() {
     active_type=o.precision==1 ? DataType::kHALF : o.precision==2 ? DataType::kBF16 : DataType::kFLOAT;
 }
+void Layers::use_synth_precision() {
+    active_type=o.synth_precision==1 ? DataType::kHALF :
+        o.synth_precision==2 ? DataType::kBF16 : DataType::kFLOAT;
+}
 bool Layers::w8a16_selected(std::string const& name) const {
-    if(o.synth_w8a16_conv2_mask==0 || o.precision!=1) return false;
+    if(o.synth_w8a16_conv2_mask==0 || o.synth_precision!=1) return false;
     int block=-1,suffix=-1;
     auto const* text=name.c_str();
     if(std::sscanf(text,"dec.resblocks.%d.convs2.%d",&block,&suffix)!=2) return false;
@@ -76,7 +80,7 @@ Weights Layers::w(std::string const& name) {
     low_constants.emplace_back(static_cast<size_t>(p.count));
     auto& dst=low_constants.back();
     for(int64_t i=0;i<p.count;++i)
-        dst[static_cast<size_t>(i)]=o.precision==1?float_to_half_bits(p.scalar(i)):float_to_bf16_bits(p.scalar(i));
+        dst[static_cast<size_t>(i)]=real_type()==DataType::kHALF?float_to_half_bits(p.scalar(i)):float_to_bf16_bits(p.scalar(i));
     return {real_type(),dst.data(),p.count};
 }
 Weights Layers::w_scaled(std::string const& name,float scale) {
@@ -90,7 +94,7 @@ Weights Layers::w_scaled(std::string const& name,float scale) {
     low_constants.emplace_back(static_cast<size_t>(p.count));
     auto& dst=low_constants.back();
     for(int64_t i=0;i<p.count;++i)
-        dst[static_cast<size_t>(i)]=o.precision==1?float_to_half_bits(values[static_cast<size_t>(i)]):float_to_bf16_bits(values[static_cast<size_t>(i)]);
+        dst[static_cast<size_t>(i)]=real_type()==DataType::kHALF?float_to_half_bits(values[static_cast<size_t>(i)]):float_to_bf16_bits(values[static_cast<size_t>(i)]);
     return {real_type(),dst.data(),p.count};
 }
 T Layers::quantized_parameter(std::string const& name,Dims d,int axis) {
@@ -143,7 +147,7 @@ T Layers::constant(std::vector<float> data,Dims d) {
     }
     low_constants.emplace_back(data.size()); auto& v=low_constants.back();
     for(size_t i=0;i<data.size();++i)
-        v[i]=o.precision==1?float_to_half_bits(data[i]):float_to_bf16_bits(data[i]);
+        v[i]=real_type()==DataType::kHALF?float_to_half_bits(data[i]):float_to_bf16_bits(data[i]);
     return output(n.addConstant(d,{real_type(),v.data(),static_cast<int64_t>(v.size())}));
 }
 T Layers::integer(std::vector<int32_t> data,Dims d) { ints.push_back(std::move(data)); auto& v=ints.back(); return output(n.addConstant(d,{DataType::kINT32,v.data(),static_cast<int64_t>(v.size())})); }
@@ -193,7 +197,7 @@ T Layers::conv(T x,std::string const& p,int stride,int dilation,int padding,bool
             low_constants.emplace_back(static_cast<size_t>(channels));
             auto& low=low_constants.back();
             for (int i=0;i<channels;++i)
-                low[static_cast<size_t>(i)]=o.precision==1?float_to_half_bits(0.0f):float_to_bf16_bits(0.0f);
+                low[static_cast<size_t>(i)]=real_type()==DataType::kHALF?float_to_half_bits(0.0f):float_to_bf16_bits(0.0f);
             bias_weights={real_type(),low.data(),channels};
         }
     }
@@ -266,10 +270,10 @@ T Layers::fused_qkv_conv(T x,std::string const& p,int channels) {
     } else {
         low_constants.emplace_back(stable_kernel.size()); auto& low_kernel=low_constants.back();
         for(size_t i=0;i<stable_kernel.size();++i)
-            low_kernel[i]=o.precision==1?float_to_half_bits(stable_kernel[i]):float_to_bf16_bits(stable_kernel[i]);
+            low_kernel[i]=real_type()==DataType::kHALF?float_to_half_bits(stable_kernel[i]):float_to_bf16_bits(stable_kernel[i]);
         low_constants.emplace_back(stable_bias.size()); auto& low_bias=low_constants.back();
         for(size_t i=0;i<stable_bias.size();++i)
-            low_bias[i]=o.precision==1?float_to_half_bits(stable_bias[i]):float_to_bf16_bits(stable_bias[i]);
+            low_bias[i]=real_type()==DataType::kHALF?float_to_half_bits(stable_bias[i]):float_to_bf16_bits(stable_bias[i]);
         fused_weights={real_type(),low_kernel.data(),static_cast<int64_t>(low_kernel.size())};
         fused_bias={real_type(),low_bias.data(),static_cast<int64_t>(low_bias.size())};
     }
@@ -350,11 +354,11 @@ T Layers::polyphase_deconv(T x,std::string const& p,int stride,int padding,float
             low_constants.emplace_back(phase_weights.size());
             auto& low_kernel=low_constants.back();
             for(size_t i=0;i<phase_weights.size();++i)
-                low_kernel[i]=o.precision==1?float_to_half_bits(phase_weights[i]):float_to_bf16_bits(phase_weights[i]);
+                low_kernel[i]=real_type()==DataType::kHALF?float_to_half_bits(phase_weights[i]):float_to_bf16_bits(phase_weights[i]);
             low_constants.emplace_back(phase_bias.size());
             auto& low_bias=low_constants.back();
             for(size_t i=0;i<phase_bias.size();++i)
-                low_bias[i]=o.precision==1?float_to_half_bits(phase_bias[i]):float_to_bf16_bits(phase_bias[i]);
+                low_bias[i]=real_type()==DataType::kHALF?float_to_half_bits(phase_bias[i]):float_to_bf16_bits(phase_bias[i]);
             phase_kernel={real_type(),low_kernel.data(),static_cast<int64_t>(low_kernel.size())};
             phase_bias_weights={real_type(),low_bias.data(),static_cast<int64_t>(low_bias.size())};
         }

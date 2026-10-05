@@ -1,10 +1,23 @@
 # Synth FP16 policy
 
-The Synth generator uses a fixed profile and keeps the numerical boundary
-explicit.  The production candidate is mixed precision: the high cost
-upsample/deconvolution path uses FP16, while the NSF source, noise convolutions,
-residual accumulation, and final projection remain in FP32.  The aggressive
-full decoder mode is available for experiments only.
+The default Synth policy is the validated `mixed012` recipe.  Acoustic
+front-end and flow computations remain FP32 (`VOCAL_TRT_PRECISION=fp32`), while
+the Synth decoder has its own precision field (`VOCAL_TRT_SYNTH_PRECISION`):
+
+* decoder stages 0, 1 and 2 use FP16 upsample/deconvolution, NSF noise
+  convolution and residual convolutions;
+* residual branch sums and stage averages stay FP32;
+* stage 3, which runs at waveform rate, is entirely FP32;
+* NSF phase/source construction, `conv_pre`, `conv_post` and `tanh` stay FP32.
+
+The corresponding defaults are `synth_precision=fp16`, residual mask `0x7`,
+`synth_fp16_noise=true` and FP32 stage mask `0x8`.  The public graph ABI remains
+FP32, so the decoder input and final audio have explicit casts at its boundary.
+The aggressive full-decoder FP16 mode remains available for experiments only.
+
+The native graph now carries Synth precision separately from acoustic
+precision.  This is required for the default to actually use Tensor Cores in
+Synth without silently converting HuBERT/RMVPE to FP16.
 
 ## Weight storage
 
@@ -19,7 +32,13 @@ When the graph type matches the stored type, Synth `Layers::w()` passes the
 F16 build-time conversion without changing the graph's arithmetic or public
 I/O.
 
-## Fixed 44960 result
+## Earlier boundary sweep
+
+The measurements in this section predate the separate Synth precision ABI and
+are retained as historical experiments.  The current default multi-model
+result is in [real-model-mixed012-benchmark.md](real-model-mixed012-benchmark.md).
+
+## Fixed 44960 result (historical)
 
 The following measurements use `target/tsukuyomi-canonical.vfr`,
 `target/compare/sine-44960.vin`, a static 281-frame profile, and the RTX 3060.
@@ -89,8 +108,11 @@ deployment.
 
 ```powershell
 $env:VOCAL_TRT_PROFILE = "realtime_44960"
-$env:VOCAL_TRT_PRECISION = "fp16"
+$env:VOCAL_TRT_PRECISION = "fp32"
 $env:VOCAL_TRT_SYNTH_PRECISION = "fp16"
+$env:VOCAL_TRT_SYNTH_FP16_NOISE = "1"
+$env:VOCAL_TRT_SYNTH_RESBLOCK_STAGE_MASK = "0x7"
+$env:VOCAL_TRT_SYNTH_FP16_FP32_STAGE_MASK = "0x8"
 $env:VOCAL_TRT_MIN_FRAMES = "281"
 $env:VOCAL_TRT_OPT_FRAMES = "281"
 $env:VOCAL_TRT_MAX_FRAMES = "281"

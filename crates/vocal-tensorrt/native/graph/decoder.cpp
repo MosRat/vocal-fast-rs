@@ -24,8 +24,12 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     // precision while the boundary avoids an unnecessary half round-trip.
     DataType decoder_type=real_type();
     bool full_fp16=decoder_type==DataType::kHALF && o.synth_full_fp16!=0;
-    auto coherent_stage=[&](int stage) {
+    auto fp32_stage=[&](int stage) {
         return decoder_type==DataType::kHALF &&
+            ((static_cast<uint32_t>(o.synth_fp16_fp32_stage_mask) >> stage) & 1u) != 0;
+    };
+    auto coherent_stage=[&](int stage) {
+        return decoder_type==DataType::kHALF && !fp32_stage(stage) &&
             ((static_cast<uint32_t>(o.synth_fp16_coherent_stage_mask) >> stage) & 1u) != 0;
     };
     // Keep the large pre-projection activation in a compact FP16 range.  The
@@ -92,6 +96,14 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
     bool fuse_residual_scale=o.synth_fuse_resblock_scale!=0;
     float residual_scale=1.0f/static_cast<float>(c.resblock_count);
     for(int i=0;i<c.upsample_count;i++) {
+        bool keep_fp32=fp32_stage(i);
+        if(keep_fp32) {
+            active_type=DataType::kFLOAT;
+            if(x->getType()!=DataType::kFLOAT) x=cast(x,DataType::kFLOAT);
+        } else if(decoder_type!=DataType::kFLOAT && x->getType()!=decoder_type) {
+            active_type=decoder_type;
+            x=cast(x,decoder_type);
+        }
         float input_scale=fuse_residual_scale && i>0?residual_scale:1.0f;
         if (i==0) input_scale/=decoder_input_scale;
         auto up_prefix="dec.ups."+std::to_string(i);
@@ -103,7 +115,7 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         if(o.debug_outputs)mark(x,("decoder_up_"+std::to_string(i)).c_str());
         if(harmonic) {
             int tail=1;for(int j=i+1;j<c.upsample_count;j++)tail*=c.rates[j];
-            bool noise_low=decoder_type==DataType::kHALF &&
+            bool noise_low=decoder_type==DataType::kHALF && !keep_fp32 &&
                 (full_fp16 || o.synth_fp16_noise!=0 ||
                  coherent_stage(i) ||
                  ((o.synth_fp16_noise_stage_mask >> i) & 1) != 0);
@@ -113,8 +125,10 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             } else if(decoder_type!=DataType::kFLOAT) {
                 active_type=DataType::kFLOAT;
                 x=add(cast(x,DataType::kFLOAT),conv(harmonic,"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
-                active_type=decoder_type;
-                x=cast(x,decoder_type);
+                if(!keep_fp32) {
+                    active_type=decoder_type;
+                    x=cast(x,decoder_type);
+                }
             } else {
                 x=add(x,conv(harmonic,"dec.noise_convs."+std::to_string(i),tail,1,i+1==c.upsample_count?0:tail/2));
             }
@@ -125,12 +139,13 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
         // mode keeps x in the decoder type and avoids two cast kernels per
         // stage. Noise convolution can independently use the decoder type via
         // the stage mask while source phase arithmetic remains FP32.
-        bool residual_low=decoder_type!=DataType::kFLOAT && o.synth_resblock_precision!=0 &&
+        bool residual_low=!keep_fp32 && decoder_type!=DataType::kFLOAT && o.synth_resblock_precision!=0 &&
             ((o.synth_resblock_stage_mask >> i) & 1) != 0;
         bool coherent_low=coherent_stage(i);
-        bool residual_compute_low=full_fp16 || residual_low || coherent_low;
-        bool residual_accum_low=(full_fp16 && o.synth_fp16_residual_accum!=0) ||
-            residual_low || coherent_low;
+        bool residual_compute_low=!keep_fp32 && (full_fp16 || residual_low || coherent_low);
+        bool residual_accum_low=!keep_fp32 &&
+            ((full_fp16 && o.synth_fp16_residual_accum!=0) ||
+             residual_low || coherent_low);
         DataType accum_type=residual_accum_low?decoder_type:DataType::kFLOAT;
         if(accum_type==DataType::kFLOAT) {
             if(decoder_type!=DataType::kFLOAT) {
@@ -196,7 +211,9 @@ T Layers::decoder(T z,T speaker,T pitchf,T noise) {
             active_type=accum_type;
             x=scale(sum,residual_scale);
         }
-        if(accum_type==DataType::kFLOAT && decoder_type!=DataType::kFLOAT) {
+        if(accum_type==DataType::kFLOAT &&
+           decoder_type!=DataType::kFLOAT &&
+           !keep_fp32) {
             active_type=decoder_type;
             x=cast(x,decoder_type);
         }

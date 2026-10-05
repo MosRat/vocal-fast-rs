@@ -162,17 +162,16 @@ pub struct NativeBuildOptions {
     pub rmvpe_logits_precision: PrecisionMode,
     #[serde(default)]
     pub synth_precision: PrecisionMode,
-    /// Precision used by Synth HiFi-GAN residual blocks.  A value different
-    /// from Fp32 removes the per-stage FP32 round trip and lets TensorRT use
-    /// low-precision convolution tactics.  The default remains Fp32 because
-    /// residual accumulation is the most sensitive decoder region.
+    /// Precision used by Synth HiFi-GAN residual blocks. The default FP16
+    /// value applies only to the first three decoder stages through
+    /// `synth_resblock_stage_mask`; the residual sum remains FP32.
     #[serde(default)]
     pub synth_resblock_precision: PrecisionMode,
     /// Bit mask of upsample stages whose residual blocks use the selected
     /// low precision. Bit 0 is the first decoder stage; the last bit is the
     /// highest temporal-resolution stage after all preceding upsampling.
-    /// Zero keeps all residual stages in FP32; the mask is ignored for an
-    /// FP32 Synth graph.
+    /// The default `0x7` selects stages 0..2. The mask is ignored for an FP32
+    /// Synth graph.
     #[serde(default)]
     pub synth_resblock_stage_mask: u32,
     /// Optional per-operation precision override for residual `convs1`.
@@ -253,6 +252,11 @@ pub struct NativeBuildOptions {
     /// by their dedicated switches.
     #[serde(default)]
     pub synth_fp16_coherent_stage_mask: u32,
+    /// Stages that must remain entirely FP32 when Synth uses FP16. The
+    /// default `0x8` keeps the final waveform-rate stage FP32 while stages 0..2
+    /// use the mixed FP16 recipe.
+    #[serde(default = "default_synth_fp16_fp32_stage_mask")]
+    pub synth_fp16_fp32_stage_mask: u32,
     /// Run only the final learned `conv_post` projection in FP16, then cast
     /// its result back to FP32 for tanh. The projection is small, so this is
     /// kept as a diagnostic knob rather than a default optimization.
@@ -281,6 +285,10 @@ pub(crate) fn default_w8a8_activation_scale() -> f32 {
 
 pub(crate) fn default_synth_fp16_input_scale() -> f32 {
     1.0
+}
+
+pub(crate) const fn default_synth_fp16_fp32_stage_mask() -> u32 {
+    0x8
 }
 
 pub(crate) fn default_tactic_sources() -> u32 {
@@ -324,9 +332,9 @@ impl Default for NativeBuildOptions {
             rmvpe_stft_precision: PrecisionMode::Fp32,
             rmvpe_gru_precision: PrecisionMode::Fp32,
             rmvpe_logits_precision: PrecisionMode::Fp32,
-            synth_precision: PrecisionMode::Fp32,
-            synth_resblock_precision: PrecisionMode::Fp32,
-            synth_resblock_stage_mask: 0,
+            synth_precision: PrecisionMode::Fp16,
+            synth_resblock_precision: PrecisionMode::Fp16,
+            synth_resblock_stage_mask: 0x7,
             synth_resblock_conv1_precision: PrecisionMode::Fp32,
             synth_resblock_conv1_stage_mask: 0,
             synth_resblock_conv2_precision: PrecisionMode::Fp32,
@@ -341,9 +349,13 @@ impl Default for NativeBuildOptions {
             synth_fp16_input_scale: default_synth_fp16_input_scale(),
             synth_fp16_residual_accum: false,
             synth_fp16_source: false,
-            synth_fp16_noise: false,
+            // The validated mixed012 recipe keeps the learned NSF noise
+            // convolutions in the same FP16 region as stages 0..2. Stage 3
+            // is still forced back to FP32 by synth_fp16_fp32_stage_mask.
+            synth_fp16_noise: true,
             synth_fp16_noise_stage_mask: 0,
             synth_fp16_coherent_stage_mask: 0,
+            synth_fp16_fp32_stage_mask: default_synth_fp16_fp32_stage_mask(),
             synth_fp16_post: false,
             log_build_options: false,
             dispatch_tune: DispatchTune::Auto,

@@ -28,6 +28,7 @@ struct Layers {
     Weights w(std::string const& name);
     Weights w_scaled(std::string const& name, float scale);
     DataType real_type() const;
+    void use_synth_precision();
     T cast_real(T x);
     void use_low_precision();
     bool w8a16_selected(std::string const& name) const;

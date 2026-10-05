@@ -90,6 +90,10 @@ struct Options {
     // 0 = FP32, 1 = FP16, 2 = BF16. Acoustic graphs keep public I/O in
     // FP32 and cast to this type at the graph boundary.
     int32_t precision;
+    // Synth decoder precision is independent from the acoustic graphs. This
+    // lets the default pipeline keep HuBERT/RMVPE in FP32 while using the
+    // measured mixed FP16 decoder recipe.
+    int32_t synth_precision;
     // Experimental explicit INT8 weight-only path. Activations remain in the
     // selected floating-point type; the graph uses per-output-channel DQ
     // weights so TensorRT can choose weight-only INT8 tactics when available.
@@ -137,6 +141,8 @@ struct Options {
     int32_t synth_fp16_noise;
     int32_t synth_fp16_noise_stage_mask;
     int32_t synth_fp16_coherent_stage_mask;
+    // Stages forced to the FP32 decoder path while the rest uses FP16.
+    int32_t synth_fp16_fp32_stage_mask;
     int32_t synth_fp16_post;
     // RMVPE mixed-precision regions. Public I/O remains FP32. STFT, GRU, and
     // logits are fixed to FP32 by the native graph; their fields document the

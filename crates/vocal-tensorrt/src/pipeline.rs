@@ -144,6 +144,7 @@ pub const RMVPE_REALTIME_SAMPLES: usize = 4_960;
 pub const RVC_F0_CACHE_FRAMES: usize = 1_024;
 const RVC_F0_LEFT_TRIM: usize = 3;
 const RVC_F0_RIGHT_TRIM: usize = 1;
+const SYNTH_RANDOM_SEED: u64 = 0x4d595df4d0f33173;
 
 const fn round_up_samples(samples: usize, hop: usize) -> usize {
     if samples == 0 {
@@ -923,12 +924,13 @@ pub struct RvcTrtPipeline {
     synth_return_length: CudaBuffer,
     synth_tail_controls: bool,
     synth_tail_mode: bool,
-    // Reused host staging for the deterministic baseline latent/source
-    // fixtures. Keeping these vectors across calls removes allocator and
-    // per-element byte-conversion work from the realtime hot path.
-    host_rnd: Vec<f32>,
+    // Reused host staging for the Synth stochastic latent/source inputs.
+    // RVC samples both tensors from a standard normal distribution on every
+    // inference; keeping the vectors allocated avoids allocator churn while
+    // the PRNG state advances between callbacks.
     host_rnd_active: Vec<f32>,
     host_noise: Vec<f32>,
+    random_state: u64,
     last_sid: Option<i32>,
     last_p_len: Option<i32>,
     last_synth_return_length: Option<i32>,
@@ -939,7 +941,6 @@ pub struct RvcTrtPipeline {
     // machine through FFI on every invocation.
     hubert_frame_shape: Option<(usize, usize)>,
     pitch_frame_shape: Option<(usize, bool, usize)>,
-    rnd_frame_shape: Option<(usize, usize)>,
     shape_key: Option<PipelineShapeKey>,
     native_cuda_graphs: bool,
     graph_mode: GraphReplayMode,
@@ -1147,7 +1148,7 @@ impl RvcTrtPipeline {
         let pitch_cache_scratch = alloc(RVC_F0_CACHE_FRAMES * 4)?;
         pitch_cache.zero()?;
         pitch_cache_scratch.zero()?;
-        let mut pipeline = Self {
+        let pipeline = Self {
             config,
             profile: p.clone(),
             hubert,
@@ -1191,9 +1192,9 @@ impl RvcTrtPipeline {
             synth_return_length: alloc(4)?,
             synth_tail_controls,
             synth_tail_mode: artifacts.synth_tail_mode,
-            host_rnd: Vec::with_capacity(latent * p.max_rvc_frames as usize),
             host_rnd_active: Vec::with_capacity(latent * p.max_rvc_frames as usize),
             host_noise: Vec::with_capacity(p.max_rvc_frames as usize * up),
+            random_state: SYNTH_RANDOM_SEED,
             last_sid: None,
             last_p_len: None,
             last_synth_return_length: None,
@@ -1201,7 +1202,6 @@ impl RvcTrtPipeline {
             rmvpe_debug_outputs,
             hubert_frame_shape: None,
             pitch_frame_shape: None,
-            rnd_frame_shape: None,
             shape_key: None,
             native_cuda_graphs,
             graph_mode,
@@ -1226,30 +1226,8 @@ impl RvcTrtPipeline {
             hybrid_decode_capturable: false,
             hybrid_graph_cache: Vec::with_capacity(graph_cache_capacity),
         };
-        pipeline.seed_static_inputs(latent, up)?;
         pipeline.threshold.upload_f32(&[0.03_f32])?;
         Ok(pipeline)
-    }
-
-    /// Seed the deterministic baseline latent/source buffers once. Every
-    /// runtime shape reads a prefix of these max-profile allocations, so no
-    /// per-block host generation or upload is needed during graph replay.
-    fn seed_static_inputs(&mut self, latent: usize, up: usize) -> Result<(), NativeBuildError> {
-        self.host_rnd.clear();
-        self.host_rnd
-            .reserve(latent * self.profile.max_rvc_frames as usize);
-        for i in 0..(latent * self.profile.max_rvc_frames as usize) {
-            self.host_rnd.push(0.01_f32 * ((i as f32) * 0.017).sin());
-        }
-        self.host_noise.clear();
-        self.host_noise
-            .reserve(self.profile.max_rvc_frames as usize * up);
-        for i in 0..(self.profile.max_rvc_frames as usize * up) {
-            self.host_noise.push(0.001_f32 * ((i as f32) * 0.013).sin());
-        }
-        self.rnd.upload_f32(&self.host_rnd)?;
-        self.nsf_noise.upload_f32(&self.host_noise)?;
-        Ok(())
     }
 
     /// Enable intermediate downloads for parity/debug reports. Keep this off
@@ -1312,7 +1290,7 @@ impl RvcTrtPipeline {
         self.last_sid = None;
         self.last_p_len = None;
         self.last_synth_return_length = None;
-        self.rnd_frame_shape = None;
+        self.random_state = SYNTH_RANDOM_SEED;
         self.shape_key = None;
         self.native_graph_shape = None;
         self.native_graph_invalidations = self.native_graph_invalidations.saturating_add(1);
@@ -2031,27 +2009,15 @@ impl RvcTrtPipeline {
             self.last_sid = Some(sid);
         }
         let frame_offset = 0usize;
-        if self.rnd_frame_shape != Some((rvc_frames, synth_frames)) {
-            self.host_rnd_active.clear();
-            let max_frames = self.profile.max_rvc_frames as usize;
-            let latent = self.config.latent_channels as usize;
-            self.host_rnd_active
-                .reserve(latent.saturating_mul(synth_frames));
-            for channel in 0..latent {
-                let start = channel
-                    .saturating_mul(max_frames)
-                    .saturating_add(frame_offset);
-                let end = start.saturating_add(synth_frames);
-                if end > self.host_rnd.len() {
-                    return Err(NativeBuildError::Argument(
-                        "Synth latent slice exceeds seeded random buffer".into(),
-                    ));
-                }
-                self.host_rnd_active
-                    .extend_from_slice(&self.host_rnd[start..end]);
-            }
-            self.rnd.upload_f32(&self.host_rnd_active)?;
-            self.rnd_frame_shape = Some((rvc_frames, synth_frames));
+        let latent = self.config.latent_channels as usize;
+        self.host_rnd_active
+            .resize(latent.saturating_mul(synth_frames), 0.0);
+        fill_standard_normal(&mut self.host_rnd_active, &mut self.random_state);
+        self.rnd.upload_f32(&self.host_rnd_active)?;
+        if self.config.uses_f0 {
+            self.host_noise.resize(synth_frames.saturating_mul(up), 0.0);
+            fill_standard_normal(&mut self.host_noise, &mut self.random_state);
+            self.nsf_noise.upload_f32(&self.host_noise)?;
         }
         self.synth.set_tensor_address_cached(
             "feats",
@@ -2580,6 +2546,26 @@ fn concrete_dim(shape: &[i64], axis: usize, fallback: usize) -> Result<usize, Na
     }
 }
 
+fn fill_standard_normal(values: &mut [f32], state: &mut u64) {
+    for pair in values.chunks_mut(2) {
+        let u1 = next_uniform(state);
+        let u2 = next_uniform(state);
+        let radius = (-2.0_f32 * u1.ln()).sqrt();
+        let angle = std::f32::consts::TAU * u2;
+        pair[0] = radius * angle.cos();
+        if let Some(value) = pair.get_mut(1) {
+            *value = radius * angle.sin();
+        }
+    }
+}
+
+fn next_uniform(state: &mut u64) -> f32 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1);
+    ((*state >> 32) as f32 + 1.0) / 4_294_967_297.0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameShape {
     hubert: usize,
@@ -2623,8 +2609,8 @@ fn realtime_crop_for_samples(samples: usize, rvc_frames: usize) -> (usize, usize
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphReplayMode, RvcCudaGraphStats, RvcRealtimeConfig, RvcTrtProfile, frame_shape,
-        realtime_crop_for_samples,
+        GraphReplayMode, RvcCudaGraphStats, RvcRealtimeConfig, RvcTrtProfile, SYNTH_RANDOM_SEED,
+        fill_standard_normal, frame_shape, realtime_crop_for_samples,
     };
 
     #[test]
@@ -2803,6 +2789,16 @@ mod tests {
     fn realtime_crop_matches_reference_skip_head() {
         assert_eq!(realtime_crop_for_samples(11_200, 70), (8, 62));
         assert_eq!(realtime_crop_for_samples(44_960, 281), (250, 31));
+    }
+
+    #[test]
+    fn synth_random_source_is_finite_and_not_a_repeating_tone() {
+        let mut state = SYNTH_RANDOM_SEED;
+        let mut values = vec![0.0_f32; 4096];
+        fill_standard_normal(&mut values, &mut state);
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values.iter().any(|value| value.abs() > 2.0));
+        assert_ne!(&values[..32], &values[32..64]);
     }
 
     #[test]

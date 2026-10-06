@@ -102,6 +102,9 @@ pub struct TensorRtEngine {
     realtime_config: RvcRealtimeConfig,
     stream_config: RvcRealtimeConfig,
     realtime_buffers: RealtimeBufferState,
+    /// Rolling input level used by Applio's realtime output envelope. It
+    /// suppresses decoder residue when the callback stream enters silence.
+    input_level_buffer: Vec<f32>,
     /// Reference workers execute the model while the context window is being
     /// filled, but publish silence for these initial blocks. Keeping this
     /// counter outside the TensorRT pipeline also clears SOLA state exactly
@@ -173,6 +176,7 @@ impl TensorRtEngine {
         let window = StreamingWindow::new(window_samples)?;
         let realtime_config = realtime_config_for_window(window_samples);
         let warmup_remaining = warmup_blocks_for_window(window_samples, realtime_config);
+        let input_level_buffer = vec![0.0; realtime_level_window(realtime_config)];
         Ok(Self {
             pipeline,
             window,
@@ -193,6 +197,7 @@ impl TensorRtEngine {
             realtime_config,
             stream_config: realtime_config,
             realtime_buffers: RealtimeBufferState::default(),
+            input_level_buffer,
             warmup_remaining,
         })
     }
@@ -201,6 +206,7 @@ impl TensorRtEngine {
         self.window.reset();
         self.output_joiner.reset();
         self.realtime_buffers.reset();
+        self.input_level_buffer.fill(0.0);
         self.warmup_remaining =
             warmup_blocks_for_window(self.window.target_samples(), self.realtime_config);
         self.pipeline
@@ -270,6 +276,7 @@ impl TensorRtEngine {
             realtime_config.sola_search_samples_16k,
         );
         self.realtime_buffers.reset();
+        self.input_level_buffer = vec![0.0; realtime_level_window(realtime_config)];
         self.warmup_remaining = warmup_blocks_for_window(window_samples, realtime_config);
         self.speaker_id = backend.speaker_id;
         Ok(())
@@ -339,6 +346,7 @@ impl TensorRtEngine {
         config: ConversionConfig,
     ) -> Result<Vec<f32>, EngineError> {
         let advance_frames = internal.len().div_ceil(160).clamp(1, 1023);
+        let input_rms = self.update_input_level(internal);
         let window = self.window.push(internal)?;
         let output = self
             .pipeline
@@ -382,11 +390,18 @@ impl TensorRtEngine {
             self.warmup_remaining -= 1;
             return Ok(vec![0.0; block_frames]);
         }
-        let converted = crate::pipeline::resample_linear(
+        let mut converted = crate::pipeline::resample_linear(
             &model_audio,
             self.model_sample_rate,
             format.sample_rate,
         );
+        // Applio scales the realtime decoder output by the rolling callback
+        // RMS before resampling. Besides preserving perceived loudness, this
+        // prevents a neural decoder from sustaining a mechanical residue
+        // after the input has gone quiet.
+        for sample in &mut converted {
+            *sample *= input_rms;
+        }
         if let Some(directory) = std::env::var_os("VOCAL_TRT_DUMP_STREAM_BLOCKS") {
             let path = std::path::PathBuf::from(directory).join(format!("block-{sequence:04}.f32"));
             let bytes = converted
@@ -534,6 +549,34 @@ fn realtime_config_for_window(window_samples: usize) -> RvcRealtimeConfig {
 fn warmup_blocks_for_window(window_samples: usize, realtime: RvcRealtimeConfig) -> usize {
     let chunk = realtime.chunk_samples_16k.max(1);
     window_samples.div_ceil(chunk).saturating_add(1)
+}
+
+fn realtime_level_window(realtime: RvcRealtimeConfig) -> usize {
+    realtime
+        .chunk_samples_16k
+        .saturating_add(realtime.crossfade_samples_16k)
+        .max(1)
+}
+
+impl TensorRtEngine {
+    fn update_input_level(&mut self, internal: &[f32]) -> f32 {
+        let window = self.input_level_buffer.len();
+        if internal.len() >= window {
+            self.input_level_buffer
+                .copy_from_slice(&internal[internal.len() - window..]);
+        } else {
+            self.input_level_buffer.copy_within(internal.len().., 0);
+            let start = window - internal.len();
+            self.input_level_buffer[start..].copy_from_slice(internal);
+        }
+        let mean_square = self
+            .input_level_buffer
+            .iter()
+            .map(|sample| sample * sample)
+            .sum::<f32>()
+            / window as f32;
+        mean_square.sqrt()
+    }
 }
 
 fn crop_realtime_audio(

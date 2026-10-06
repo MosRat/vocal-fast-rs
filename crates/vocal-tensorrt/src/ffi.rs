@@ -53,6 +53,10 @@ pub(crate) struct CudaGraphExec {
 pub(crate) struct CufftFrontend {
     _private: [u8; 0],
 }
+#[repr(C)]
+pub(crate) struct RetrievalGpuIndex {
+    _private: [u8; 0],
+}
 
 unsafe extern "C" {
     pub(crate) fn vocal_trt_set_log_callback(
@@ -151,6 +155,32 @@ unsafe extern "C" {
         error: *mut *mut c_char,
     ) -> i32;
     pub(crate) fn vocal_cufft_frontend_destroy(frontend: *mut CufftFrontend);
+    pub(crate) fn vocal_faiss_gpu_create(
+        dimensions: i32,
+        nlist: i32,
+        nprobe: i32,
+        vector_count: usize,
+        centroids: *const f32,
+        centroid_count: usize,
+        offsets: *const i32,
+        offset_count: usize,
+        vectors: *const f32,
+        vector_value_count: usize,
+        ids: *const i32,
+        id_count: usize,
+        out: *mut *mut RetrievalGpuIndex,
+        error: *mut *mut c_char,
+    ) -> i32;
+    pub(crate) fn vocal_faiss_gpu_destroy(index: *mut RetrievalGpuIndex);
+    pub(crate) fn vocal_faiss_gpu_blend(
+        index: *mut RetrievalGpuIndex,
+        features: *mut f32,
+        frames: usize,
+        width: i32,
+        index_rate: *const f32,
+        stream: *mut Stream,
+        error: *mut *mut c_char,
+    ) -> i32;
     pub(crate) fn vocal_trt_build_bytes(
         handle: *mut Build,
         data: *mut *mut u8,

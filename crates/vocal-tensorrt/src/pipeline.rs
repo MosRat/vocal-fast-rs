@@ -11,11 +11,12 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use vocal_model::{ModelPackage, RvcSynthConfig};
+use vocal_model::{ModelPackage, RetrievalIndex, RvcSynthConfig};
 
 use crate::timing::CudaEvent;
 use crate::{
-    CudaBuffer, CudaGraphExec, CudaStream, OwnedContext, PinnedHostRing, Runtime,
+    CudaBuffer, CudaGraphExec, CudaStream, GpuRetrievalIndex, OwnedContext, PinnedHostRing,
+    Runtime,
     builder::NativeTensorRtBuilder,
     config::{DiagnosticsConfig, GraphReplayMode, PipelineRuntimeConfig, TensorRtConfig},
     cufft::{CufftFrontend, unique_shapes},
@@ -751,6 +752,7 @@ impl RvcTrtPipelineArtifacts {
 pub struct RvcTrtTimings {
     pub upload_ms: f64,
     pub hubert_enqueue_ms: f64,
+    pub retrieval_enqueue_ms: f64,
     pub rmvpe_enqueue_ms: f64,
     pub frontend_enqueue_ms: f64,
     pub synth_enqueue_ms: f64,
@@ -806,6 +808,8 @@ struct PipelineShapeKey {
 struct StageEvents {
     hubert_start: CudaEvent,
     hubert_end: CudaEvent,
+    retrieval_start: CudaEvent,
+    retrieval_end: CudaEvent,
     rmvpe_start: CudaEvent,
     rmvpe_end: CudaEvent,
     frontend_start: CudaEvent,
@@ -899,6 +903,10 @@ pub struct RvcTrtPipeline {
     audio_host_ring: PinnedHostRing,
     threshold: CudaBuffer,
     hubert_features: CudaBuffer,
+    retrieval: Option<GpuRetrievalIndex>,
+    retrieval_ratio: CudaBuffer,
+    last_retrieval_ratio: f32,
+    active_hubert_frames: usize,
     pitchf_raw: CudaBuffer,
     rmvpe_magnitude: CudaBuffer,
     p_len: CudaBuffer,
@@ -1034,6 +1042,25 @@ impl RvcTrtPipeline {
         runtime_config: PipelineRuntimeConfig,
         diagnostics: DiagnosticsConfig,
     ) -> Result<Self, NativeBuildError> {
+        Self::load_with_runtime_config_and_retrieval(
+            artifacts,
+            config,
+            runtime_config,
+            diagnostics,
+            None,
+        )
+    }
+
+    /// Load a pipeline and optionally transfer a parsed RVC FAISS index to
+    /// device memory. The CPU parser remains owned by the caller; only the
+    /// normalized arrays are copied into the GPU resident retrieval handle.
+    pub fn load_with_runtime_config_and_retrieval(
+        artifacts: &RvcTrtPipelineArtifacts,
+        config: RvcSynthConfig,
+        runtime_config: PipelineRuntimeConfig,
+        diagnostics: DiagnosticsConfig,
+        retrieval: Option<&RetrievalIndex>,
+    ) -> Result<Self, NativeBuildError> {
         artifacts.profile.validate()?;
         if runtime_config.graph_cache_size == 0 || runtime_config.graph_cache_size > 64 {
             return Err(NativeBuildError::Argument(
@@ -1114,6 +1141,8 @@ impl RvcTrtPipeline {
         let stage_events = StageEvents {
             hubert_start: CudaEvent::new()?,
             hubert_end: CudaEvent::new()?,
+            retrieval_start: CudaEvent::new()?,
+            retrieval_end: CudaEvent::new()?,
             rmvpe_start: CudaEvent::new()?,
             rmvpe_end: CudaEvent::new()?,
             frontend_start: CudaEvent::new()?,
@@ -1143,6 +1172,7 @@ impl RvcTrtPipeline {
             || rmvpe_realtime.has_tensor("rmvpe_debug_mel")?;
         let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs || plan_has_rmvpe_debug_outputs;
         let debug_intermediates = diagnostics.debug_intermediates;
+        let retrieval = retrieval.map(GpuRetrievalIndex::new).transpose()?;
         let rmvpe_max_padded_frames = ((p.max_pitch_frames as usize + 31) / 32) * 32;
         let pitch_cache = alloc(RVC_F0_CACHE_FRAMES * 4)?;
         let pitch_cache_scratch = alloc(RVC_F0_CACHE_FRAMES * 4)?;
@@ -1171,6 +1201,10 @@ impl RvcTrtPipeline {
             audio_host_ring: PinnedHostRing::new(3, p.max_rvc_frames as usize * up * 4)?,
             threshold: alloc(4)?,
             hubert_features: alloc(p.max_hubert_frames as usize * 768 * 4)?,
+            retrieval,
+            retrieval_ratio: alloc(4)?,
+            last_retrieval_ratio: 0.0,
+            active_hubert_frames: 0,
             pitchf_raw: alloc(p.max_pitch_frames as usize * 4)?,
             rmvpe_magnitude: alloc(p.max_pitch_frames as usize * 513 * 4)?,
             p_len: alloc(4)?,
@@ -1227,7 +1261,34 @@ impl RvcTrtPipeline {
             hybrid_graph_cache: Vec::with_capacity(graph_cache_capacity),
         };
         pipeline.threshold.upload_f32(&[0.03_f32])?;
+        pipeline.retrieval_ratio.upload_f32(&[0.0_f32])?;
         Ok(pipeline)
+    }
+
+    pub fn has_retrieval_index(&self) -> bool {
+        self.retrieval.is_some()
+    }
+
+    /// Set the RVC feature index blend ratio. The value is uploaded through
+    /// the pipeline stream and remains at a fixed device address, so changing
+    /// it does not invalidate an already captured CUDA graph.
+    pub fn set_retrieval_ratio(&mut self, ratio: f32) -> Result<(), NativeBuildError> {
+        if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+            return Err(NativeBuildError::Argument(
+                "retrieval ratio must be finite and in [0, 1]".into(),
+            ));
+        }
+        if ratio > 0.0 && self.retrieval.is_none() {
+            return Err(NativeBuildError::Argument(
+                "retrieval ratio is non-zero but no FAISS index is loaded".into(),
+            ));
+        }
+        if (ratio - self.last_retrieval_ratio).abs() > f32::EPSILON {
+            self.control_host_ring
+                .upload_f32(&self.retrieval_ratio, &[ratio], &self.stream)?;
+            self.last_retrieval_ratio = ratio;
+        }
+        Ok(())
     }
 
     /// Enable intermediate downloads for parity/debug reports. Keep this off
@@ -1383,6 +1444,13 @@ impl RvcTrtPipeline {
         }
         self.hubert
             .enqueue_named(&self.stream, Some("rvc.hubert"))?;
+        if self.retrieval.is_some() {
+            self.stage_events.retrieval_start.record(&self.stream)?;
+        }
+        self.enqueue_retrieval(&self.stream)?;
+        if self.retrieval.is_some() {
+            self.stage_events.retrieval_end.record(&self.stream)?;
+        }
         self.stage_events.hubert_end.record(&self.stream)?;
         self.stage_events.rmvpe_start.record(&self.stream)?;
         if self.rmvpe_external_stft {
@@ -1473,6 +1541,18 @@ impl RvcTrtPipeline {
         Ok(())
     }
 
+    fn enqueue_retrieval(&self, stream: &CudaStream) -> Result<(), NativeBuildError> {
+        if let Some(index) = self.retrieval.as_ref() {
+            index.blend(
+                &self.hubert_features,
+                self.active_hubert_frames,
+                &self.retrieval_ratio,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Run HuBERT and RMVPE on independent streams after the waveform upload
     /// has completed.  Their outputs are consumed only after both streams are
     /// synchronized, so frontend/Synth retain the same ordering and bindings
@@ -1499,6 +1579,17 @@ impl RvcTrtPipeline {
         }
         self.hubert
             .enqueue_named(&self.acoustic_hubert_stream, Some("rvc.hubert"))?;
+        if self.retrieval.is_some() {
+            self.stage_events
+                .retrieval_start
+                .record(&self.acoustic_hubert_stream)?;
+        }
+        self.enqueue_retrieval(&self.acoustic_hubert_stream)?;
+        if self.retrieval.is_some() {
+            self.stage_events
+                .retrieval_end
+                .record(&self.acoustic_hubert_stream)?;
+        }
         self.stage_events
             .hubert_end
             .record(&self.acoustic_hubert_stream)?;
@@ -2069,6 +2160,7 @@ impl RvcTrtPipeline {
             f0_advance_frames: advance_frames,
             streaming_f0,
         };
+        self.active_hubert_frames = hubert_frames;
         if (self.cuda_graphs && !self.external_graph_capability_checked)
             || (self.hybrid_cuda_graphs && !self.hybrid_graph_capability_checked)
         {
@@ -2367,6 +2459,13 @@ impl RvcTrtPipeline {
             .stage_events
             .hubert_start
             .elapsed(&self.stage_events.hubert_end)?;
+        let retrieval_enqueue_ms = if self.retrieval.is_some() {
+            self.stage_events
+                .retrieval_start
+                .elapsed(&self.stage_events.retrieval_end)?
+        } else {
+            0.0
+        };
         let rmvpe_enqueue_ms = self
             .stage_events
             .rmvpe_start
@@ -2527,6 +2626,7 @@ impl RvcTrtPipeline {
             timings: RvcTrtTimings {
                 upload_ms,
                 hubert_enqueue_ms,
+                retrieval_enqueue_ms,
                 rmvpe_enqueue_ms,
                 frontend_enqueue_ms,
                 synth_enqueue_ms,

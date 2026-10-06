@@ -60,6 +60,10 @@ struct CudaGraphExec { cudaGraphExec_t exec{}; };
 // cuFFT-backed RMVPE STFT frontend. The plan and scratch buffers are owned by
 // the native handle and are created before CUDA graph capture starts.
 struct CufftFrontend;
+// GPU-resident IVF-Flat retrieval index. The object owns all FAISS payloads
+// after construction; the runtime path only supplies a HuBERT feature buffer,
+// a device-side index ratio, and the inference stream.
+struct RetrievalGpuIndex;
 // Versioned C data contract, independent of TensorRT C++ layouts. Rust validates
 // the canonical package before passing these borrowed arrays for the build call.
 // `data` is an F32 build-time mirror.  For VFRM F16/BF16 tensors `data16`
@@ -230,6 +234,18 @@ extern "C" int vocal_cufft_frontend_enqueue(
     CufftFrontend* frontend, void const* waveform, size_t waveform_bytes,
     Memory* magnitude, Stream* stream, char** error) noexcept;
 extern "C" void vocal_cufft_frontend_destroy(CufftFrontend* frontend) noexcept;
+
+extern "C" int vocal_faiss_gpu_create(
+    int32_t dimensions, int32_t nlist, int32_t nprobe, size_t vector_count,
+    float const* centroids, size_t centroid_count,
+    int32_t const* offsets, size_t offset_count,
+    float const* vectors, size_t vector_value_count,
+    int32_t const* ids, size_t id_count,
+    RetrievalGpuIndex** out, char** error) noexcept;
+extern "C" void vocal_faiss_gpu_destroy(RetrievalGpuIndex* index) noexcept;
+extern "C" int vocal_faiss_gpu_blend(
+    RetrievalGpuIndex* index, float* features, size_t frames, int32_t width,
+    float const* index_rate, Stream* stream, char** error) noexcept;
 
 // Pinned host staging is used by the realtime waveform ring. The async copy
 // does not block the producer and is ordered on the pipeline CUDA stream.

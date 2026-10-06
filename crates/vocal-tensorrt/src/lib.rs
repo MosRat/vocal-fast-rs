@@ -16,6 +16,7 @@ mod config;
 mod cufft;
 mod error;
 mod options;
+mod retrieval;
 mod runtime;
 mod timing;
 
@@ -37,6 +38,7 @@ pub use pipeline::{
     RMVPE_REALTIME_SAMPLES, RVC_F0_CACHE_FRAMES, RvcCudaGraphStats, RvcRealtimeConfig,
     RvcTrtOutput, RvcTrtPipeline, RvcTrtPipelineArtifacts, RvcTrtProfile, RvcTrtTimings,
 };
+pub use retrieval::GpuRetrievalIndex;
 pub use runtime::{
     Context, CudaBuffer, CudaGraphCapture, CudaGraphExec, CudaStream, OwnedContext,
     PinnedHostBuffer, PinnedHostRing, Runtime,

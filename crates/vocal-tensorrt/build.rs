@@ -37,6 +37,7 @@ fn main() {
         "native/frontend.cpp",
         "native/serialization.cpp",
         "native/plugin.cpp",
+        "native/retrieval.cu",
         "native/cufft_frontend.cu",
         "native/graph/layers.h",
         "native/graph/layers.cpp",
@@ -110,6 +111,7 @@ fn main() {
         .arg("-I")
         .arg(c.join("include"))
         .arg("native/cufft_frontend.cu")
+        .arg("native/retrieval.cu")
         .arg("-o")
         .arg(&cufft_lib)
         .status()

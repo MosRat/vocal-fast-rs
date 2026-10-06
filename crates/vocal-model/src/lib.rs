@@ -21,6 +21,7 @@ mod logging;
 mod onnx;
 mod package;
 mod pickle;
+mod retrieval;
 mod schema;
 mod state;
 
@@ -34,6 +35,7 @@ pub use config::{
 };
 pub use error::ModelError;
 pub use package::{ModelPackage, RvcModelManifest, Tensor, TensorDType};
+pub use retrieval::RetrievalIndex;
 pub use schema::{RVC_TENSOR_SCHEMA, RvcSynthConfig};
 pub use state::{ModelLoadState, ModelLoadStatus};
 

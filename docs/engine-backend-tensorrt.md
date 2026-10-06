@@ -13,6 +13,7 @@ AudioChunk (interleaved, caller rate)
   -> fixed profile StreamingWindow (left zero pad, latest context)
   -> RvcTrtPipeline
        waveform H2D -> HuBERT/RMVPE/frontend (full context)
+       HuBERT -> GPU IVF-Flat FAISS top-8 blend (optional)
        -> Synth (trailing skip_head/return_length frames) -> audio D2H
   -> model-rate resample to caller rate
   -> SOLA search + crossfade of the extended block
@@ -61,7 +62,13 @@ TensorRT runtime and diagnostic policy is parsed once through
 `TensorRtConfig::from_env`, so graph mode, asynchronous audio D2H, and debug
 switches use the same typed configuration as the CLI benchmark commands.
 
-The current native graph has no feature-index input or pitch-shift control.
-The adapter therefore rejects non-zero `index_ratio` and
-`pitch_semitones`, and accepts the native protection value (`0.33`). RMS mix
-is applied to the returned block on the host, after the final D2H copy.
+The VFRM package may contain `aux.retrieval.faiss`, a bounded RVC
+`IndexIVFFlat,Flat,L2` payload. When present, TensorRT loads the index into a
+CUDA-resident handle at startup. Each HuBERT frame searches the configured IVF
+lists, takes the reference top-8 neighbors, applies inverse-square distance
+weights, and blends in place before the native frontend. The ratio is held in
+a one-element device buffer, so changing `ConversionConfig.index_ratio` does
+not invalidate CUDA Graph replay. A non-zero ratio without a package index is
+rejected. `pitch_semitones` is still rejected by this native frontend profile,
+and the native protection value remains `0.33`. RMS mix is applied to the
+returned block on the host, after the final D2H copy.

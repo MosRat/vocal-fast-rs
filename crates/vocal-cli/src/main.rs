@@ -325,12 +325,15 @@ fn test_trt_pipeline(
             run_config.warmup = 10;
         }
     }
-    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config(
+    let retrieval = vocal_model::RetrievalIndex::from_package(&package)?;
+    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config_and_retrieval(
         &artifacts,
         config,
         runtime_config.clone(),
         diagnostics.clone(),
+        retrieval.as_ref(),
     )?;
+    pipeline.set_retrieval_ratio(retrieval_ratio_from_env()?)?;
     // Intermediate D2H copies are opt-in for parity diagnostics. Nsight mode
     // keeps all activations device-resident and measures the production path.
     let debug_intermediates = diagnostics.debug_intermediates;
@@ -389,6 +392,7 @@ fn test_trt_pipeline(
             "synth_frames": result.synth_frames,
             "output_samples": result.audio.len(), "timings_ms": {
                 "upload": result.timings.upload_ms, "hubert": result.timings.hubert_enqueue_ms,
+                "retrieval": result.timings.retrieval_enqueue_ms,
                 "rmvpe": result.timings.rmvpe_enqueue_ms, "frontend": result.timings.frontend_enqueue_ms,
                 "synth": result.timings.synth_enqueue_ms, "total": result.timings.total_ms,
             },
@@ -423,12 +427,15 @@ fn run_trt_pipeline(
         return Err("offline input contains no samples".into());
     }
     let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
-    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config(
+    let retrieval = vocal_model::RetrievalIndex::from_package(&package)?;
+    let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config_and_retrieval(
         &artifacts,
         synth_config.clone(),
         trt_config.runtime,
         trt_config.diagnostics,
+        retrieval.as_ref(),
     )?;
+    pipeline.set_retrieval_ratio(retrieval_ratio_from_env()?)?;
     let profile = artifacts.profile;
     let min_samples = profile.min_samples.max(160) as usize;
     let max_samples = profile.max_samples.max(min_samples as i32) as usize;
@@ -503,6 +510,16 @@ fn run_offline_pipeline(
     let mut pipeline = EngineOfflinePipeline::new(backend, engine, AudioFormat::MONO_16K)?;
     let mut config = OfflineRunConfig::default();
     config.window_samples = window_samples;
+    // Keep the offline command useful for retrieval validation without adding
+    // a backend-specific CLI flag. Runtime callers can set the same
+    // ConversionConfig field directly; the environment adapter is only for
+    // reproducible smoke tests and scripts.
+    if let Some(value) = env::var("VOCAL_INDEX_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+    {
+        config.conversion.index_ratio = value;
+    }
     // TensorRT performs SOLA/crossfade in its streaming engine because it
     // needs the extended model output before cropping each callback. The
     // shared runner concatenates the already-cropped blocks here; future
@@ -629,6 +646,20 @@ fn round_up_audio_samples(samples: usize, hop: usize) -> usize {
 }
 
 #[cfg(feature = "tensorrt-rtx")]
+fn retrieval_ratio_from_env() -> CliResult<f32> {
+    let Some(value) = env::var("VOCAL_INDEX_RATIO").ok() else {
+        return Ok(0.0);
+    };
+    let ratio = value
+        .parse::<f32>()
+        .map_err(|_| format!("VOCAL_INDEX_RATIO is not a float: {value}"))?;
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return Err("VOCAL_INDEX_RATIO must be finite and in [0, 1]".into());
+    }
+    Ok(ratio)
+}
+
+#[cfg(feature = "tensorrt-rtx")]
 fn compare_trt_pipeline(
     artifacts_path: PathBuf,
     cache: PathBuf,
@@ -642,6 +673,7 @@ fn compare_trt_pipeline(
         .rvc_synth_config()?
         .ok_or("cache has no rvc_synth config")?;
     let samples = read_f32_audio(&input)?;
+    let retrieval = vocal_model::RetrievalIndex::from_package(&package)?;
     let base_config = vocal_tensorrt::TensorRtConfig::from_env()?;
     let warmups = base_config.run.warmup.max(3);
     let iterations = requested_iterations
@@ -669,12 +701,14 @@ fn compare_trt_pipeline(
         config.runtime.native_cuda_graph = mode == vocal_tensorrt::GraphReplayMode::NativeSubgraphs;
         config.diagnostics.debug_intermediates = false;
         config.diagnostics.layer_profile = false;
-        let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config(
+        let mut pipeline = vocal_tensorrt::RvcTrtPipeline::load_with_runtime_config_and_retrieval(
             &artifacts,
             synth_config.clone(),
             config.runtime,
             config.diagnostics,
+            retrieval.as_ref(),
         )?;
+        pipeline.set_retrieval_ratio(retrieval_ratio_from_env()?)?;
         let run_once = |pipeline: &mut vocal_tensorrt::RvcTrtPipeline| {
             if realtime_f0 {
                 pipeline.process_realtime(&samples, 0, realtime_advance)
@@ -714,6 +748,7 @@ fn compare_trt_pipeline(
             "mean_stage_ms": {
                 "upload": mean(|r| r.timings.upload_ms),
                 "hubert": mean(|r| r.timings.hubert_enqueue_ms),
+                "retrieval": mean(|r| r.timings.retrieval_enqueue_ms),
                 "rmvpe": mean(|r| r.timings.rmvpe_enqueue_ms),
                 "frontend": mean(|r| r.timings.frontend_enqueue_ms),
                 "synth": mean(|r| r.timings.synth_enqueue_ms),

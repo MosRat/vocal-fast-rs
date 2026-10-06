@@ -8,7 +8,7 @@
 use std::time::Instant;
 use std::{fs, path::Path};
 
-use vocal_model::{ModelPackage, RvcSynthConfig, load_cache_shared};
+use vocal_model::{ModelPackage, RetrievalIndex, RvcSynthConfig, load_cache_shared};
 use vocal_types::{AudioChunk, AudioFormat, ConversionConfig, LatencyMetrics, ModelDescriptor};
 
 use crate::{
@@ -91,6 +91,7 @@ impl TensorRtBackendConfig {
 /// type is `Send` and can be moved into the runtime's worker thread.
 pub struct TensorRtEngine {
     pipeline: RvcTrtPipeline,
+    retrieval: Option<RetrievalIndex>,
     window: StreamingWindow,
     synth_config: RvcSynthConfig,
     model_sample_rate: u32,
@@ -168,17 +169,20 @@ impl TensorRtEngine {
                 synth_config.sample_rate, model.sample_rate
             )));
         }
+        let retrieval = RetrievalIndex::from_package(package)
+            .map_err(|error| backend_error("load FAISS retrieval index", error))?;
         let window_samples = backend
             .window_samples
             .unwrap_or_else(|| artifacts.profile.opt_samples.max(1) as usize);
         validate_window(&artifacts, window_samples)?;
-        let pipeline = load_pipeline(&artifacts, &synth_config, &backend)?;
+        let pipeline = load_pipeline(&artifacts, &synth_config, &backend, retrieval.as_ref())?;
         let window = StreamingWindow::new(window_samples)?;
         let realtime_config = realtime_config_for_window(window_samples);
         let warmup_remaining = warmup_blocks_for_window(window_samples, realtime_config);
         let input_level_buffer = vec![0.0; realtime_level_window(realtime_config)];
         Ok(Self {
             pipeline,
+            retrieval,
             window,
             synth_config,
             model_sample_rate: model.sample_rate,
@@ -263,7 +267,12 @@ impl TensorRtEngine {
             .window_samples
             .unwrap_or_else(|| artifacts.profile.opt_samples.max(1) as usize);
         validate_window(&artifacts, window_samples)?;
-        let pipeline = load_pipeline(&artifacts, &self.synth_config, &backend)?;
+        let pipeline = load_pipeline(
+            &artifacts,
+            &self.synth_config,
+            &backend,
+            self.retrieval.as_ref(),
+        )?;
         let window = StreamingWindow::new(window_samples)?;
         let realtime_config = realtime_config_for_window(window_samples);
         self.pipeline = pipeline;
@@ -289,7 +298,10 @@ impl TensorRtEngine {
         sequence: u64,
         config: ConversionConfig,
     ) -> Result<AudioChunk, EngineError> {
-        validate_native_conversion(config)?;
+        validate_native_conversion(config, self.pipeline.has_retrieval_index())?;
+        self.pipeline
+            .set_retrieval_ratio(config.index_ratio)
+            .map_err(|error| backend_error("set FAISS retrieval ratio", error))?;
         let started = Instant::now();
         let mono = to_mono(format, samples);
         let internal = to_internal_rate(&mono, format.sample_rate);
@@ -612,12 +624,14 @@ fn load_pipeline(
     artifacts: &RvcTrtPipelineArtifacts,
     synth_config: &RvcSynthConfig,
     backend: &TensorRtBackendConfig,
+    retrieval: Option<&RetrievalIndex>,
 ) -> Result<RvcTrtPipeline, EngineError> {
-    RvcTrtPipeline::load_with_runtime_config(
+    RvcTrtPipeline::load_with_runtime_config_and_retrieval(
         artifacts,
         synth_config.clone(),
         backend.runtime.clone(),
         backend.diagnostics.clone(),
+        retrieval,
     )
     .map_err(|error| backend_error("load TensorRT pipeline", error))
 }
@@ -639,7 +653,10 @@ fn validate_window(
     Ok(())
 }
 
-fn validate_native_conversion(config: ConversionConfig) -> Result<(), EngineError> {
+fn validate_native_conversion(
+    config: ConversionConfig,
+    has_retrieval_index: bool,
+) -> Result<(), EngineError> {
     crate::validate_conversion(config)?;
     let default = ConversionConfig::default();
     if config.pitch_semitones != 0.0 {
@@ -647,7 +664,7 @@ fn validate_native_conversion(config: ConversionConfig) -> Result<(), EngineErro
             "TensorRT backend currently requires pitch_semitones = 0; apply pitch in the native frontend profile before enabling it".into(),
         ));
     }
-    if config.index_ratio != 0.0 {
+    if config.index_ratio != 0.0 && !has_retrieval_index {
         return Err(EngineError::InvalidConfig(
             "TensorRT backend has no loaded feature index; index_ratio must be 0".into(),
         ));

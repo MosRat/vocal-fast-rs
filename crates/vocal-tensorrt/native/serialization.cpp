@@ -1,5 +1,13 @@
 #include "bridge.h"
 
+extern "C" int vocal_trt_build_view(
+    vocal::Build* build, unsigned char const** data, size_t* bytes) noexcept {
+    if (!build || !build->mem || !data || !bytes) return 1;
+    *data = static_cast<unsigned char const*>(build->mem->data());
+    *bytes = build->mem->size();
+    return 0;
+}
+
 extern "C" int vocal_trt_build_bytes(
     vocal::Build* build, unsigned char** data, size_t* bytes) noexcept {
     if (!build || !build->mem || !data || !bytes) return 1;

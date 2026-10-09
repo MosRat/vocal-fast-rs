@@ -14,7 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{ModelError, ModelLoadConfig, ModelPackage, load_cache_with_config};
+use crate::{ModelError, ModelLoadConfig, ModelPackage, load_cache_selected};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ModelCacheKey {
@@ -25,10 +25,15 @@ struct ModelCacheKey {
     max_tensors: u64,
     max_tensor_bytes: u64,
     validate_canonical: bool,
+    voice_only: bool,
 }
 
 impl ModelCacheKey {
-    fn from_path(path: impl AsRef<Path>, config: &ModelLoadConfig) -> Result<Self, ModelError> {
+    fn from_path(
+        path: impl AsRef<Path>,
+        config: &ModelLoadConfig,
+        voice_only: bool,
+    ) -> Result<Self, ModelError> {
         let canonical_path = fs::canonicalize(path)?;
         let metadata = fs::metadata(&canonical_path)?;
         Ok(Self {
@@ -39,6 +44,7 @@ impl ModelCacheKey {
             max_tensors: config.max_tensors,
             max_tensor_bytes: config.max_tensor_bytes,
             validate_canonical: config.validate_canonical,
+            voice_only,
         })
     }
 }
@@ -48,7 +54,14 @@ impl ModelCacheKey {
 /// the next lookup will parse the file again if needed.
 #[derive(Debug, Default)]
 pub struct ModelPackageCache {
-    entries: Mutex<HashMap<ModelCacheKey, Weak<ModelPackage>>>,
+    entries: Mutex<HashMap<ModelCacheKey, Arc<Mutex<Weak<ModelPackage>>>>>,
+}
+
+fn live(entry: &Arc<Mutex<Weak<ModelPackage>>>) -> bool {
+    Arc::strong_count(entry) > 1
+        || entry
+            .try_lock()
+            .map_or(true, |package| package.strong_count() > 0)
 }
 
 impl ModelPackageCache {
@@ -63,32 +76,48 @@ impl ModelPackageCache {
         path: impl AsRef<Path>,
         config: &ModelLoadConfig,
     ) -> Result<Arc<ModelPackage>, ModelError> {
+        self.load_selected(path.as_ref(), config, false)
+    }
+
+    pub fn load_voice(
+        &self,
+        path: impl AsRef<Path>,
+        config: &ModelLoadConfig,
+    ) -> Result<Arc<ModelPackage>, ModelError> {
+        self.load_selected(path.as_ref(), config, true)
+    }
+
+    fn load_selected(
+        &self,
+        path: &Path,
+        config: &ModelLoadConfig,
+        voice_only: bool,
+    ) -> Result<Arc<ModelPackage>, ModelError> {
         config.validate()?;
-        let key = ModelCacheKey::from_path(path, config)?;
-        {
+        let key = ModelCacheKey::from_path(path, config, voice_only)?;
+        let entry = {
             let mut entries = self
                 .entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            entries.retain(|_, package| package.strong_count() != 0);
-            if let Some(package) = entries.get(&key).and_then(Weak::upgrade) {
-                return Ok(package);
-            }
-        }
+            entries.retain(|_, entry| live(entry));
+            Arc::clone(entries.entry(key.clone()).or_default())
+        };
 
-        // Do not hold the cache mutex while parsing a large package. A
-        // concurrent duplicate load is harmless and avoids blocking unrelated
-        // model requests behind disk IO and validation.
-        let package = Arc::new(load_cache_with_config(&key.canonical_path, config)?);
-        let mut entries = self
-            .entries
+        // Only identical requests wait together. Unrelated paths keep loading
+        // concurrently, without duplicate multi-hundred-MiB package allocations.
+        let mut current = entry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, cached| cached.strong_count() != 0);
-        if let Some(existing) = entries.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
+        if let Some(package) = current.upgrade() {
+            return Ok(package);
         }
-        entries.insert(key, Arc::downgrade(&package));
+        let package = Arc::new(load_cache_selected(
+            &key.canonical_path,
+            config,
+            voice_only,
+        )?);
+        *current = Arc::downgrade(&package);
         Ok(package)
     }
 
@@ -104,7 +133,7 @@ impl ModelPackageCache {
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, cached| cached.strong_count() != 0);
+        entries.retain(|_, entry| live(entry));
         entries.len()
     }
 

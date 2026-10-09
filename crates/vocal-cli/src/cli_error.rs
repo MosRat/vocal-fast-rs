@@ -22,6 +22,11 @@ pub enum CliError {
     Graph(#[from] vocal_engine::tensorrt::GraphError),
     #[error("audio error: {0}")]
     Audio(#[from] vocal_audio::AudioError),
+    #[error("WAV error: {0}")]
+    Wav(#[from] vocal_audio::WavError),
+    #[cfg(feature = "directml")]
+    #[error("DirectML error: {0}")]
+    DirectMl(#[from] vocal_directml::DirectMlError),
     #[error("invalid integer: {0}")]
     ParseInt(#[from] ParseIntError),
     #[error("invalid binary input: {0}")]

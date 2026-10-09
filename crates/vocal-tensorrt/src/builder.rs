@@ -6,7 +6,6 @@
 
 use std::ffi::CString;
 use std::{
-    fs,
     path::{Path, PathBuf},
     ptr, slice,
 };
@@ -84,6 +83,7 @@ impl NativeTensorRtBuilder {
             rmvpe_fft_mode: self.options.rmvpe_fft_radix2 as i32,
             fused_rvc_qkv: self.options.fused_rvc_qkv as i32,
             hubert_feature_precision: self.options.hubert_feature_precision.code(),
+            rvc_feature_width: self.options.rvc_version.feature_width() as i32,
             rmvpe_external_stft,
             tactic_sources: self.options.tactic_sources as i32,
             timing_cache_path: timing_cache.map_or(ptr::null(), |path| path.as_ptr()),
@@ -135,6 +135,7 @@ impl NativeTensorRtBuilder {
         let code = unsafe {
             ffi::vocal_trt_build_rvc_frontend(
                 self.options.workspace_bytes,
+                self.options.rvc_version.feature_width() as i32,
                 self.options.min_frames,
                 self.options.opt_frames,
                 self.options.max_frames,
@@ -280,6 +281,9 @@ impl NativeTensorRtBuilder {
     /// package.  The integer shape constants and ONNX operator IR stay in the
     /// package metadata; only floating point parameters cross the C ABI.
     pub fn compile_hubert_vfrm(&self, package: &ModelPackage) -> Result<PathBuf, NativeBuildError> {
+        package
+            .validate_hubert_for_rvc(self.options.rvc_version)
+            .map_err(|e| NativeBuildError::Argument(e.to_string()))?;
         if !self.options.precision.is_native_type_available() {
             return Err(NativeBuildError::Argument(format!(
                 "native HuBERT VFRM graph does not support {:?} on this TensorRT-RTX runtime",
@@ -579,9 +583,9 @@ impl NativeTensorRtBuilder {
                 "TensorRT builder returned a null handle".into(),
             ));
         }
-        let mut bytes_ptr = ptr::null_mut();
+        let mut bytes_ptr = ptr::null();
         let mut bytes_len = 0;
-        let code = unsafe { ffi::vocal_trt_build_bytes(handle, &mut bytes_ptr, &mut bytes_len) };
+        let code = unsafe { ffi::vocal_trt_build_view(handle, &mut bytes_ptr, &mut bytes_len) };
         if code != 0 || bytes_ptr.is_null() {
             unsafe { ffi::vocal_trt_build_free(handle) };
             return Err(NativeBuildError::Api(
@@ -589,13 +593,12 @@ impl NativeTensorRtBuilder {
             ));
         }
         let write_result = unsafe {
-            fs::write(
+            crate::cache_io::publish(
                 &self.options.output,
                 slice::from_raw_parts(bytes_ptr, bytes_len),
             )
         };
         unsafe {
-            ffi::vocal_trt_free_bytes(bytes_ptr, bytes_len);
             ffi::vocal_trt_build_free(handle);
         }
         write_result

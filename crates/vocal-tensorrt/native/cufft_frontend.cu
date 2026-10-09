@@ -91,8 +91,8 @@ struct CufftFrontend : CufftFrontendImpl {};
 extern "C" int vocal_cufft_frontend_create(
     int32_t samples, CufftFrontend** out, char** error) noexcept {
     return guarded(error, [&] {
-        require(out && samples >= kNfft && samples % kHop == 0,
-                "cuFFT frontend samples must be a 160-sample multiple >= 1024");
+        require(out && samples >= kNfft,
+                "cuFFT frontend samples must be >= 1024");
         *out = nullptr;
         auto frontend = std::make_unique<CufftFrontend>();
         frontend->samples = samples;

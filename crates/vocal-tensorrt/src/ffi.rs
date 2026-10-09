@@ -11,6 +11,21 @@ use std::{
 
 use crate::abi::{NativeConfig, NativeOptions, NativeWeight};
 
+unsafe extern "C" {
+    pub(crate) fn vocal_pitch_match(
+        raw: *const f32,
+        scaled: *mut f32,
+        controls: *const f32,
+        state: *mut f32,
+        scratch: *mut f32,
+        frames: i32,
+        minimum: i32,
+        streaming: i32,
+        stream: *mut Stream,
+        error: *mut *mut c_char,
+    ) -> i32;
+}
+
 /// Opaque native handle categories exposed by the C ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleKind {
@@ -108,6 +123,7 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn vocal_trt_build_rvc_frontend(
         workspace: u64,
+        feature_width: i32,
         min_frames: i32,
         opt_frames: i32,
         max_frames: i32,
@@ -181,13 +197,12 @@ unsafe extern "C" {
         stream: *mut Stream,
         error: *mut *mut c_char,
     ) -> i32;
-    pub(crate) fn vocal_trt_build_bytes(
+    pub(crate) fn vocal_trt_build_view(
         handle: *mut Build,
-        data: *mut *mut u8,
+        data: *mut *const u8,
         bytes: *mut usize,
     ) -> i32;
     pub(crate) fn vocal_trt_build_free(handle: *mut Build);
-    pub(crate) fn vocal_trt_free_bytes(data: *mut u8, bytes: usize);
     pub(crate) fn vocal_trt_free_error(error: *mut c_char);
 
     pub(crate) fn vocal_trt_runtime_load(
@@ -209,6 +224,20 @@ unsafe extern "C" {
         error: *mut *mut c_char,
     ) -> i32;
     pub(crate) fn vocal_trt_context_free(handle: *mut Context);
+    pub(crate) fn vocal_trt_context_create_cached(
+        runtime: *mut Runtime,
+        strategy: i32,
+        cached: *const u8,
+        cached_bytes: usize,
+        accepted: *mut i32,
+        out: *mut *mut Context,
+        error: *mut *mut c_char,
+    ) -> i32;
+    pub(crate) fn vocal_trt_context_cache(
+        context: *mut Context,
+        out: *mut *mut Build,
+        error: *mut *mut c_char,
+    ) -> i32;
     pub(crate) fn vocal_trt_context_is_stream_capturable(
         context: *mut Context,
         stream: *mut c_void,
@@ -371,3 +400,18 @@ pub(crate) fn native_message(error: *mut c_char, fallback: &str) -> String {
 }
 
 pub const ABI_VERSION: u32 = 2;
+
+unsafe extern "C" {
+    pub(crate) fn vocal_retrieval_protect(
+        features: *mut f32,
+        raw: *const f32,
+        pitchf: *const f32,
+        ratio: *const f32,
+        protect: *const f32,
+        frames: i32,
+        hubert_frames: i32,
+        width: i32,
+        stream: *mut Stream,
+        error: *mut *mut c_char,
+    ) -> i32;
+}

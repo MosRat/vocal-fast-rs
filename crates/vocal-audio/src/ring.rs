@@ -42,6 +42,7 @@ unsafe impl Sync for RingSlot {}
 
 struct RingInner {
     config: StreamConfig,
+    prefill_blocks: usize,
     /// One allocation per ring keeps slot samples contiguous. The producer
     /// and consumer still own disjoint ranges through the SPSC cursors.
     arena: UnsafeCell<Vec<f32>>,
@@ -62,8 +63,13 @@ unsafe impl Send for RingInner {}
 unsafe impl Sync for RingInner {}
 
 impl RingInner {
-    fn new(config: StreamConfig) -> Result<Arc<Self>, AudioError> {
+    fn new(config: StreamConfig, prefill_blocks: usize) -> Result<Arc<Self>, AudioError> {
         let config = config.validate()?;
+        if prefill_blocks > config.queue_blocks {
+            return Err(AudioError::InvalidConfig(
+                "prefill exceeds ring capacity".into(),
+            ));
+        }
         let arena = allocate_samples(
             config
                 .queue_blocks
@@ -85,6 +91,7 @@ impl RingInner {
         let slots = slots.into_boxed_slice();
         Ok(Arc::new(Self {
             config,
+            prefill_blocks,
             arena: UnsafeCell::new(arena),
             slots,
             wake: AudioWake::new(),
@@ -131,6 +138,7 @@ impl RingInner {
             });
         }
 
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let write = self.write.0.load(Ordering::Relaxed);
         let read = self.read.0.load(Ordering::Acquire);
         if write.wrapping_sub(read) >= self.slots.len() {
@@ -138,7 +146,6 @@ impl RingInner {
             return Err(AudioError::QueueFull);
         }
 
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         // SAFETY: only the single producer can reach this slot while the
         // write index has not been published.
         unsafe {
@@ -274,9 +281,20 @@ pub struct AudioRing {
 
 impl AudioRing {
     pub fn new(config: StreamConfig) -> Result<Self, AudioError> {
+        Self::new_with_prefill(config, 0)
+    }
+
+    pub fn new_with_prefill(
+        config: StreamConfig,
+        prefill_blocks: usize,
+    ) -> Result<Self, AudioError> {
         Ok(Self {
-            inner: RingInner::new(config)?,
+            inner: RingInner::new(config, prefill_blocks)?,
         })
+    }
+
+    pub fn prefill_blocks(&self) -> usize {
+        self.inner.prefill_blocks
     }
 
     pub fn config(&self) -> StreamConfig {
@@ -333,6 +351,7 @@ impl AudioRing {
         let write = self.inner.write.0.load(Ordering::Relaxed);
         let read = self.inner.read.0.load(Ordering::Relaxed);
         let next_sequence = self.inner.next_sequence.load(Ordering::Relaxed);
+        let primed = self.inner.prefill_blocks == 0;
         (
             AudioProducer {
                 inner: Arc::clone(&self.inner),
@@ -346,6 +365,7 @@ impl AudioRing {
                 config,
                 read,
                 cached_write: write,
+                primed,
             },
         )
     }
@@ -361,6 +381,12 @@ pub struct AudioProducer {
 }
 
 impl AudioProducer {
+    /// Mark lost capture time before publishing the next successful block.
+    /// Aborting a reservation or waiting for output space is not audio loss.
+    pub fn mark_discontinuity(&mut self) {
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+    }
+
     pub fn config(&self) -> StreamConfig {
         self.config
     }
@@ -411,7 +437,20 @@ impl AudioProducer {
                 actual: samples.len(),
             });
         }
-        let mut lease = self.try_acquire_at(timestamp)?;
+        let (index, sequence) = match self.reserve() {
+            Ok(reserved) => reserved,
+            Err(AudioError::QueueFull) => {
+                self.mark_discontinuity();
+                return Err(AudioError::QueueFull);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut lease = AudioWriteLease {
+            producer: self,
+            index,
+            sequence,
+            timestamp,
+        };
         lease.samples_mut().copy_from_slice(samples);
         Ok(lease.commit())
     }
@@ -528,9 +567,19 @@ pub struct AudioConsumer {
     config: StreamConfig,
     read: usize,
     cached_write: usize,
+    primed: bool,
 }
 
 impl AudioConsumer {
+    /// Only the consumer changes this local gate; callbacks never lock or wait.
+    pub fn ready_for_playback(&mut self) -> bool {
+        if !self.primed {
+            let write = self.inner.write.0.load(Ordering::Acquire);
+            self.primed = write.wrapping_sub(self.read) >= self.inner.prefill_blocks;
+        }
+        self.primed
+    }
+
     pub fn config(&self) -> StreamConfig {
         self.config
     }
@@ -550,6 +599,9 @@ impl AudioConsumer {
     }
 
     pub fn try_acquire(&mut self) -> Result<AudioReadLease<'_>, AudioError> {
+        if !self.ready_for_playback() {
+            return Err(AudioError::QueueEmpty);
+        }
         let read = self.read;
         if read == self.cached_write {
             self.cached_write = self.inner.write.0.load(Ordering::Acquire);

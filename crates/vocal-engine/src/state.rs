@@ -13,6 +13,7 @@ pub struct EngineStatus {
 impl EngineStatus {
     pub fn ready(&mut self) {
         self.state = EngineLifecycle::Ready;
+        self.last_error = None;
     }
 
     pub fn begin(&mut self) -> Result<(), &'static str> {

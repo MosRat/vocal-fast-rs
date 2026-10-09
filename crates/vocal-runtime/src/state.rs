@@ -13,7 +13,7 @@ use vocal_engine::{
 };
 use vocal_model::{
     ModelArtifactKind, ModelLoadConfig, ModelLoader, ModelPackage, RvcModelManifest,
-    inspect_model_manifest_with_config, model_artifact_kind, resolve_model_path,
+    inspect_model_artifact_with_config, model_artifact_kind, resolve_model_path,
 };
 use vocal_types::{AudioChunk, LatencyMetrics, LifecycleState, ModelDescriptor};
 
@@ -23,6 +23,10 @@ use crate::{
 };
 
 const MAX_CONTROL_BLOCK_SAMPLES: usize = 1_048_576;
+
+#[cfg(test)]
+#[path = "idle_reload_tests.rs"]
+mod idle_reload_tests;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,13 +62,12 @@ impl ModelSummary {
             architecture: descriptor.architecture.clone(),
             version: descriptor.version.clone(),
             sample_rate: descriptor.sample_rate,
-            feature_dims: if descriptor.version.to_ascii_lowercase().contains("v2")
-                || descriptor.architecture.to_ascii_lowercase().contains("v2")
-            {
-                768
-            } else {
-                256
-            },
+            feature_dims: vocal_model::RvcVersion::from_labels(
+                &descriptor.version,
+                &descriptor.architecture,
+            )
+            .map(|version| version.feature_width())
+            .unwrap_or(0),
             uses_f0: true,
         }
     }
@@ -77,6 +80,7 @@ pub struct ModelCatalogEntry {
     pub kind: ModelArtifactKind,
     pub size_bytes: u64,
     pub modified_at_ms: u64,
+    pub components: vocal_model::ModelComponents,
     #[serde(flatten)]
     pub model: ModelSummary,
 }
@@ -173,12 +177,18 @@ struct RuntimeInner {
     /// The control actor owns this engine while no audio model worker is
     /// running. During an active stream ownership moves to that worker.
     engine: Option<Box<dyn InferenceEngine>>,
+    /// Configuration actually applied to the resident engine. Saved plan/model
+    /// selections may be pending and must not become the reload baseline.
+    engine_config: Option<RuntimeConfig>,
     worker_status: Option<EngineStatus>,
     worker_generation: u64,
     worker_active: bool,
     metrics: LatencyMetrics,
     last_error: Option<RuntimeErrorInfo>,
     config_store: Option<crate::ConfigStore>,
+    /// Heavy operations may free gigabytes on this long-lived actor. Collect
+    /// only after the command and its candidate temporaries have been dropped.
+    collect_memory: bool,
 }
 
 type RuntimeCommand = Box<dyn FnOnce(&mut RuntimeInner) + Send + 'static>;
@@ -209,12 +219,14 @@ impl RuntimeContext {
             loaded_model_path: None,
             model_package: None,
             engine: None,
+            engine_config: None,
             worker_status: None,
             worker_generation: 0,
             worker_active: false,
             metrics: LatencyMetrics::default(),
             last_error: None,
             config_store: None,
+            collect_memory: false,
         };
         std::thread::Builder::new()
             .name("vocal-runtime-control".into())
@@ -231,7 +243,14 @@ impl RuntimeContext {
         let (reply, result) = std::sync::mpsc::sync_channel(1);
         self.control
             .send(Box::new(move |state| {
-                let _ = reply.send(command(state));
+                let outcome = command(state);
+                // The command has dropped temporary/candidate resources. A
+                // load/unload reply promises this reclamation is complete,
+                // rather than racing the GUI's completed-state notification.
+                if std::mem::take(&mut state.collect_memory) {
+                    crate::memory::collect_idle();
+                }
+                let _ = reply.send(outcome);
             }))
             .map_err(|_| RuntimeError::ControlClosed("runtime control actor stopped".into()))?;
         result
@@ -241,6 +260,20 @@ impl RuntimeContext {
 
     pub fn set_config_store(&self, store: crate::ConfigStore) -> RuntimeResult<()> {
         self.request(move |state| state.set_config_store(store))
+    }
+
+    /// Resolve a fresh/automatic backend, or recover a saved unavailable one,
+    /// before model restoration. Runtime configuration remains authoritative.
+    pub fn initialize_processing_backend(&self) -> RuntimeResult<Option<String>> {
+        self.initialize_processing_backend_with_catalog(crate::detect_processing_backends())
+    }
+
+    /// Reuse a controller's startup probe without probing device drivers twice.
+    pub fn initialize_processing_backend_with_catalog(
+        &self,
+        catalog: crate::ProcessingBackendCatalog,
+    ) -> RuntimeResult<Option<String>> {
+        self.request(move |state| state.initialize_processing_backend(catalog))
     }
 
     pub fn config(&self) -> RuntimeResult<RuntimeConfig> {
@@ -270,9 +303,81 @@ impl RuntimeContext {
         self.request(move |state| state.update_config(config, expected_revision))
     }
 
+    /// Update display metadata while preserving the resident engine and tensor ownership.
+    pub fn edit_model_metadata(
+        &self,
+        path: String,
+        revision: String,
+        edit: vocal_model::ModelMetadataEdit,
+    ) -> RuntimeResult<vocal_model::ModelMetadataView> {
+        self.request(move |state| {
+            if state.worker_status.is_some()
+                || state.worker_active
+                || matches!(
+                    state.lifecycle,
+                    LifecycleState::Running | LifecycleState::Loading | LifecycleState::Stopping
+                )
+            {
+                return Err(RuntimeError::State {
+                    state: "audio_session_active".into(),
+                    action: "edit_model_metadata".into(),
+                });
+            }
+            let view = vocal_model::edit_model_metadata(path, &revision, edit)?;
+            if state.loaded_model_path.as_deref() == Some(view.inspection.path.as_str()) {
+                state.model = Some(ModelSummary::from(&view.inspection.manifest));
+                state.descriptor = Some(view.inspection.manifest.descriptor());
+            }
+            Ok(view)
+        })
+    }
+
+    /// Commit a successfully built/published TensorRT manifest, including a
+    /// rebuild at the same path. The idle engine prepares replacement internal
+    /// contexts before persistence; changing models still requires Model Load.
+    pub fn apply_prepared_tensorrt_pipeline(
+        &self,
+        config: RuntimeConfig,
+        expected_revision: u64,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        self.request(move |state| state.update_config_inner(config, expected_revision, true))
+    }
+
     pub fn load_model(&self, path: impl Into<String>) -> RuntimeResult<RuntimeSnapshot> {
         let path = path.into();
-        self.request(move |state| state.load_model(path))
+        self.request(move |state| state.load_model(path, None))
+    }
+
+    pub fn load_model_with_backend(
+        &self,
+        path: impl Into<String>,
+        selection: crate::ModelBackendSelection,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        let path = path.into();
+        self.request(move |state| state.load_model(path, Some(selection)))
+    }
+
+    /// Commit a prepared model and its derived configuration in one actor command.
+    /// Engine construction and persistence succeed before any prior state is replaced.
+    pub fn load_model_with_config(
+        &self,
+        path: impl Into<String>,
+        config: RuntimeConfig,
+        expected_revision: u64,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        let path = path.into();
+        self.request(move |state| {
+            state.check_revision(expected_revision)?;
+            if state.worker_status.is_some() {
+                return Err(RuntimeError::State {
+                    state: "model_worker_owns_engine".into(),
+                    action: "load_model".into(),
+                });
+            }
+            config.validate()?;
+            crate::detect_processing_backends().ensure_available(config.backend)?;
+            state.load_model_config(path, config)
+        })
     }
 
     pub fn unload_model(&self) -> RuntimeResult<RuntimeSnapshot> {
@@ -326,6 +431,18 @@ impl RuntimeContext {
         self.request(RuntimeInner::take_engine_for_worker)
     }
 
+    /// Query idle engine timing before opening the device graph. No engine
+    /// reference leaves the actor; active workers own their timing and engine.
+    pub fn processing_batch_frames(&self) -> RuntimeResult<usize> {
+        self.request(|state| {
+            let engine = state.engine.as_ref().ok_or_else(|| RuntimeError::State {
+                state: "engine_unavailable".into(),
+                action: "processing_batch_frames".into(),
+            })?;
+            Ok(engine.preferred_batch_frames(state.config.input_format))
+        })
+    }
+
     /// Mark a reserved worker lease as started. A separate activation step
     /// lets a failed thread spawn roll back without racing a stale worker.
     pub fn activate_worker(&self, generation: u64) -> RuntimeResult<()> {
@@ -351,7 +468,41 @@ fn runtime_actor(commands: std::sync::mpsc::Receiver<RuntimeCommand>, state: &mu
 }
 
 impl RuntimeInner {
+    fn initialize_processing_backend(
+        &mut self,
+        catalog: crate::ProcessingBackendCatalog,
+    ) -> RuntimeResult<Option<String>> {
+        if self.descriptor.is_some() || self.worker_status.is_some() {
+            return Err(RuntimeError::State {
+                state: "model_already_loaded".into(),
+                action: "initialize_processing_backend".into(),
+            });
+        }
+        let unavailable = catalog.ensure_available(self.config.backend).err();
+        if self.config.backend_auto || unavailable.is_some() {
+            let mut config = self.config.clone();
+            config.backend = catalog.recommended;
+            if let Some(store) = &self.config_store {
+                store.save(&config)?;
+            }
+            self.config = config;
+            self.config_revision = self.config_revision.saturating_add(1);
+        }
+        Ok(unavailable.map(|error| {
+            format!(
+                "The saved processing backend is unavailable ({error}). Using {:?}.",
+                self.config.backend
+            )
+        }))
+    }
+
     fn set_config_store(&mut self, store: crate::ConfigStore) -> RuntimeResult<()> {
+        if self.descriptor.is_some() || self.worker_status.is_some() {
+            return Err(RuntimeError::State {
+                state: "model_already_loaded".into(),
+                action: "set_config_store".into(),
+            });
+        }
         let loaded = store.load()?;
         self.config_store = Some(store);
         if let Some(config) = loaded {
@@ -366,8 +517,25 @@ impl RuntimeInner {
         config: RuntimeConfig,
         expected_revision: u64,
     ) -> RuntimeResult<RuntimeSnapshot> {
+        self.update_config_inner(config, expected_revision, false)
+    }
+
+    fn update_config_inner(
+        &mut self,
+        config: RuntimeConfig,
+        expected_revision: u64,
+        pipeline_prepared: bool,
+    ) -> RuntimeResult<RuntimeSnapshot> {
         config.validate()?;
         self.check_revision(expected_revision)?;
+        if pipeline_prepared
+            && (config.backend != RuntimeBackend::TensorRtRtx
+                || config.tensorrt_artifacts().is_none())
+        {
+            return Err(RuntimeError::Config(
+                "prepared pipeline requires TensorRT and a published artifacts manifest".into(),
+            ));
+        }
         if self.worker_status.is_some()
             || matches!(
                 self.lifecycle,
@@ -381,11 +549,51 @@ impl RuntimeInner {
         }
         let model_needs_reload = self.descriptor.is_some()
             && config.model_path.as_deref() != self.loaded_model_path.as_deref();
-        let change = if model_needs_reload {
+        if config.backend != self.config.backend {
+            crate::detect_processing_backends().ensure_available(config.backend)?;
+        }
+        let pending_plans =
+            config.backend == RuntimeBackend::TensorRtRtx && config.tensorrt_artifacts().is_none();
+        let mut change = if model_needs_reload {
             ConfigUpdateKind::LoadModelRequired
         } else {
-            classify_config_change(&self.config, &config, self.descriptor.is_some())
+            classify_config_change(
+                self.engine_config.as_ref().unwrap_or(&self.config),
+                &config,
+                self.descriptor.is_some(),
+            )
         };
+        if pipeline_prepared && !model_needs_reload && self.descriptor.is_some() {
+            change = if self.engine.is_some()
+                && self
+                    .engine_config
+                    .as_ref()
+                    .is_some_and(|applied| applied.backend == RuntimeBackend::TensorRtRtx)
+            {
+                ConfigUpdateKind::ReloadTensorRtPipeline
+            } else {
+                ConfigUpdateKind::RebuildEngine
+            };
+        }
+        if !model_needs_reload && self.descriptor.is_some() && self.engine.is_none() {
+            change = ConfigUpdateKind::RebuildEngine;
+        }
+        if pending_plans && !model_needs_reload {
+            change = ConfigUpdateKind::PlanBuildRequired;
+        }
+        if matches!(
+            change,
+            ConfigUpdateKind::RebuildEngine | ConfigUpdateKind::ReloadTensorRtPipeline
+        ) || (pending_plans
+            && self.engine.is_some()
+            && self
+                .engine_config
+                .as_ref()
+                .is_none_or(|applied| applied.backend != config.backend))
+        {
+            // Mark before preparation so failed candidates are reclaimed too.
+            self.collect_memory = true;
+        }
         let replacement = if change == ConfigUpdateKind::RebuildEngine {
             self.descriptor
                 .as_ref()
@@ -396,59 +604,111 @@ impl RuntimeInner {
         } else {
             None
         };
-        let previous = self.config.clone();
-        if let Some(store) = &self.config_store {
-            store.save(&config)?;
+        if !matches!(
+            change,
+            ConfigUpdateKind::LoadModelRequired | ConfigUpdateKind::PlanBuildRequired
+        ) && let Some(engine) = replacement.as_ref().or(self.engine.as_ref())
+        {
+            engine.validate_config(config.conversion)?;
         }
-        if change == ConfigUpdateKind::ReloadTensorRtPipeline && self.engine.is_some() {
-            if let Err(error) = self.reload_idle_engine(&config) {
-                if let Some(store) = &self.config_store {
-                    if let Err(rollback) = store.save(&previous) {
-                        return Err(RuntimeError::Config(format!(
-                            "TensorRT pipeline reload failed: {error}; restoring the previous configuration also failed: {rollback}"
-                        )));
-                    }
-                }
-                return Err(error);
+        // A prepared reload holds the old engine unchanged until persistence
+        // succeeds. Dropping it on save failure also drops all candidate GPU state.
+        {
+            let prepared = if change == ConfigUpdateKind::ReloadTensorRtPipeline {
+                let reload = engine_reload_config(&config)?;
+                self.engine
+                    .as_mut()
+                    .map(|engine| engine.prepare_reload_config(reload))
+                    .transpose()?
+            } else {
+                None
+            };
+            if let Some(store) = &self.config_store {
+                store.save(&config)?;
             }
+            if let Some(prepared) = prepared {
+                prepared.commit();
+            }
+        }
+        if !matches!(
+            change,
+            ConfigUpdateKind::LoadModelRequired | ConfigUpdateKind::PlanBuildRequired
+        ) && (replacement.is_some() || self.engine.is_some())
+        {
+            self.engine_config = Some(config.clone());
         }
         self.config = config;
         self.config_revision = self.config_revision.saturating_add(1);
         self.last_config_update = change;
         if replacement.is_some() {
             self.engine = replacement;
+            self.lifecycle = LifecycleState::Ready;
+            self.last_error = None;
+        } else if change == ConfigUpdateKind::ReloadTensorRtPipeline && self.engine.is_some() {
+            self.lifecycle = LifecycleState::Ready;
+            self.last_error = None;
+        } else if pending_plans
+            && self
+                .engine_config
+                .as_ref()
+                .is_none_or(|applied| applied.backend != self.config.backend)
+        {
+            // Keep the parsed model resident but never run the old backend
+            // under the newly selected backend's name.
+            self.engine = None;
+            self.engine_config = None;
+            self.lifecycle = LifecycleState::Created;
         }
         Ok(self.snapshot())
     }
 
-    fn reload_idle_engine(&mut self, config: &RuntimeConfig) -> RuntimeResult<()> {
-        let engine = self.engine.as_mut().ok_or_else(|| RuntimeError::State {
-            state: "engine_not_loaded".into(),
-            action: "reload_idle_engine".into(),
-        })?;
-        let artifacts_path = config.tensorrt_artifacts().ok_or_else(|| {
-            RuntimeError::Config("TensorRT artifacts path is not configured".into())
-        })?;
-        engine.reload_config(EngineReloadConfig {
-            backend: config.backend.engine_kind(),
-            tensorrt: Some(TensorRtReloadConfig {
-                artifacts_path: PathBuf::from(artifacts_path),
-                speaker_id: config.speaker_id,
-                window_samples: config.tensorrt_window(),
-                graph_mode: config.tensorrt.graph_mode.clone(),
-                cuda_graph: config.tensorrt.cuda_graph,
-                native_cuda_graph: config.tensorrt.native_cuda_graph,
-                graph_cache_size: config.tensorrt.graph_cache_size,
-                parallel_acoustic: config.tensorrt.parallel_acoustic,
-                async_audio_d2h: config.tensorrt.async_audio_d2h,
-            }),
-        })?;
-        Ok(())
+    fn load_model(
+        &mut self,
+        path: String,
+        selection: Option<crate::ModelBackendSelection>,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        if self.worker_status.is_some() {
+            return Err(RuntimeError::State {
+                state: "model_worker_owns_engine".into(),
+                action: "load_model".into(),
+            });
+        }
+        let mut config = self.config.clone();
+        if let Some(selection) = selection {
+            self.check_revision(selection.expected_revision)?;
+            let catalog = crate::detect_processing_backends();
+            config.backend = if selection.automatic {
+                catalog.recommended
+            } else {
+                selection.backend
+            };
+            catalog.ensure_available(config.backend)?;
+            config.backend_auto = selection.automatic;
+            config.tensorrt.artifacts_path = selection.artifacts_path.clone();
+            config.tensorrt_artifacts_path = selection.artifacts_path;
+            if config.backend == RuntimeBackend::DirectMl {
+                config.directml_sources_path = selection.directml_sources_path;
+                config.directml_device_id = selection.directml_device_id;
+            }
+            config.validate()?;
+        }
+        self.load_model_config(path, config)
     }
 
-    fn load_model(&mut self, path: String) -> RuntimeResult<RuntimeSnapshot> {
+    fn load_model_config(
+        &mut self,
+        path: String,
+        config: RuntimeConfig,
+    ) -> RuntimeResult<RuntimeSnapshot> {
+        if self.worker_status.is_some() {
+            return Err(RuntimeError::State {
+                state: "model_worker_owns_engine".into(),
+                action: "load_model".into(),
+            });
+        }
         self.transition(LifecycleState::Loading, "load_model")?;
-        match self.load_model_inner(path) {
+        self.collect_memory = true;
+        match self.load_model_inner(path, config) {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 self.fail(&error);
@@ -469,7 +729,14 @@ impl RuntimeInner {
                 action: "unload_model".into(),
             });
         }
+        let mut config = self.config.clone();
+        config.model_path = None;
+        if let Some(store) = &self.config_store {
+            store.save(&config)?;
+        }
+        self.collect_memory = true;
         self.engine = None;
+        self.engine_config = None;
         self.worker_status = None;
         self.worker_active = false;
         self.worker_generation = self.worker_generation.wrapping_add(1);
@@ -477,12 +744,10 @@ impl RuntimeInner {
         self.descriptor = None;
         self.loaded_model_path = None;
         self.model_package = None;
-        self.config.model_path = None;
+        self.config = config;
         self.metrics = LatencyMetrics::default();
         self.config_revision = self.config_revision.saturating_add(1);
-        if let Some(store) = &self.config_store {
-            store.save(&self.config)?;
-        }
+        self.last_config_update = ConfigUpdateKind::Unchanged;
         self.lifecycle = LifecycleState::Created;
         self.last_error = None;
         Ok(self.snapshot())
@@ -527,6 +792,7 @@ impl RuntimeInner {
         descriptor: ModelDescriptor,
     ) -> RuntimeResult<RuntimeSnapshot> {
         self.transition(LifecycleState::Loading, "load_model_descriptor")?;
+        self.collect_memory = true;
         let result = (|| {
             descriptor.validate()?;
             let config = self.config.clone();
@@ -543,6 +809,7 @@ impl RuntimeInner {
             self.loaded_model_path = None;
             self.model_package = None;
             self.engine = Some(engine);
+            self.engine_config = Some(self.config.clone());
             self.worker_status = None;
             self.worker_active = false;
             self.lifecycle = LifecycleState::Ready;
@@ -559,6 +826,29 @@ impl RuntimeInner {
     }
 
     fn start_processing(&mut self) -> RuntimeResult<RuntimeSnapshot> {
+        if self.worker_status.is_some()
+            || matches!(
+                self.lifecycle,
+                LifecycleState::Loading | LifecycleState::Running | LifecycleState::Stopping
+            )
+        {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.lifecycle),
+                action: "start_while_active".into(),
+            });
+        }
+        if self.config.backend == RuntimeBackend::TensorRtRtx {
+            crate::detect_processing_backends().ensure_available(self.config.backend)?;
+        }
+        if matches!(
+            self.last_config_update,
+            ConfigUpdateKind::PlanBuildRequired | ConfigUpdateKind::LoadModelRequired
+        ) {
+            return Err(RuntimeError::State {
+                state: format!("{:?}", self.last_config_update),
+                action: "start_before_engine_preparation".into(),
+            });
+        }
         if self.descriptor.is_none() || self.engine.is_none() {
             return Err(RuntimeError::State {
                 state: format!("{:?}", self.lifecycle),
@@ -571,6 +861,9 @@ impl RuntimeInner {
                 action: "start".into(),
             });
         }
+        let engine = self.engine.as_mut().expect("engine checked above");
+        engine.validate_config(self.config.conversion)?;
+        engine.reset_stream()?;
         self.lifecycle = LifecycleState::Running;
         self.last_error = None;
         Ok(self.snapshot())
@@ -613,6 +906,7 @@ impl RuntimeInner {
                 descriptor,
                 self.model_package.as_deref(),
             )?);
+            self.engine_config = Some(self.config.clone());
         }
         self.lifecycle = if self.engine.is_some() {
             LifecycleState::Ready
@@ -636,11 +930,19 @@ impl RuntimeInner {
     }
 
     fn clear_error(&mut self) -> RuntimeResult<RuntimeSnapshot> {
-        if self.worker_status.is_some() {
+        if self.worker_status.is_some()
+            || matches!(
+                self.lifecycle,
+                LifecycleState::Loading | LifecycleState::Running | LifecycleState::Stopping
+            )
+        {
             return Err(RuntimeError::State {
                 state: format!("{:?}", self.lifecycle),
                 action: "clear_error_while_worker_active".into(),
             });
+        }
+        if let Some(engine) = self.engine.as_mut() {
+            engine.reset_stream()?;
         }
         self.last_error = None;
         if self.lifecycle == LifecycleState::Failed {
@@ -653,7 +955,11 @@ impl RuntimeInner {
         Ok(self.snapshot())
     }
 
-    fn load_model_inner(&mut self, path: String) -> RuntimeResult<RuntimeSnapshot> {
+    fn load_model_inner(
+        &mut self,
+        path: String,
+        mut config: RuntimeConfig,
+    ) -> RuntimeResult<RuntimeSnapshot> {
         let input = resolve_model_path(Path::new(&path))?;
         if !input.is_file() {
             return Err(RuntimeError::Config(format!(
@@ -667,7 +973,13 @@ impl RuntimeInner {
             .is_some_and(|value| {
                 value.eq_ignore_ascii_case("vfr") || value.eq_ignore_ascii_case("vfrm")
             }) {
-            let package = loader.load_cache_shared(&input)?;
+            let inspection = vocal_model::inspect_model_artifact(&input)?;
+            if !inspection.components.synth.present {
+                return Err(RuntimeError::Config(
+                    "select a voice model; this file contains only acoustic weights".into(),
+                ));
+            }
+            let package = loader.load_voice_cache_shared(&input)?;
             (package.clone(), package.manifest.clone())
         } else {
             let manifest = loader.load_manifest(&input)?;
@@ -676,9 +988,19 @@ impl RuntimeInner {
             (package, manifest)
         };
         let descriptor = manifest.descriptor();
-        let mut config = self.config.clone();
         config.model_path = Some(input.display().to_string());
-        let engine = create_runtime_engine(&config, &descriptor, Some(package.as_ref()))?;
+        let pending_plans =
+            config.backend == RuntimeBackend::TensorRtRtx && config.tensorrt_artifacts().is_none();
+        let engine = if pending_plans {
+            crate::detect_processing_backends().ensure_available(config.backend)?;
+            None
+        } else {
+            Some(create_runtime_engine(
+                &config,
+                &descriptor,
+                Some(package.as_ref()),
+            )?)
+        };
         if let Some(store) = &self.config_store {
             store.save(&config)?;
         }
@@ -688,10 +1010,20 @@ impl RuntimeInner {
         self.descriptor = Some(descriptor);
         self.loaded_model_path = Some(input.display().to_string());
         self.model_package = Some(package);
-        self.engine = Some(engine);
+        self.engine = engine;
+        self.engine_config = self.engine.as_ref().map(|_| self.config.clone());
         self.worker_status = None;
         self.worker_active = false;
-        self.lifecycle = LifecycleState::Ready;
+        self.lifecycle = if pending_plans {
+            LifecycleState::Created
+        } else {
+            LifecycleState::Ready
+        };
+        self.last_config_update = if pending_plans {
+            ConfigUpdateKind::PlanBuildRequired
+        } else {
+            ConfigUpdateKind::Unchanged
+        };
         self.last_error = None;
         Ok(self.snapshot())
     }
@@ -727,7 +1059,7 @@ impl RuntimeInner {
     fn complete_worker(
         &mut self,
         generation: u64,
-        engine: Box<dyn InferenceEngine>,
+        mut engine: Box<dyn InferenceEngine>,
         failure: Option<(String, String)>,
     ) -> RuntimeResult<RuntimeSnapshot> {
         if self.engine.is_some()
@@ -739,6 +1071,7 @@ impl RuntimeInner {
                 action: "complete_worker_without_active_worker".into(),
             });
         }
+        engine.flush_idle_caches();
         self.metrics = engine.metrics();
         self.worker_status = None;
         self.worker_active = false;
@@ -854,6 +1187,10 @@ fn scan_model_directory_impl(root_input: String) -> RuntimeResult<ModelCatalog> 
                 }
             };
             let path = item.path();
+            // Import/cache/editor staging is never a published library artifact.
+            if item.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             let metadata = match item.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
@@ -904,8 +1241,8 @@ fn scan_model_directory_impl(root_input: String) -> RuntimeResult<ModelCatalog> 
                     continue;
                 }
             };
-            let manifest = match inspect_model_manifest_with_config(&path, &load_config) {
-                Ok(manifest) => manifest,
+            let inspection = match inspect_model_artifact_with_config(&path, &load_config) {
+                Ok(inspection) => inspection,
                 Err(error) => {
                     let is_named_manifest = path
                         .file_name()
@@ -926,6 +1263,7 @@ fn scan_model_directory_impl(root_input: String) -> RuntimeResult<ModelCatalog> 
                     continue;
                 }
             };
+            let manifest = inspection.manifest;
             let path_string = canonical_path.display().to_string();
             let artifact_bytes = metadata.len();
             let kind = model_artifact_kind(&canonical_path).unwrap_or(ModelArtifactKind::Manifest);
@@ -944,6 +1282,7 @@ fn scan_model_directory_impl(root_input: String) -> RuntimeResult<ModelCatalog> 
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
                     .unwrap_or_default(),
+                components: inspection.components,
                 model: ModelSummary::from(&manifest),
             });
         }
@@ -953,6 +1292,19 @@ fn scan_model_directory_impl(root_input: String) -> RuntimeResult<ModelCatalog> 
             .display_name
             .to_ascii_lowercase()
             .cmp(&right.model.display_name.to_ascii_lowercase())
+            .then_with(|| {
+                right
+                    .components
+                    .automatic_tensor_rt
+                    .cmp(&left.components.automatic_tensor_rt)
+            })
+            .then_with(|| {
+                right
+                    .components
+                    .retrieval
+                    .present
+                    .cmp(&left.components.retrieval.present)
+            })
             .then_with(|| artifact_priority(left.kind).cmp(&artifact_priority(right.kind)))
             .then_with(|| left.path.cmp(&right.path))
     });
@@ -998,13 +1350,27 @@ fn artifact_priority(kind: ModelArtifactKind) -> u8 {
 }
 
 fn catalog_identity(entry: &ModelCatalogEntry) -> String {
+    // Imports are independent records even when IDs match. Prefer a cache over
+    // its manifest within the same folder.
     let model = &entry.model;
     if model.id.trim().is_empty() {
         return format!("path:{}", entry.path);
     }
     format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        model.id, model.version, model.architecture, model.sample_rate
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        model.id,
+        model.version,
+        model.architecture,
+        model.sample_rate,
+        entry.components.automatic_tensor_rt,
+        entry.components.retrieval.present,
+        entry.components.synth.present,
+        entry.components.hubert.present,
+        entry.components.rmvpe.present,
+        Path::new(&entry.path)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .display()
     )
 }
 
@@ -1043,9 +1409,58 @@ fn referenced_model_bytes(manifest_path: &Path, manifest: &RvcModelManifest) -> 
 fn create_runtime_engine(
     config: &RuntimeConfig,
     descriptor: &ModelDescriptor,
+    package: Option<&ModelPackage>,
+) -> RuntimeResult<Box<dyn InferenceEngine>> {
+    let engine = build_runtime_engine(config, descriptor, package)?;
+    engine.validate_config(config.conversion)?;
+    Ok(engine)
+}
+
+fn engine_reload_config(config: &RuntimeConfig) -> RuntimeResult<EngineReloadConfig> {
+    let artifacts_path = config
+        .tensorrt_artifacts()
+        .ok_or_else(|| RuntimeError::Config("TensorRT artifacts path is not configured".into()))?;
+    Ok(EngineReloadConfig {
+        backend: config.backend.engine_kind(),
+        tensorrt: Some(TensorRtReloadConfig {
+            artifacts_path: PathBuf::from(artifacts_path),
+            speaker_id: config.speaker_id,
+            window_samples: config.tensorrt_window(),
+            graph_mode: config.tensorrt.graph_mode.clone(),
+            cuda_graph: config.tensorrt.cuda_graph,
+            native_cuda_graph: config.tensorrt.native_cuda_graph,
+            graph_cache_size: config.tensorrt.graph_cache_size,
+            parallel_acoustic: config.tensorrt.parallel_acoustic,
+            async_audio_d2h: config.tensorrt.async_audio_d2h,
+        }),
+    })
+}
+
+fn build_runtime_engine(
+    config: &RuntimeConfig,
+    descriptor: &ModelDescriptor,
     #[allow(unused_variables)] package: Option<&ModelPackage>,
 ) -> RuntimeResult<Box<dyn InferenceEngine>> {
+    #[cfg(not(feature = "cpu-graph"))]
+    if config.backend == RuntimeBackend::RvcCpu
+        && package.is_some_and(|p| {
+            p.metadata["canonical_schema"].as_str() == Some(vocal_model::RVC_TENSOR_SCHEMA)
+        })
+    {
+        return Err(RuntimeError::Config(
+            "CPU model inference requires the cpu-graph feature".into(),
+        ));
+    }
+    #[cfg(feature = "cpu-graph")]
+    if config.backend == RuntimeBackend::RvcCpu
+        && package.is_some_and(|p| {
+            p.metadata["canonical_schema"].as_str() == Some(vocal_model::RVC_TENSOR_SCHEMA)
+        })
+    {
+        return crate::cpu::create(config, descriptor);
+    }
     if config.backend == RuntimeBackend::TensorRtRtx {
+        crate::detect_processing_backends().ensure_available(config.backend)?;
         #[cfg(feature = "tensorrt-rtx")]
         {
             let package = package.ok_or_else(|| {
@@ -1091,10 +1506,21 @@ fn create_runtime_engine(
             .into());
         }
     }
+    if config.backend == RuntimeBackend::DirectMl {
+        crate::detect_processing_backends().ensure_available(config.backend)?;
+        #[cfg(feature = "directml")]
+        return crate::directml::create(config, descriptor);
+        #[cfg(not(feature = "directml"))]
+        return Err(RuntimeError::Config(
+            "DirectML requires the directml feature".into(),
+        ));
+    }
     Ok(create_engine(EngineConfig {
         backend: config.backend.engine_kind(),
         model: descriptor.clone(),
         tensorrt: None,
+        directml: None,
+        cpu: None,
     })?)
 }
 
@@ -1130,9 +1556,9 @@ mod tests {
         ModelDescriptor {
             id: "fixture".into(),
             display_name: "Fixture".into(),
-            architecture: "passthrough".into(),
+            architecture: "rvc-v1".into(),
             sample_rate: 16_000,
-            version: "0.1".into(),
+            version: "v1".into(),
         }
     }
 
@@ -1248,6 +1674,10 @@ mod tests {
             .report_failure("audio.worker", "worker stopped")
             .expect("report failure");
         assert!(matches!(
+            context.load_model("replacement.vfr"),
+            Err(RuntimeError::State { .. })
+        ));
+        assert!(matches!(
             context.clear_error(),
             Err(RuntimeError::State { .. })
         ));
@@ -1298,6 +1728,117 @@ mod tests {
     }
 
     #[test]
+    fn stale_backend_selection_leaves_model_and_configuration_untouched() {
+        let context = RuntimeContext::new(RuntimeConfig::default()).expect("context");
+        context.load_model_descriptor(descriptor()).expect("load");
+        let selection = crate::ModelBackendSelection {
+            expected_revision: 0,
+            backend: RuntimeBackend::RvcCpu,
+            automatic: false,
+            artifacts_path: None,
+            directml_sources_path: None,
+            directml_device_id: None,
+        };
+        assert!(matches!(
+            context.load_model_with_backend("missing.vfr", selection),
+            Err(RuntimeError::ConfigConflict { .. })
+        ));
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.lifecycle, LifecycleState::Ready);
+        assert_eq!(snapshot.config.backend, RuntimeBackend::Passthrough);
+        assert_eq!(snapshot.config_revision, 1);
+        assert!(snapshot.engine.is_some());
+    }
+
+    #[test]
+    fn automatic_startup_and_missing_backend_recovery_use_catalog_policy() {
+        let unavailable = crate::ProcessingBackendCatalog {
+            cpu: Default::default(),
+            recommended: RuntimeBackend::Passthrough,
+            backends: vec![crate::BackendAvailability {
+                backend: RuntimeBackend::Passthrough,
+                available: true,
+                reason: None,
+                device: Some("CPU".into()),
+                description: "Monitoring".into(),
+                devices: Vec::new(),
+                recommended_device_id: None,
+            }],
+        };
+        let context = RuntimeContext::new(RuntimeConfig {
+            backend: RuntimeBackend::TensorRtRtx,
+            backend_auto: false,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let notice = context
+            .request(move |state| state.initialize_processing_backend(unavailable))
+            .unwrap();
+        assert!(notice.is_some());
+        assert_eq!(
+            context.config().unwrap().backend,
+            RuntimeBackend::Passthrough
+        );
+        assert!(!context.config().unwrap().backend_auto);
+
+        let available = crate::ProcessingBackendCatalog {
+            cpu: Default::default(),
+            recommended: RuntimeBackend::TensorRtRtx,
+            backends: vec![crate::BackendAvailability {
+                backend: RuntimeBackend::TensorRtRtx,
+                available: true,
+                reason: None,
+                device: Some("GPU".into()),
+                description: "GPU conversion".into(),
+                devices: Vec::new(),
+                recommended_device_id: None,
+            }],
+        };
+        let automatic = RuntimeContext::new(RuntimeConfig::default()).unwrap();
+        automatic
+            .request(move |state| state.initialize_processing_backend(available))
+            .unwrap();
+        assert_eq!(
+            automatic.config().unwrap().backend,
+            RuntimeBackend::TensorRtRtx
+        );
+        assert!(automatic.snapshot().unwrap().engine.is_none());
+    }
+
+    #[cfg(not(feature = "tensorrt-rtx"))]
+    #[test]
+    fn unavailable_backend_is_rejected_without_replacing_the_idle_engine() {
+        let context = RuntimeContext::new(RuntimeConfig::default()).unwrap();
+        context.load_model_descriptor(descriptor()).unwrap();
+        let mut config = context.config().unwrap();
+        config.backend = RuntimeBackend::TensorRtRtx;
+        assert!(matches!(
+            context.update_config(config, 1),
+            Err(RuntimeError::Engine(
+                vocal_engine::EngineError::BackendUnavailable(_)
+            ))
+        ));
+        assert_eq!(
+            context.config().unwrap().backend,
+            RuntimeBackend::Passthrough
+        );
+        assert!(context.snapshot().unwrap().engine.is_some());
+        context
+            .start_processing()
+            .expect("old engine is still usable");
+    }
+
+    #[test]
+    fn pending_model_or_plan_changes_cannot_start_an_obsolete_engine() {
+        let context = RuntimeContext::new(RuntimeConfig::default()).unwrap();
+        context.load_model_descriptor(descriptor()).unwrap();
+        let mut config = context.config().unwrap();
+        config.model_path = Some("replacement.vfr".into());
+        context.update_config(config, 1).unwrap();
+        assert!(context.start_processing().is_err());
+    }
+
+    #[test]
     fn idle_hot_reload_keeps_engine_state() {
         let context = RuntimeContext::new(RuntimeConfig::default()).expect("context");
         context.load_model_descriptor(descriptor()).expect("load");
@@ -1332,7 +1873,13 @@ mod tests {
 
     #[test]
     fn pending_model_path_prevents_follow_up_engine_reload() {
-        let context = RuntimeContext::new(RuntimeConfig::default()).expect("context");
+        // Descriptor-only fixture exercises deferred replacement without
+        // advertising an uncompiled CPU backend in capability discovery.
+        let context = RuntimeContext::new(RuntimeConfig {
+            backend: RuntimeBackend::RvcCpu,
+            ..Default::default()
+        })
+        .expect("context");
         context.load_model_descriptor(descriptor()).expect("load");
 
         let mut config = context.config().expect("config");
@@ -1345,7 +1892,7 @@ mod tests {
             ConfigUpdateKind::LoadModelRequired
         );
 
-        config.backend = RuntimeBackend::RvcCpu;
+        config.backend = RuntimeBackend::Passthrough;
         let snapshot = context
             .update_config(config, snapshot.config_revision)
             .expect("defer backend change");
@@ -1366,6 +1913,95 @@ mod tests {
         let snapshot = context.clear_error().expect("clear");
         assert_eq!(snapshot.lifecycle, LifecycleState::Ready);
         assert!(snapshot.last_error.is_none());
+    }
+
+    #[test]
+    fn prepared_model_config_commit_is_atomic_and_revision_checked() {
+        let context = RuntimeContext::new(RuntimeConfig::default()).unwrap();
+        let original = context.load_model_descriptor(descriptor()).unwrap();
+        let mut candidate = original.config.clone();
+        candidate.queue_blocks = 2;
+        assert!(
+            context
+                .load_model_with_config(
+                    "missing-voice.vfrm",
+                    candidate.clone(),
+                    original.config_revision - 1
+                )
+                .is_err()
+        );
+        assert!(
+            context
+                .load_model_with_config(
+                    "missing-voice.vfrm",
+                    candidate.clone(),
+                    original.config_revision
+                )
+                .is_err()
+        );
+        let failed = context.snapshot().unwrap();
+        assert_eq!(failed.config_revision, original.config_revision);
+        assert_eq!(failed.config.queue_blocks, original.config.queue_blocks);
+        assert_eq!(failed.model.unwrap().id, original.model.unwrap().id);
+        assert!(failed.engine.is_some());
+        context.clear_error().unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "prepared-model-{}-{}.vfrm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        vocal_model::write_cache(
+            &path,
+            &vocal_model::ModelPackage {
+                manifest: vocal_model::RvcModelManifest {
+                    id: "prepared".into(),
+                    display_name: "Prepared voice".into(),
+                    architecture: "rvc-v2".into(),
+                    version: "v2".into(),
+                    sample_rate: 48_000,
+                    model_file: "voice.pth".into(),
+                    index_file: None,
+                    source: "test".into(),
+                    notes: None,
+                },
+                metadata: serde_json::json!({}),
+                tensors: vec![vocal_model::Tensor::byte_tensor("rvc.pth", vec![1, 2, 3])],
+            },
+        )
+        .unwrap();
+        let loaded = context
+            .load_model_with_config(
+                path.display().to_string(),
+                candidate.clone(),
+                original.config_revision,
+            )
+            .unwrap();
+        assert_eq!(loaded.config_revision, original.config_revision + 1);
+        assert_eq!(loaded.config.queue_blocks, 2);
+        assert_eq!(loaded.model.unwrap().id, "prepared");
+        assert_eq!(loaded.lifecycle, LifecycleState::Ready);
+        context.start_processing().unwrap();
+        let (generation, engine) = context.take_engine_for_worker().unwrap();
+        assert!(
+            context
+                .load_model_with_config(
+                    path.display().to_string(),
+                    candidate,
+                    loaded.config_revision
+                )
+                .is_err()
+        );
+        assert_eq!(
+            context.snapshot().unwrap().config_revision,
+            loaded.config_revision
+        );
+        context.stop_processing().unwrap();
+        context.complete_worker(generation, engine, None).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1400,7 +2036,7 @@ mod tests {
         let cache = vocal_model::ModelPackage {
             manifest: serde_json::from_value(manifest).unwrap(),
             metadata: serde_json::json!({}),
-            tensors: vec![vocal_model::Tensor::byte_tensor("payload", vec![1, 2, 3])],
+            tensors: vec![vocal_model::Tensor::byte_tensor("rvc.pth", vec![1, 2, 3])],
         };
         vocal_model::write_cache(root.join("fixture.vfrm"), &cache).expect("write cache");
 
@@ -1411,7 +2047,22 @@ mod tests {
         assert_eq!(catalog.entries.len(), 1);
         assert_eq!(catalog.entries[0].kind, ModelArtifactKind::Vfrm);
         assert_eq!(catalog.entries[0].model.id, "fixture");
+        assert!(catalog.entries[0].components.synth.present);
         assert!(catalog.issues.is_empty());
+        let imported = root.join("imported");
+        std::fs::create_dir(&imported).unwrap();
+        vocal_model::write_cache(imported.join("model.vfrm"), &cache).unwrap();
+        let hidden = root.join(".import-staging");
+        std::fs::create_dir(&hidden).unwrap();
+        vocal_model::write_cache(hidden.join("model.vfrm"), &cache).unwrap();
+        let refreshed = context
+            .scan_model_directory(root.to_string_lossy().into_owned())
+            .unwrap();
+        assert_eq!(
+            refreshed.entries.len(),
+            2,
+            "imported records stay visible, staging stays hidden"
+        );
         std::fs::remove_dir_all(root).expect("remove model root");
     }
 }

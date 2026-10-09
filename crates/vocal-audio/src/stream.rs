@@ -23,12 +23,25 @@ impl StreamIo {
 
     pub fn new_with_io_config(config: AudioIoConfig) -> Result<Self, AudioError> {
         let config = config.validate()?;
-        let stream = config.stream;
-        let queues = config.queues;
+        Self::new_duplex(config.stream, config.stream, config.queues)
+    }
+
+    /// Independent endpoint formats and block sizes. Blocks represent approximately
+    /// the same duration, but the worker may publish zero, one or multiple render
+    /// blocks after resampling. There is no one-to-one sample-count assumption.
+    pub fn new_duplex(
+        capture: StreamConfig,
+        render: StreamConfig,
+        queues: StreamQueueConfig,
+    ) -> Result<Self, AudioError> {
+        let queues = queues.validate()?;
         Ok(Self {
-            config: stream,
-            input: AudioRing::new(stream.with_queue_blocks(queues.input_blocks))?,
-            output: AudioRing::new(stream.with_queue_blocks(queues.output_blocks))?,
+            config: capture.validate()?,
+            input: AudioRing::new(capture.with_queue_blocks(queues.input_blocks))?,
+            output: AudioRing::new_with_prefill(
+                render.with_queue_blocks(queues.output_blocks),
+                queues.render_prefill_blocks,
+            )?,
         })
     }
 
@@ -46,11 +59,16 @@ impl StreamIo {
         self.config
     }
 
+    pub fn output_config(&self) -> StreamConfig {
+        self.output.config()
+    }
+
     pub fn queue_config(&self) -> StreamQueueConfig {
         StreamQueueConfig::new(
             self.input.config().queue_blocks,
             self.output.config().queue_blocks,
         )
+        .with_render_prefill(self.output.prefill_blocks())
     }
 
     pub fn split(self) -> (DeviceIo, WorkerIo) {
@@ -257,23 +275,27 @@ impl BlockAssembler {
         }
         let mut offset = 0;
         let mut pushed = 0;
+        let mut overflow = false;
         while offset < input.len() {
+            let block_timestamp = timestamp.later_by(Duration::from_secs_f64(
+                (offset / usize::from(self.config.format.channels)) as f64
+                    / f64::from(self.config.format.sample_rate),
+            ));
             if self.filled == 0 && input.len() - offset >= self.staging.len() {
                 let end = offset + self.staging.len();
-                match producer.try_push_at(&input[offset..end], timestamp) {
-                    Ok(_) => {}
+                match producer.try_push_at(&input[offset..end], block_timestamp) {
+                    Ok(_) => pushed += 1,
                     Err(AudioError::QueueFull) => {
                         self.dropped_blocks = self.dropped_blocks.saturating_add(1);
-                        return Err(AudioError::QueueFull);
+                        overflow = true;
                     }
                     Err(error) => return Err(error),
                 }
-                pushed += 1;
                 offset = end;
                 continue;
             }
             if self.filled == 0 {
-                self.staging_timestamp = timestamp;
+                self.staging_timestamp = block_timestamp;
             }
             let take = (self.staging.len() - self.filled).min(input.len() - offset);
             self.staging[self.filled..self.filled + take]
@@ -282,21 +304,22 @@ impl BlockAssembler {
             offset += take;
             if self.filled == self.staging.len() {
                 match producer.try_push_at(&self.staging, self.staging_timestamp) {
-                    Ok(_) => {}
+                    Ok(_) => pushed += 1,
                     Err(AudioError::QueueFull) => {
                         self.dropped_blocks = self.dropped_blocks.saturating_add(1);
-                        self.filled = 0;
-                        self.staging_timestamp = AudioTimestamp::ZERO;
-                        return Err(AudioError::QueueFull);
+                        overflow = true;
                     }
                     Err(error) => return Err(error),
                 }
                 self.filled = 0;
                 self.staging_timestamp = AudioTimestamp::ZERO;
-                pushed += 1;
             }
         }
-        Ok(pushed)
+        if overflow {
+            Err(AudioError::QueueFull)
+        } else {
+            Ok(pushed)
+        }
     }
 
     pub fn buffered_samples(&self) -> usize {
@@ -373,8 +396,15 @@ impl BlockDrainer {
             return Err(AudioError::PartialFrame);
         }
         let mut report = DrainReport::default();
+        if !consumer.ready_for_playback() {
+            output.fill(0.0);
+            return Ok(report);
+        }
         if self.offset < self.current.len() {
-            report.source_timestamp = self.current_timestamp;
+            report.source_timestamp = self.current_timestamp.later_by(Duration::from_secs_f64(
+                (self.offset / usize::from(self.config.format.channels)) as f64
+                    / f64::from(self.config.format.sample_rate),
+            ));
         }
         // The common WASAPI/cpal path uses a fixed engine period equal to one
         // inference block. Read directly into the device buffer and avoid the
@@ -443,6 +473,10 @@ impl BlockDrainer {
             .is_multiple_of(self.config.format.channels as usize)
         {
             return Err(AudioError::PartialFrame);
+        }
+        if !consumer.ready_for_playback() {
+            output.fill(0.0);
+            return Ok(DrainReport::default());
         }
         let channels = self.config.format.channels as usize;
         let output_frames = output.len() / channels;

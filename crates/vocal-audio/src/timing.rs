@@ -40,6 +40,29 @@ impl AudioTimestamp {
     pub const fn is_set(self) -> bool {
         self.0 != 0
     }
+
+    /// Account for a causal converter's group delay without manufacturing a
+    /// timestamp for an unprofiled stream. An earlier source yields greater age.
+    pub fn earlier_by(self, delay: Duration) -> Self {
+        if !self.is_set() {
+            return self;
+        }
+        Self(
+            self.0
+                .saturating_sub(delay.as_nanos().min(u64::MAX as u128) as u64)
+                .max(1),
+        )
+    }
+
+    pub fn later_by(self, offset: Duration) -> Self {
+        if !self.is_set() {
+            return self;
+        }
+        Self(
+            self.0
+                .saturating_add(offset.as_nanos().min(u64::MAX as u128) as u64),
+        )
+    }
 }
 
 /// Process-local monotonic clock for capture-to-render measurements.

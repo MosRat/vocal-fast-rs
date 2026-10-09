@@ -45,6 +45,19 @@ pub(crate) fn load_rvc_pth(path: &Path) -> Result<(JsonValue, Vec<crate::Tensor>
     let file = File::open(path)?;
     let mut archive =
         ZipArchive::new(file).map_err(|e| bad(format!("invalid PyTorch ZIP: {e}")))?;
+    if archive.len() > 100_000 {
+        return Err(bad("checkpoint has too many ZIP entries"));
+    }
+    let mut expanded = 0_u64;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(|e| bad(e.to_string()))?;
+        expanded = expanded
+            .checked_add(entry.size())
+            .ok_or_else(|| bad("checkpoint size overflow"))?;
+        if expanded > 4 * 1024 * 1024 * 1024 || entry.size() > 512 * 1024 * 1024 {
+            return Err(bad("checkpoint expanded size exceeds import limits"));
+        }
+    }
     let pickle_name = (0..archive.len())
         .find_map(|i| {
             archive.by_index(i).ok().and_then(|entry| {
@@ -56,9 +69,14 @@ pub(crate) fn load_rvc_pth(path: &Path) -> Result<(JsonValue, Vec<crate::Tensor>
         })
         .ok_or_else(|| bad("RVC checkpoint is not a modern PyTorch ZIP (data.pkl missing)"))?;
     let mut pickle_bytes = Vec::new();
-    archive
+    let pickle = archive
         .by_name(&pickle_name)
-        .map_err(|e| bad(format!("cannot read data.pkl: {e}")))?
+        .map_err(|e| bad(format!("cannot read data.pkl: {e}")))?;
+    if pickle.size() > 16 * 1024 * 1024 {
+        return Err(bad("checkpoint metadata exceeds 16 MiB"));
+    }
+    pickle
+        .take(16 * 1024 * 1024 + 1)
         .read_to_end(&mut pickle_bytes)?;
     let parsed = parse(&pickle_bytes)?;
     let root = parsed.dict(parsed.root)?;
@@ -66,11 +84,28 @@ pub(crate) fn load_rvc_pth(path: &Path) -> Result<(JsonValue, Vec<crate::Tensor>
         .get("weight")
         .ok_or_else(|| bad("RVC checkpoint has no weight state_dict"))?;
     let weight = parsed.dict(weight_id)?;
+    if weight.len() > 100_000 {
+        return Err(bad("checkpoint contains too many tensors"));
+    }
     let mut tensors = Vec::with_capacity(weight.len());
+    let mut tensor_bytes = 0_u64;
     for (name, value_id) in weight {
         let Value::Tensor(view) = &parsed.arena[value_id] else {
             return Err(bad(format!("RVC weight {name} is not a tensor")));
         };
+        let bytes = view
+            .shape
+            .iter()
+            .try_fold(view.storage.dtype.element_size() as u64, |n, &dim| {
+                n.checked_mul(dim)
+            })
+            .ok_or_else(|| bad("tensor size overflows"))?;
+        tensor_bytes = tensor_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| bad("checkpoint tensor size overflows"))?;
+        if tensor_bytes > 2 * 1024 * 1024 * 1024 {
+            return Err(bad("materialized checkpoint tensors exceed 2 GiB"));
+        }
         tensors.push(materialize_tensor(name, view, &mut archive)?);
     }
     let mut metadata = serde_json::Map::new();
@@ -116,6 +151,7 @@ fn materialize_tensor(
     archive
         .by_name(&storage_name)
         .map_err(|e| bad(format!("cannot read storage: {e}")))?
+        .take(512 * 1024 * 1024 + 1)
         .read_to_end(&mut storage)?;
     let element_size = view.storage.dtype.element_size();
     let expected_storage = view

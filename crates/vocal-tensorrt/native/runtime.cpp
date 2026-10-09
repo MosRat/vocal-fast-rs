@@ -28,6 +28,7 @@ extern "C" void vocal_trt_runtime_free(vocal::Runtime* runtime) noexcept {
 
 static int create_context(
     vocal::Runtime* runtime, int32_t cuda_graph_strategy,
+    unsigned char const* cached, size_t cached_bytes, int32_t* cache_accepted,
     vocal::Context** out, char** error) noexcept {
     return vocal::guarded(error, [&] {
         vocal::require(runtime && runtime->engine && out, "invalid runtime handle");
@@ -35,6 +36,17 @@ static int create_context(
         std::unique_ptr<nvinfer1::IRuntimeConfig> runtime_config(
             runtime->engine->createRuntimeConfig());
         vocal::require(runtime_config != nullptr, "createRuntimeConfig failed");
+        std::unique_ptr<nvinfer1::IRuntimeCache> cache(runtime_config->createRuntimeCache());
+        if (cache_accepted) *cache_accepted = 0;
+        if (cache) {
+            if (cached && cached_bytes && cache->deserialize(cached, cached_bytes)) {
+                if (cache_accepted) *cache_accepted = 1;
+            }
+            if (!runtime_config->setRuntimeCache(*cache)) {
+                cache.reset();
+                if (cache_accepted) *cache_accepted = 0;
+            }
+        }
         if (cuda_graph_strategy != 0) {
             vocal::require(
                 cuda_graph_strategy == 1,
@@ -49,27 +61,52 @@ static int create_context(
                     nvinfer1::CudaGraphStrategy::kDISABLED),
                 "disable TensorRT CUDA graph strategy failed");
         }
-        auto* context = runtime->engine->createExecutionContext(runtime_config.get());
+        std::unique_ptr<IExecutionContext> context(
+            runtime->engine->createExecutionContext(runtime_config.get()));
         vocal::require(context != nullptr, "createExecutionContext failed");
-        *out = new vocal::Context{context, runtime->engine, runtime_config.release()};
+        auto result = std::make_unique<vocal::Context>();
+        result->context = context.release();
+        result->engine = runtime->engine;
+        result->runtime_config = runtime_config.release();
+        result->runtime_cache = cache.release();
+        *out = result.release();
     });
 }
 
 extern "C" int vocal_trt_context_create(
     vocal::Runtime* runtime, vocal::Context** out, char** error) noexcept {
-    return create_context(runtime, 0, out, error);
+    return create_context(runtime, 0, nullptr, 0, nullptr, out, error);
 }
 
 extern "C" int vocal_trt_context_create_with_options(
     vocal::Runtime* runtime, int32_t cuda_graph_strategy,
     vocal::Context** out, char** error) noexcept {
-    return create_context(runtime, cuda_graph_strategy, out, error);
+    return create_context(runtime, cuda_graph_strategy, nullptr, 0, nullptr, out, error);
+}
+
+extern "C" int vocal_trt_context_create_cached(
+    vocal::Runtime* runtime, int32_t strategy, unsigned char const* cached,
+    size_t cached_bytes, int32_t* accepted, vocal::Context** out, char** error) noexcept {
+    return create_context(runtime, strategy, cached, cached_bytes, accepted, out, error);
+}
+
+extern "C" int vocal_trt_context_cache(vocal::Context* context, vocal::Build** out,
+                                       char** error) noexcept {
+    return vocal::guarded(error, [&] {
+        vocal::require(context && out, "invalid context cache arguments");
+        *out = nullptr;
+        if (!context->runtime_cache) return;
+        auto result = std::make_unique<vocal::Build>();
+        result->mem = context->runtime_cache->serialize();
+        if (result->mem) *out = result.release();
+    });
 }
 
 extern "C" void vocal_trt_context_free(vocal::Context* context) noexcept {
     if (context) {
         delete context->context;
         delete context->runtime_config;
+        delete context->runtime_cache;
         delete context;
     }
 }

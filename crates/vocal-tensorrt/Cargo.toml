@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+vocal-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 vocal-model.workspace = true
 half.workspace = true
+memmap2 = "0.9"
 
 [build-dependencies]
 cc = "1.2"

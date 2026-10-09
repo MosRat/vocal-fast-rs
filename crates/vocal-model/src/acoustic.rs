@@ -4,7 +4,7 @@
 //! initializer table in the same VFRM container.  The IR is consumed by the
 //! native TensorRT builder; it is never an ONNX protobuf at runtime.
 
-use crate::{ModelError, ModelPackage, TensorDType};
+use crate::{ModelError, ModelPackage, RvcVersion, TensorDType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,6 +41,14 @@ pub struct AcousticPort {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HubertFeatureMode {
+    pub version: RvcVersion,
+    pub output_layer: usize,
+    pub feature_width: usize,
+    pub projection: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AcousticConfig {
     pub kind: AcousticKind,
     pub graph_schema: String,
@@ -48,6 +56,46 @@ pub struct AcousticConfig {
     pub outputs: Vec<AcousticPort>,
     pub node_count: usize,
     pub tensor_map: Vec<AcousticTensorMap>,
+    /// Empty in older acoustic packages; builders infer support from weights.
+    #[serde(default)]
+    pub rvc_feature_modes: Vec<HubertFeatureMode>,
+}
+
+impl AcousticConfig {
+    pub(crate) fn validate_rvc_version(&self, version: RvcVersion) -> Result<(), ModelError> {
+        self.validate_feature_modes()?;
+        if self.kind != AcousticKind::Hubert
+            || (!self.rvc_feature_modes.is_empty()
+                && !self
+                    .rvc_feature_modes
+                    .iter()
+                    .any(|mode| mode.version == version))
+        {
+            return Err(ModelError::UnsupportedModel(format!(
+                "HuBERT package does not support RVC {}",
+                version.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_feature_modes(&self) -> Result<(), ModelError> {
+        let mut versions = std::collections::HashSet::new();
+        for mode in &self.rvc_feature_modes {
+            let projection = (mode.version == RvcVersion::V1).then_some("hubert.model.final_proj");
+            if self.kind != AcousticKind::Hubert
+                || !versions.insert(mode.version)
+                || mode.feature_width != mode.version.feature_width()
+                || mode.output_layer != mode.version.hubert_output_layer()
+                || mode.projection.as_deref() != projection
+            {
+                return Err(ModelError::InvalidCache(
+                    "invalid HuBERT RVC feature mode metadata".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ModelPackage {
@@ -72,6 +120,15 @@ impl ModelPackage {
         let config = self.acoustic_config()?.ok_or_else(|| {
             ModelError::UnsupportedModel("expected acoustic-v1 VFRM package".into())
         })?;
+        config.validate_feature_modes()?;
+        for mode in &config.rvc_feature_modes {
+            crate::rvc_version::validate_hubert_feature_tensors(
+                mode.version,
+                self.tensors
+                    .iter()
+                    .map(|t| (t.name.as_str(), t.shape.as_slice(), t.dtype)),
+            )?;
+        }
         if expected.is_some_and(|kind| kind != config.kind) {
             return Err(ModelError::UnsupportedModel(format!(
                 "acoustic package kind {} does not match requested kind",

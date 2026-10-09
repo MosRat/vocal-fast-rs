@@ -13,6 +13,9 @@ pub use wav::{WavData, WavError, read_wav, read_wav_bytes, resample_linear, writ
 #[cfg(feature = "cpal-backend")]
 pub mod cpal_backend;
 
+#[cfg(feature = "cpal-backend")]
+mod cpal_samples;
+
 #[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
 pub mod wasapi_backend;
 
@@ -24,3 +27,6 @@ mod backend_error;
 
 #[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
 mod wasapi_native;
+
+#[cfg(all(feature = "wasapi-backend", target_os = "windows"))]
+mod wasapi_devices;

@@ -11,6 +11,11 @@ use vocal_model::RetrievalIndex;
 
 use crate::{CudaBuffer, CudaStream, NativeBuildError, ffi};
 
+pub(crate) mod protection;
+
+#[cfg(test)]
+mod tests;
+
 pub struct GpuRetrievalIndex {
     raw: *mut ffi::RetrievalGpuIndex,
     dimensions: usize,
@@ -113,6 +118,7 @@ impl GpuRetrievalIndex {
         if frames == 0 {
             return Ok(());
         }
+        validate_blend_buffers(frames, self.dimensions, features.bytes, index_rate.bytes)?;
         let mut error = ptr::null_mut();
         let code = unsafe {
             ffi::vocal_faiss_gpu_blend(
@@ -136,6 +142,26 @@ impl GpuRetrievalIndex {
             Ok(())
         }
     }
+}
+
+fn validate_blend_buffers(
+    frames: usize,
+    dimensions: usize,
+    feature_bytes: usize,
+    rate_bytes: usize,
+) -> Result<(), NativeBuildError> {
+    let required = frames
+        .checked_mul(dimensions)
+        .and_then(|n| n.checked_mul(size_of::<f32>()));
+    if frames > i32::MAX as usize
+        || required.is_none_or(|bytes| bytes > feature_bytes)
+        || rate_bytes < size_of::<f32>()
+    {
+        return Err(NativeBuildError::Argument(
+            "retrieval shape exceeds CUDA grid or buffer capacity".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for GpuRetrievalIndex {

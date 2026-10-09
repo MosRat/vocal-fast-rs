@@ -8,18 +8,19 @@
 use std::time::Instant;
 use std::{fs, path::Path};
 
-use vocal_model::{ModelPackage, RetrievalIndex, RvcSynthConfig, load_cache_shared};
+use vocal_model::{ModelPackage, RetrievalIndex, RvcSynthConfig, load_voice_cache_shared};
 use vocal_types::{AudioChunk, AudioFormat, ConversionConfig, LatencyMetrics, ModelDescriptor};
 
 use crate::{
     EngineError, EngineReloadConfig, InferenceEngine,
     audio_adapter::{
         RealtimeBufferState, StreamingOutputJoiner, StreamingWindow, apply_rms_mix, interleave,
-        tail_with_length, to_internal_rate, to_mono,
+        tail_with_length, to_mono,
     },
     config::{TensorRtEngineSpec, TensorRtReloadConfig},
     logging,
     state::{EngineLifecycle, EngineStatus},
+    streaming_output::{apply_realtime_rms_mix, decoder_source_tail},
 };
 
 use vocal_tensorrt::{
@@ -103,14 +104,8 @@ pub struct TensorRtEngine {
     realtime_config: RvcRealtimeConfig,
     stream_config: RvcRealtimeConfig,
     realtime_buffers: RealtimeBufferState,
-    /// Rolling input level used by Applio's realtime output envelope. It
-    /// suppresses decoder residue when the callback stream enters silence.
-    input_level_buffer: Vec<f32>,
-    /// Reference workers execute the model while the context window is being
-    /// filled, but publish silence for these initial blocks. Keeping this
-    /// counter outside the TensorRT pipeline also clears SOLA state exactly
-    /// at a stream reset and avoids feeding zero-padded output into the joiner.
-    warmup_remaining: usize,
+    input_resampler: Option<crate::streaming_resampler::ModelInputResampler>,
+    format: Option<AudioFormat>,
 }
 
 impl TensorRtEngine {
@@ -130,7 +125,7 @@ impl TensorRtEngine {
             .validate()
             .map_err(|error| EngineError::InvalidConfig(error.to_string()))?;
         let artifacts = read_artifacts(&backend.artifacts_path)?;
-        let package = load_cache_shared(&backend.model_package_path)
+        let package = load_voice_cache_shared(&backend.model_package_path)
             .map_err(|error| backend_error("load VFRM package", error))?;
         Self::from_package_and_artifacts(model, &package, artifacts, backend)
     }
@@ -157,6 +152,18 @@ impl TensorRtEngine {
         let synth_config = package
             .validate_rvc_synth()
             .map_err(|error| backend_error("validate VFRM Synth package", error))?;
+        let selected_version =
+            vocal_model::RvcVersion::from_labels(&model.version, &model.architecture)
+                .map_err(|error| EngineError::InvalidConfig(error.to_string()))?;
+        let package_version = package
+            .manifest
+            .rvc_version()
+            .map_err(|error| backend_error("validate VFRM RVC version", error))?;
+        if selected_version != package_version || selected_version != artifacts.rvc_version {
+            return Err(EngineError::InvalidConfig(
+                "TensorRT artifacts, Synth package, and selected model disagree on RVC v1/v2 feature contract".into(),
+            ));
+        }
         if package.manifest.id != model.id {
             return Err(EngineError::InvalidConfig(format!(
                 "VFRM package id {} does not match selected model {}",
@@ -171,6 +178,7 @@ impl TensorRtEngine {
         }
         let retrieval = RetrievalIndex::from_package(package)
             .map_err(|error| backend_error("load FAISS retrieval index", error))?;
+        validate_speaker(backend.speaker_id, &synth_config)?;
         let window_samples = backend
             .window_samples
             .unwrap_or_else(|| artifacts.profile.opt_samples.max(1) as usize);
@@ -178,8 +186,6 @@ impl TensorRtEngine {
         let pipeline = load_pipeline(&artifacts, &synth_config, &backend, retrieval.as_ref())?;
         let window = StreamingWindow::new(window_samples)?;
         let realtime_config = realtime_config_for_window(window_samples);
-        let warmup_remaining = warmup_blocks_for_window(window_samples, realtime_config);
-        let input_level_buffer = vec![0.0; realtime_level_window(realtime_config)];
         Ok(Self {
             pipeline,
             retrieval,
@@ -201,22 +207,23 @@ impl TensorRtEngine {
             realtime_config,
             stream_config: realtime_config,
             realtime_buffers: RealtimeBufferState::default(),
-            input_level_buffer,
-            warmup_remaining,
+            input_resampler: None,
+            format: None,
         })
     }
 
     pub fn reset(&mut self) -> Result<(), EngineError> {
-        self.window.reset();
-        self.output_joiner.reset();
-        self.realtime_buffers.reset();
-        self.input_level_buffer.fill(0.0);
-        self.warmup_remaining =
-            warmup_blocks_for_window(self.window.target_samples(), self.realtime_config);
+        // Complete the fallible device reset before changing host stream state.
         self.pipeline
             .reset_streaming_state()
             .map_err(|error| backend_error("reset TensorRT pipeline", error))?;
+        self.window.reset();
+        self.output_joiner.reset();
+        self.realtime_buffers.reset();
+        self.input_resampler = None;
         self.last_timings = None;
+        self.format = None;
+        self.status.ready();
         Ok(())
     }
 
@@ -236,7 +243,11 @@ impl TensorRtEngine {
     /// object stable. The caller must ensure the worker is idle; construction
     /// happens entirely in locals so a failed reload leaves the old pipeline
     /// usable.
-    fn reload_pipeline(&mut self, config: TensorRtReloadConfig) -> Result<(), EngineError> {
+    fn prepare_pipeline_reload(
+        &mut self,
+        config: TensorRtReloadConfig,
+    ) -> Result<Box<dyn crate::PreparedEngineReload + '_>, EngineError> {
+        validate_speaker(config.speaker_id, &self.synth_config)?;
         let env = TensorRtConfig::from_env().map_err(config_error)?;
         let graph_mode =
             vocal_tensorrt::GraphReplayMode::parse(&config.graph_mode).ok_or_else(|| {
@@ -275,20 +286,24 @@ impl TensorRtEngine {
         )?;
         let window = StreamingWindow::new(window_samples)?;
         let realtime_config = realtime_config_for_window(window_samples);
-        self.pipeline = pipeline;
-        self.window = window;
-        self.realtime_config = realtime_config;
-        self.stream_config = realtime_config;
-        self.output_joiner = StreamingOutputJoiner::new(
+        let joiner = StreamingOutputJoiner::new(
             16_000,
             realtime_config.crossfade_samples_16k,
             realtime_config.sola_search_samples_16k,
         );
-        self.realtime_buffers.reset();
-        self.input_level_buffer = vec![0.0; realtime_level_window(realtime_config)];
-        self.warmup_remaining = warmup_blocks_for_window(window_samples, realtime_config);
-        self.speaker_id = backend.speaker_id;
-        Ok(())
+        Ok(crate::reload::prepared_reload(move || {
+            self.pipeline = pipeline;
+            self.window = window;
+            self.realtime_config = realtime_config;
+            self.stream_config = realtime_config;
+            self.output_joiner = joiner;
+            self.realtime_buffers.reset();
+            self.input_resampler = None;
+            self.speaker_id = backend.speaker_id;
+            self.last_timings = None;
+            self.format = None;
+            self.status.ready();
+        }))
     }
 
     fn process_block(
@@ -300,25 +315,45 @@ impl TensorRtEngine {
     ) -> Result<AudioChunk, EngineError> {
         validate_native_conversion(config, self.pipeline.has_retrieval_index())?;
         self.pipeline
+            .set_pitch_controls(config.pitch_semitones, config.auto_pitch)
+            .map_err(|error| backend_error("set pitch controls", error))?;
+        self.pipeline
             .set_retrieval_ratio(config.index_ratio)
             .map_err(|error| backend_error("set FAISS retrieval ratio", error))?;
+        self.pipeline
+            .set_protect(config.protect)
+            .map_err(|error| backend_error("set unvoiced protection", error))?;
+        if self.format.is_some_and(|previous| previous != format) {
+            self.reset()?;
+        }
+        if self.format != Some(format) {
+            self.input_resampler = Some(crate::streaming_resampler::ModelInputResampler::new(
+                format.sample_rate,
+            )?);
+            self.format = Some(format);
+        }
         let started = Instant::now();
         let mono = to_mono(format, samples);
-        let internal = to_internal_rate(&mono, format.sample_rate);
+        let internal = self
+            .input_resampler
+            .as_mut()
+            .ok_or_else(|| {
+                EngineError::InvalidState("TensorRT input converter was not prepared".into())
+            })?
+            .process(&mono)?;
         let output_mono = if self.pipeline.config.uses_f0 {
             self.realtime_buffers.append_input(&internal, &mono);
             let target_internal = self.stream_config.chunk_samples_16k.max(160);
             let target_source =
                 crate::pipeline::resampled_len(target_internal, 16_000, format.sample_rate);
             let mut chunk_count = 0usize;
-            while let Some((chunk_internal, chunk_source)) = self
+            while let Some((chunk_internal, _chunk_source)) = self
                 .realtime_buffers
                 .take_input_chunk(target_internal, target_source)
             {
                 let converted = self.infer_realtime_chunk(
                     format,
                     &chunk_internal,
-                    &chunk_source,
                     sequence.saturating_add(chunk_count as u64),
                     config,
                 )?;
@@ -353,12 +388,10 @@ impl TensorRtEngine {
         &mut self,
         format: AudioFormat,
         internal: &[f32],
-        source: &[f32],
         sequence: u64,
         config: ConversionConfig,
     ) -> Result<Vec<f32>, EngineError> {
         let advance_frames = internal.len().div_ceil(160).clamp(1, 1023);
-        let input_rms = self.update_input_level(internal);
         let window = self.window.push(internal)?;
         let output = self
             .pipeline
@@ -394,26 +427,20 @@ impl TensorRtEngine {
         } else {
             output.audio
         };
-        // Applio keeps the CUDA pipeline hot while the circular context is
-        // filling, then returns zero blocks for `ceil(window/chunk)+1`
-        // iterations. Do not pass these blocks through SOLA: its overlap
-        // buffer must remain zero until the first publishable block.
-        if self.warmup_remaining > 0 {
-            self.warmup_remaining -= 1;
-            return Ok(vec![0.0; block_frames]);
-        }
+        // Missing startup history is already represented by left-padded
+        // silence. Publishing the valid tail preserves the first utterance.
         let mut converted = crate::pipeline::resample_linear(
             &model_audio,
             self.model_sample_rate,
             format.sample_rate,
         );
-        // Applio scales the realtime decoder output by the rolling callback
-        // RMS before resampling. Besides preserving perceived loudness, this
-        // prevents a neural decoder from sustaining a mechanical residue
-        // after the input has gone quiet.
-        for sample in &mut converted {
-            *sample *= input_rms;
-        }
+        apply_realtime_rms_mix(
+            decoder_source_tail(window, model_audio.len(), self.model_sample_rate),
+            16000,
+            &mut converted,
+            format.sample_rate,
+            config.rms_mix_rate,
+        );
         if let Some(directory) = std::env::var_os("VOCAL_TRT_DUMP_STREAM_BLOCKS") {
             let path = std::path::PathBuf::from(directory).join(format!("block-{sequence:04}.f32"));
             let bytes = converted
@@ -431,11 +458,7 @@ impl TensorRtEngine {
         }
         let needed = self.output_joiner.required_samples(block_frames);
         let extended = head_with_length(&converted, needed);
-        let mut output = self.output_joiner.process(&extended, block_frames);
-        if config.rms_mix_rate < 1.0 && !source.is_empty() {
-            apply_rms_mix(source, &mut output, config.rms_mix_rate);
-        }
-        Ok(output)
+        Ok(self.output_joiner.process(&extended, block_frames))
     }
 
     fn infer_non_realtime_chunk(
@@ -466,7 +489,29 @@ impl TensorRtEngine {
 }
 
 impl InferenceEngine for TensorRtEngine {
-    fn reload_config(&mut self, config: EngineReloadConfig) -> Result<(), EngineError> {
+    fn flush_idle_caches(&mut self) {
+        self.pipeline.persist_runtime_caches();
+    }
+    fn preferred_batch_frames(&self, format: AudioFormat) -> usize {
+        crate::pipeline::resampled_len(
+            self.stream_config.chunk_samples_16k,
+            16_000,
+            format.sample_rate,
+        )
+    }
+
+    fn reset_stream(&mut self) -> Result<(), EngineError> {
+        self.reset()
+    }
+
+    fn validate_config(&self, config: ConversionConfig) -> Result<(), EngineError> {
+        validate_native_conversion(config, self.pipeline.has_retrieval_index())
+    }
+
+    fn prepare_reload_config(
+        &mut self,
+        config: EngineReloadConfig,
+    ) -> Result<Box<dyn crate::PreparedEngineReload + '_>, EngineError> {
         if config.backend != crate::BackendKind::TensorRtRtx {
             return Err(EngineError::InvalidConfig(
                 "TensorRT engine cannot switch backend in place".into(),
@@ -475,7 +520,7 @@ impl InferenceEngine for TensorRtEngine {
         let spec = config.tensorrt.ok_or_else(|| {
             EngineError::InvalidConfig("TensorRT reload requires execution settings".into())
         })?;
-        self.reload_pipeline(spec)
+        self.prepare_pipeline_reload(spec)
     }
 
     fn process(
@@ -558,39 +603,6 @@ fn realtime_config_for_window(window_samples: usize) -> RvcRealtimeConfig {
     }
 }
 
-fn warmup_blocks_for_window(window_samples: usize, realtime: RvcRealtimeConfig) -> usize {
-    let chunk = realtime.chunk_samples_16k.max(1);
-    window_samples.div_ceil(chunk).saturating_add(1)
-}
-
-fn realtime_level_window(realtime: RvcRealtimeConfig) -> usize {
-    realtime
-        .chunk_samples_16k
-        .saturating_add(realtime.crossfade_samples_16k)
-        .max(1)
-}
-
-impl TensorRtEngine {
-    fn update_input_level(&mut self, internal: &[f32]) -> f32 {
-        let window = self.input_level_buffer.len();
-        if internal.len() >= window {
-            self.input_level_buffer
-                .copy_from_slice(&internal[internal.len() - window..]);
-        } else {
-            self.input_level_buffer.copy_within(internal.len().., 0);
-            let start = window - internal.len();
-            self.input_level_buffer[start..].copy_from_slice(internal);
-        }
-        let mean_square = self
-            .input_level_buffer
-            .iter()
-            .map(|sample| sample * sample)
-            .sum::<f32>()
-            / window as f32;
-        mean_square.sqrt()
-    }
-}
-
 fn crop_realtime_audio(
     audio: &[f32],
     rvc_frames: usize,
@@ -658,21 +670,20 @@ fn validate_native_conversion(
     has_retrieval_index: bool,
 ) -> Result<(), EngineError> {
     crate::validate_conversion(config)?;
-    let default = ConversionConfig::default();
-    if config.pitch_semitones != 0.0 {
-        return Err(EngineError::InvalidConfig(
-            "TensorRT backend currently requires pitch_semitones = 0; apply pitch in the native frontend profile before enabling it".into(),
-        ));
-    }
     if config.index_ratio != 0.0 && !has_retrieval_index {
         return Err(EngineError::InvalidConfig(
             "TensorRT backend has no loaded feature index; index_ratio must be 0".into(),
         ));
     }
-    if (config.protect - default.protect).abs() > f32::EPSILON {
-        return Err(EngineError::InvalidConfig(
-            "TensorRT backend uses the native protection policy; protect must remain 0.33".into(),
-        ));
+    Ok(())
+}
+
+fn validate_speaker(speaker: i32, synth: &RvcSynthConfig) -> Result<(), EngineError> {
+    if speaker < 0 || speaker as i64 >= synth.speakers as i64 {
+        return Err(EngineError::InvalidConfig(format!(
+            "TensorRT speaker ID {speaker} is outside 0..{}",
+            synth.speakers
+        )));
     }
     Ok(())
 }
@@ -687,17 +698,49 @@ fn backend_error(stage: &str, error: impl std::fmt::Display) -> EngineError {
 
 #[cfg(test)]
 mod tests {
-    use super::{crop_realtime_audio, realtime_config_for_window, warmup_blocks_for_window};
+    use super::{crop_realtime_audio, realtime_config_for_window, validate_native_conversion};
 
     #[test]
-    fn realtime_warmup_matches_reference_window_chunks() {
-        assert_eq!(
-            warmup_blocks_for_window(11_200, realtime_config_for_window(11_200)),
-            3
+    fn conversion_validation_accepts_protection_range_without_an_index() {
+        for protect in [0.0, 0.33, 0.5, 1.0] {
+            let config = vocal_types::ConversionConfig {
+                protect,
+                ..Default::default()
+            };
+            validate_native_conversion(config, false).unwrap();
+            validate_native_conversion(config, true).unwrap();
+        }
+        for protect in [f32::NAN, -0.1, 1.1] {
+            assert!(
+                validate_native_conversion(
+                    vocal_types::ConversionConfig {
+                        protect,
+                        ..Default::default()
+                    },
+                    true
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_native_conversion(
+                vocal_types::ConversionConfig {
+                    index_ratio: 0.5,
+                    ..Default::default()
+                },
+                false
+            )
+            .is_err()
         );
-        assert_eq!(
-            warmup_blocks_for_window(44_960, realtime_config_for_window(44_960)),
-            13
+        assert!(
+            validate_native_conversion(
+                vocal_types::ConversionConfig {
+                    pitch_semitones: f32::NAN,
+                    ..Default::default()
+                },
+                true
+            )
+            .is_err()
         );
     }
 

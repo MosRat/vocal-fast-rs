@@ -1,6 +1,11 @@
 mod build_support;
 
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    process::Command,
+};
 
 fn main() {
     for variable in [
@@ -25,6 +30,52 @@ fn main() {
         .unwrap_or_else(|| {
             PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4")
         });
+    // Native graphs are statically linked: a nonexistent DLL's timestamp
+    // cannot invalidate plans after graph fixes. Hash builder sources instead.
+    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+    for file in [
+        "native/bridge.h",
+        "native/common.cpp",
+        "native/onnx.cpp",
+        "native/hubert.cpp",
+        "native/rmvpe.cpp",
+        "native/frontend.cpp",
+        "native/plugin.cpp",
+        "native/serialization.cpp",
+        "native/graph/layers.h",
+        "native/graph/layers.cpp",
+        "native/graph/encoder.cpp",
+        "native/graph/flow.cpp",
+        "native/graph/decoder.cpp",
+        "native/graph/build.cpp",
+        "src/abi.rs",
+        "src/builder.rs",
+        "src/acoustic.rs",
+        "src/graph.rs",
+    ] {
+        println!("cargo:rerun-if-changed={file}");
+        file.hash(&mut fingerprint);
+        fs::read(file)
+            .expect("builder source exists")
+            .hash(&mut fingerprint);
+    }
+    for file in [
+        r.join("include/NvInferVersion.h"),
+        r.join("bin/tensorrt_rtx_1_6.dll"),
+        r.join("bin/tensorrt_onnxparser_rtx_1_6.dll"),
+    ] {
+        println!("cargo:rerun-if-changed={}", file.display());
+        if file.extension().is_some_and(|ext| ext == "h") {
+            fs::read(&file).ok().hash(&mut fingerprint);
+        } else if let Ok(metadata) = fs::metadata(file) {
+            metadata.len().hash(&mut fingerprint);
+            metadata.modified().ok().hash(&mut fingerprint);
+        }
+    }
+    println!(
+        "cargo:rustc-env=VOCAL_TRT_BUILDER_FINGERPRINT={:016x}",
+        fingerprint.finish()
+    );
     for file in [
         "native/bridge.h",
         "native/nvtx.h",
@@ -38,6 +89,10 @@ fn main() {
         "native/serialization.cpp",
         "native/plugin.cpp",
         "native/retrieval.cu",
+        "native/retrieval_protection.cu",
+        "native/pitch_matching.cu",
+        "native/retrieval_block.cuh",
+        "native/retrieval_kernels.cuh",
         "native/cufft_frontend.cu",
         "native/graph/layers.h",
         "native/graph/layers.cpp",
@@ -112,6 +167,8 @@ fn main() {
         .arg(c.join("include"))
         .arg("native/cufft_frontend.cu")
         .arg("native/retrieval.cu")
+        .arg("native/retrieval_protection.cu")
+        .arg("native/pitch_matching.cu")
         .arg("-o")
         .arg(&cufft_lib)
         .status()

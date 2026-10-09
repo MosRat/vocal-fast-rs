@@ -7,13 +7,24 @@
 //! and transport: Tauri owns device views, while CLI owns argument parsing and
 //! output.
 
+mod capabilities;
 mod config;
+#[cfg(feature = "cpu-graph")]
+mod cpu;
+#[cfg(feature = "directml")]
+mod directml;
 mod error;
+mod memory;
+pub mod model_library;
 mod state;
 
+pub use capabilities::{
+    BackendAvailability, CpuCapabilities, ProcessingBackendCatalog, ProcessingDevice,
+    ProcessingDeviceKind, detect_processing_backends, detect_tensor_rt_backend,
+};
 pub use config::{
-    ConfigStore, ConfigUpdateKind, RUNTIME_CONFIG_SCHEMA_VERSION, RuntimeBackend, RuntimeConfig,
-    TensorRtPipelineConfig, classify_config_change,
+    ConfigStore, ConfigUpdateKind, ModelBackendSelection, RUNTIME_CONFIG_SCHEMA_VERSION,
+    RuntimeBackend, RuntimeConfig, TensorRtPipelineConfig, classify_config_change,
 };
 pub use error::{RuntimeError, RuntimeResult};
 pub use state::{

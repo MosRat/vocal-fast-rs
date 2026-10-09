@@ -48,6 +48,8 @@ struct NodeProto {
 struct AttributeProto {
     #[prost(string, tag = "1")]
     name: String,
+    #[prost(float, tag = "2")]
+    float: f32,
     #[prost(int64, tag = "3")]
     int: i64,
     #[prost(int64, repeated, packed = "true", tag = "8")]
@@ -176,11 +178,7 @@ pub(crate) fn load_rvc_onnx(
         .and_then(|v| serde_json::from_str::<Value>(v).ok())
         .unwrap_or_else(|| json!({}));
     let schema = if input_names.contains("feats") {
-        if input_names.contains("pitch") {
-            "rvc-v2-f0-feats"
-        } else {
-            "rvc-v2-nof0-feats"
-        }
+        canonical::graph_schema(manifest)
     } else if input_names.contains("phone") {
         if input_names.contains("pitch") {
             "rvc-phone-f0"
@@ -323,16 +321,62 @@ fn infer_onnx_config(
     RvcSynthConfig::from_onnx_parts(manifest, tensors, ups, kernels, dilations3, resblock_type)
 }
 
+fn rvc_gemm_head(node: &NodeProto) -> Result<&str, ModelError> {
+    let bias = node.inputs.get(2).map(String::as_str).unwrap_or_default();
+    let head = bias
+        .strip_suffix(".bias")
+        .filter(|head| matches!(*head, "enc_p.emb_phone" | "dec.m_source.l_linear"))
+        .ok_or_else(|| {
+            ModelError::UnsupportedModel("Gemm is not a standard RVC phone/NSF linear".into())
+        })?;
+    let mut names = HashSet::new();
+    for attribute in &node.attributes {
+        let supported = match attribute.name.as_str() {
+            "alpha" | "beta" => attribute.float == 1.,
+            "transA" => attribute.int == 0,
+            "transB" => matches!(attribute.int, 0 | 1),
+            _ => false,
+        };
+        if !supported || !names.insert(attribute.name.as_str()) {
+            return Err(ModelError::UnsupportedModel(format!(
+                "unsupported RVC Gemm attribute {}",
+                attribute.name
+            )));
+        }
+    }
+    Ok(head)
+}
+
 fn canonicalize_initializers(
     graph: &GraphProto,
     tensors: Vec<Tensor>,
 ) -> Result<Vec<canonical::CanonicalTensor>, ModelError> {
     let mut entries = Vec::new();
-    for tensor in tensors {
+    for mut tensor in tensors {
         let source_name = tensor.name.clone();
         let mut canonical_name = None;
         let mut transform = "identity";
-        if canonical::is_model_parameter(&tensor.name) {
+        // Simplifiers can fuse linear MatMul+Add into anonymous Gemm nodes.
+        // The learned bias retains the semantic name and determines the head.
+        if let Some(node) = graph
+            .nodes
+            .iter()
+            .find(|n| n.op_type == "Gemm" && n.inputs.get(1) == Some(&source_name))
+        {
+            let head = rvc_gemm_head(node)?;
+            if node
+                .attributes
+                .iter()
+                .any(|a| a.name == "transB" && a.int == 1)
+            {
+                tensor = canonical::transpose_2d(&tensor)?;
+            }
+            canonical_name = Some(format!("{head}.weight"));
+            transform = "onnx-gemm-weight->in-out";
+        }
+        if canonical_name.is_some() {
+            // Already mapped above using the source-independent bias name.
+        } else if canonical::is_model_parameter(&tensor.name) {
             canonical_name = Some(tensor.name.clone());
         } else if !tensor.name.starts_with('/') {
             if !is_graph_constant_name(&tensor.name) {
@@ -402,6 +446,9 @@ fn canonicalize_initializers(
 
 fn is_graph_constant_name(name: &str) -> bool {
     name.starts_with("onnx::")
+        || name.strip_prefix("_v_").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
         || (!name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
@@ -426,6 +473,7 @@ fn validate_operator_set(nodes: &[NodeProto]) -> Result<(), ModelError> {
         "LeakyRelu",
         "Less",
         "MatMul",
+        "Gemm",
         "Mul",
         "Neg",
         "Pad",
@@ -456,6 +504,9 @@ fn validate_operator_set(nodes: &[NodeProto]) -> Result<(), ModelError> {
                 node.op_type
             )));
         }
+        if node.op_type == "Gemm" {
+            rvc_gemm_head(node)?;
+        }
     }
     for required in ["Conv", "ConvTranspose", "MatMul", "Tanh"] {
         if !nodes.iter().any(|node| node.op_type == required) {
@@ -479,6 +530,23 @@ fn validate_signature(
         .find(|x| x.key == "metadata")
         .and_then(|x| serde_json::from_str::<Value>(&x.value).ok());
     if let Some(meta) = metadata {
+        let version = manifest.rvc_version()?;
+        if let Some(layer) = meta.get("embOutputLayer") {
+            if layer.as_u64() != Some(version.hubert_output_layer() as u64) {
+                return Err(ModelError::UnsupportedModel(format!(
+                    "ONNX embOutputLayer must be {} for standard RVC {}",
+                    version.hubert_output_layer(),
+                    version.as_str()
+                )));
+            }
+        }
+        if let Some(projected) = meta.get("useFinalProj") {
+            if projected.as_bool() != Some(version == crate::RvcVersion::V1) {
+                return Err(ModelError::UnsupportedModel(
+                    "ONNX useFinalProj disagrees with RVC version".into(),
+                ));
+            }
+        }
         if let Some(channels) = meta.get("embChannels").and_then(Value::as_u64)
             && channels != manifest.feature_dims() as u64
         {
@@ -632,6 +700,113 @@ fn shape_of(value: &ValueInfoProto) -> Result<Vec<Option<i64>>, ModelError> {
         ModelError::UnsupportedModel(format!("ONNX input {} has no shape", value.name))
     })?;
     Ok(shape.dims.iter().map(|d| d.value).collect())
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    fn port(name: &str, ty: i32, dims: &[Option<i64>]) -> ValueInfoProto {
+        ValueInfoProto {
+            name: name.into(),
+            value_type: Some(TypeProto {
+                tensor_type: Some(TensorTypeProto {
+                    elem_type: ty,
+                    shape: Some(TensorShapeProto {
+                        dims: dims
+                            .iter()
+                            .map(|value| DimensionProto {
+                                value: *value,
+                                param: value.is_none().then(|| "frames".into()),
+                            })
+                            .collect(),
+                    }),
+                }),
+            }),
+        }
+    }
+    fn validate(width: i64, declared: Value) -> Result<(), ModelError> {
+        let manifest: RvcModelManifest = serde_json::from_value(json!({
+            "id":"v1", "display_name":"v1", "architecture":"rvc-v1", "version":"v1",
+            "sample_rate":40000, "model_file":"v1.onnx", "index_file":null, "source":"test", "notes":null,
+        })).unwrap();
+        let inputs = vec![
+            port("feats", 1, &[Some(1), None, Some(width)]),
+            port("p_len", 7, &[Some(1)]),
+            port("pitch", 7, &[Some(1), None]),
+            port("pitchf", 1, &[Some(1), None]),
+            port("sid", 7, &[Some(1)]),
+        ];
+        let props = [StringStringEntryProto {
+            key: "metadata".into(),
+            value: declared.to_string(),
+        }];
+        validate_signature(
+            &manifest,
+            &props,
+            &inputs.iter().collect::<Vec<_>>(),
+            &[port("audio", 1, &[None])],
+            &HashSet::from(["emb_g.weight"]),
+        )
+    }
+    #[test]
+    fn voice_changer_application_version_is_independent_of_rvc_version() {
+        assert!(validate(256, json!({"version":"2.1","embChannels":256,"embOutputLayer":9,"useFinalProj":true,"f0":true,"samplingRate":40000})).is_ok());
+    }
+    #[test]
+    fn v1_rejects_v2_width_or_nonstandard_acoustic_contract() {
+        assert!(validate(768, json!({})).is_err());
+        assert!(validate(256, json!({"embOutputLayer":12})).is_err());
+        assert!(validate(256, json!({"useFinalProj":false})).is_err());
+        assert!(validate(256, json!({"embChannels":768})).is_err());
+    }
+
+    #[test]
+    fn anonymous_gemm_uses_bias_name_and_normalizes_transposed_weights() {
+        let mut graph = GraphProto::default();
+        graph.nodes.push(NodeProto {
+            name: "Gemm_1".into(),
+            op_type: "Gemm".into(),
+            inputs: vec![
+                "feats".into(),
+                "_v_123".into(),
+                "enc_p.emb_phone.bias".into(),
+            ],
+            attributes: vec![AttributeProto {
+                name: "transB".into(),
+                int: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let tensor = Tensor {
+            name: "_v_123".into(),
+            dtype: TensorDType::F32,
+            shape: vec![2, 3],
+            data: [1f32, 2., 3., 4., 5., 6.]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        };
+        let entries = canonicalize_initializers(&graph, vec![tensor.clone()]).unwrap();
+        assert_eq!(entries[0].tensor.name, "enc_p.emb_phone.weight");
+        assert_eq!(entries[0].tensor.shape, vec![3, 2]);
+        assert_eq!(
+            canonical::to_f32(&entries[0].tensor).unwrap(),
+            vec![1., 4., 2., 5., 3., 6.]
+        );
+        graph.nodes[0].attributes.push(AttributeProto {
+            name: "alpha".into(),
+            float: 2.,
+            ..Default::default()
+        });
+        assert!(
+            validate_operator_set(&graph.nodes)
+                .unwrap_err()
+                .to_string()
+                .contains("alpha")
+        );
+        assert!(canonicalize_initializers(&graph, vec![tensor]).is_err());
+    }
 }
 fn value_info_json(value: &ValueInfoProto) -> Value {
     json!({"name": value.name, "shape": shape_of(value).unwrap_or_default()})

@@ -16,18 +16,18 @@ use thiserror::Error;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, EDataFlow,
-    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioClock, IAudioRenderClient,
-    MMDeviceEnumerator, eCapture, eConsole, eRender,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, IAudioCaptureClient, IAudioClient, IAudioClock,
+    IAudioRenderClient, eCapture, eRender,
 };
-use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
-use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
 use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-    CoUninitialize,
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
-use windows::core::Interface;
+
+#[path = "wasapi_init.rs"]
+mod init;
+pub use init::WasapiInitError;
+use init::{InitializedClient, setup_client};
 
 use crate::backend_error::BackendErrorState;
 use crate::logging;
@@ -43,7 +43,7 @@ pub enum NativeWasapiError {
     #[error("invalid native WASAPI stream configuration: {0}")]
     Audio(#[from] AudioError),
     #[error("native WASAPI worker failed to start: {0}")]
-    Startup(String),
+    Startup(WasapiInitError),
     #[error("failed to spawn native WASAPI worker: {0}")]
     Spawn(#[source] std::io::Error),
 }
@@ -103,23 +103,54 @@ impl NativeWasapiStream {
         queues: StreamQueueConfig,
         clock: Option<AudioClock>,
     ) -> Result<(Self, WorkerIo), NativeWasapiError> {
+        Self::open_prepared(config, config, queues, clock, None, None)
+    }
+
+    /// Select each endpoint's native shared format. `reference` only supplies
+    /// a duration/queue budget; the returned worker rings expose actual formats.
+    pub fn open_devices_profiled(
+        reference: StreamConfig,
+        queues: StreamQueueConfig,
+        clock: AudioClock,
+        capture_id: Option<String>,
+        render_id: Option<String>,
+    ) -> Result<(Self, WorkerIo), NativeWasapiError> {
+        let pair = crate::wasapi_devices::probe(reference.validate()?, capture_id, render_id)
+            .map_err(NativeWasapiError::Startup)?;
+        Self::open_prepared(
+            pair.capture,
+            pair.render,
+            queues,
+            Some(clock),
+            Some(pair.capture_id),
+            Some(pair.render_id),
+        )
+    }
+
+    fn open_prepared(
+        config: StreamConfig,
+        render_config: StreamConfig,
+        queues: StreamQueueConfig,
+        clock: Option<AudioClock>,
+        capture_id: Option<String>,
+        render_id: Option<String>,
+    ) -> Result<(Self, WorkerIo), NativeWasapiError> {
         let config = config.validate()?;
-        let io = crate::StreamIo::new_with_io_config(AudioIoConfig::new(config, queues))?;
+        let io = crate::StreamIo::new_duplex(config, render_config, queues)?;
         let (device, worker) = io.split();
         let state = Arc::new(StreamState::new());
         state.set(StreamLifecycle::Starting);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_event = EventHandle(
             unsafe { CreateEventW(None, true, false, None) }
-                .map_err(|error| NativeWasapiError::Startup(error.to_string()))?,
+                .map_err(|error| NativeWasapiError::Startup(error.to_string().into()))?,
         );
         let errors = Arc::new(BackendErrorState::new(Arc::clone(&state), "wasapi.native"));
         let latency = clock
             .as_ref()
             .map(|_| Arc::new(AudioLatencyStats::default()));
         let clock_state = Arc::new(ClockDriftState::default());
-        let (capture_ready_tx, capture_ready_rx) = mpsc::sync_channel(1);
-        let (render_ready_tx, render_ready_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(2);
 
         let crate::DeviceIo {
             input: input_producer,
@@ -132,21 +163,23 @@ impl NativeWasapiStream {
             Arc::clone(&stop),
             stop_event.0.0 as usize,
             Arc::clone(&errors),
-            capture_ready_tx,
+            ready_tx.clone(),
             clock.clone(),
             latency.clone(),
             Arc::clone(&clock_state),
+            capture_id,
         )?;
         let render = match spawn_render(
-            config,
+            render_config,
             output_consumer,
             Arc::clone(&stop),
             stop_event.0.0 as usize,
             Arc::clone(&errors),
-            render_ready_tx,
+            ready_tx,
             clock,
             latency.clone(),
             Arc::clone(&clock_state),
+            render_id,
         ) {
             Ok(render) => render,
             Err(error) => {
@@ -156,35 +189,29 @@ impl NativeWasapiStream {
             }
         };
 
-        let capture_result = capture_ready_rx
-            .recv()
-            .unwrap_or_else(|_| Err("capture thread exited before startup".into()));
-        let render_result = render_ready_rx
-            .recv()
-            .unwrap_or_else(|_| Err("render thread exited before startup".into()));
-        if let Err(error) = capture_result {
-            logging::fault(
-                "wasapi.native",
-                crate::AudioFaultKind::Startup,
-                Some(crate::AudioFaultDirection::Capture),
-                &error,
-            );
-            signal_stop(&stop, stop_event.0);
-            let _ = capture.join();
-            let _ = render.join();
-            return Err(NativeWasapiError::Startup(error));
-        }
-        if let Err(error) = render_result {
-            logging::fault(
-                "wasapi.native",
-                crate::AudioFaultKind::Startup,
-                Some(crate::AudioFaultDirection::Render),
-                &error,
-            );
-            signal_stop(&stop, stop_event.0);
-            let _ = capture.join();
-            let _ = render.join();
-            return Err(NativeWasapiError::Startup(error));
+        // Whichever endpoint fails first cancels the graph immediately. Both
+        // threads must release their COM clients before another backend opens.
+        for _ in 0..2 {
+            let result = ready_rx.recv().unwrap_or_else(|_| {
+                Err(WasapiInitError::from(
+                    "endpoint thread exited before startup".to_owned(),
+                ))
+            });
+            if let Err(error) = result {
+                logging::fault(
+                    "wasapi.native",
+                    crate::AudioFaultKind::Startup,
+                    error.direction.map(|direction| match direction {
+                        AudioDirection::Capture => crate::AudioFaultDirection::Capture,
+                        AudioDirection::Render => crate::AudioFaultDirection::Render,
+                    }),
+                    &error.to_string(),
+                );
+                signal_stop(&stop, stop_event.0);
+                let _ = capture.join();
+                let _ = render.join();
+                return Err(NativeWasapiError::Startup(error));
+            }
         }
 
         state.set(StreamLifecycle::Running);
@@ -410,10 +437,11 @@ fn spawn_capture(
     stop: Arc<AtomicBool>,
     stop_event: usize,
     errors: Arc<BackendErrorState>,
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<(), WasapiInitError>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
     clock_state: Arc<ClockDriftState>,
+    device_id: Option<String>,
 ) -> Result<JoinHandle<()>, NativeWasapiError> {
     thread::Builder::new()
         .name("vocal-wasapi3-capture".into())
@@ -428,6 +456,7 @@ fn spawn_capture(
                 clock,
                 latency,
                 clock_state,
+                device_id,
             )
         })
         .map_err(NativeWasapiError::Spawn)
@@ -439,10 +468,11 @@ fn spawn_render(
     stop: Arc<AtomicBool>,
     stop_event: usize,
     errors: Arc<BackendErrorState>,
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<(), WasapiInitError>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
     clock_state: Arc<ClockDriftState>,
+    device_id: Option<String>,
 ) -> Result<JoinHandle<()>, NativeWasapiError> {
     thread::Builder::new()
         .name("vocal-wasapi3-render".into())
@@ -457,6 +487,7 @@ fn spawn_render(
                 clock,
                 latency,
                 clock_state,
+                device_id,
             )
         })
         .map_err(NativeWasapiError::Spawn)
@@ -519,6 +550,14 @@ impl Drop for EventHandle {
     }
 }
 
+struct ComGuard;
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
 struct CoTaskMemFormat(*mut windows::Win32::Media::Audio::WAVEFORMATEX);
 
 impl Drop for CoTaskMemFormat {
@@ -550,120 +589,6 @@ struct RenderSetup {
     block_align: usize,
     endpoint_frames: usize,
     period_frames: usize,
-}
-
-fn setup_client(
-    config: StreamConfig,
-    flow: EDataFlow,
-) -> Result<
-    (
-        IAudioClient,
-        Option<IAudioClock>,
-        EventHandle,
-        Option<i64>,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
-    let enumerator: windows::Win32::Media::Audio::IMMDeviceEnumerator =
-        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
-            .map_err(|error| error.to_string())?;
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }
-        .map_err(|error| error.to_string())?;
-    let client3: IAudioClient3 =
-        unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|error| error.to_string())?;
-    let client: IAudioClient = client3.cast().map_err(|error| error.to_string())?;
-    let format_ptr = unsafe { client.GetMixFormat() }.map_err(|error| error.to_string())?;
-    let _format_mem = CoTaskMemFormat(format_ptr);
-    let format = unsafe { ptr::read_unaligned(format_ptr) };
-    let channels = format.nChannels;
-    let sample_rate = format.nSamplesPerSec;
-    let block_align = format.nBlockAlign as usize;
-    let bits_per_sample = format.wBitsPerSample;
-    let is_float32_tag = match format.wFormatTag as u32 {
-        WAVE_FORMAT_IEEE_FLOAT => true,
-        WAVE_FORMAT_EXTENSIBLE => unsafe {
-            let extensible =
-                format_ptr.cast::<windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE>();
-            let sub_format = ptr::read_unaligned(std::ptr::addr_of!((*extensible).SubFormat));
-            sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        },
-        _ => false,
-    };
-    let is_float32 = is_float32_tag
-        && bits_per_sample == 32
-        && block_align == channels as usize * std::mem::size_of::<f32>();
-    if !is_float32 || channels != config.format.channels || sample_rate != config.format.sample_rate
-    {
-        return Err(format!(
-            "native shared mix format is {} Hz, {} channels, {} bits; expected {} Hz, {} channels, f32",
-            sample_rate,
-            channels,
-            bits_per_sample,
-            config.format.sample_rate,
-            config.format.channels,
-        ));
-    }
-
-    let mut default_period = 0;
-    let mut fundamental_period = 0;
-    let mut min_period = 0;
-    let mut max_period = 0;
-    unsafe {
-        client3
-            .GetSharedModeEnginePeriod(
-                format_ptr,
-                &mut default_period,
-                &mut fundamental_period,
-                &mut min_period,
-                &mut max_period,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    // IAudioClock is present on normal WASAPI endpoints, but it is telemetry
-    // rather than a data-path dependency. Keep the stream usable with an
-    // unusual driver that does not expose the service.
-    let clock = unsafe { client.GetService::<IAudioClock>().ok() };
-    let period = choose_period(config.block_frames, fundamental_period, min_period, max_period)
-        .ok_or_else(|| {
-            format!(
-                "IAudioClient3 returned invalid engine periods default={default_period}, fundamental={fundamental_period}, min={min_period}, max={max_period}"
-            )
-        })?;
-    unsafe {
-        client3
-            .InitializeSharedAudioStream(
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                period,
-                format_ptr,
-                None,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    let event = unsafe { CreateEventW(None, false, false, None) }
-        .map(EventHandle)
-        .map_err(|error| error.to_string())?;
-    unsafe {
-        client
-            .SetEventHandle(event.0)
-            .map_err(|error| error.to_string())?;
-    }
-    let endpoint_frames = unsafe { client.GetBufferSize() }.map_err(|error| error.to_string())?;
-    // This value includes the endpoint's safety offset and is static for the
-    // initialized stream. Keep it separate from runtime `GetCurrentPadding`
-    // samples in the latency profile.
-    let stream_latency_hns = unsafe { client.GetStreamLatency().ok() };
-    Ok((
-        client,
-        clock,
-        event,
-        stream_latency_hns,
-        block_align,
-        endpoint_frames as usize,
-        period as usize,
-    ))
 }
 
 fn choose_period(target: usize, fundamental: u32, min: u32, max: u32) -> Option<u32> {
@@ -735,12 +660,27 @@ fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
     left
 }
 
-fn setup_capture(config: StreamConfig) -> Result<CaptureSetup, String> {
-    let (client, clock, event, stream_latency_hns, _block_align, endpoint_frames, period_frames) =
-        setup_client(config, eCapture)?;
-    let capture =
-        unsafe { client.GetService::<IAudioCaptureClient>() }.map_err(|error| error.to_string())?;
-    unsafe { client.Start() }.map_err(|error| error.to_string())?;
+fn setup_capture(
+    config: StreamConfig,
+    device_id: Option<&str>,
+) -> Result<CaptureSetup, WasapiInitError> {
+    let InitializedClient {
+        client,
+        clock,
+        event,
+        stream_latency_hns,
+        endpoint_frames,
+        period_frames,
+        ..
+    } = setup_client(config, eCapture, device_id)?;
+    let capture = unsafe { client.GetService::<IAudioCaptureClient>() }.map_err(|e| {
+        WasapiInitError::windows("Get capture service", e)
+            .with_endpoint(AudioDirection::Capture, device_id)
+    })?;
+    unsafe { client.Start() }.map_err(|e| {
+        WasapiInitError::windows("Start capture", e)
+            .with_endpoint(AudioDirection::Capture, device_id)
+    })?;
     Ok(CaptureSetup {
         client,
         capture,
@@ -752,12 +692,26 @@ fn setup_capture(config: StreamConfig) -> Result<CaptureSetup, String> {
     })
 }
 
-fn setup_render(config: StreamConfig) -> Result<RenderSetup, String> {
-    let (client, clock, event, stream_latency_hns, block_align, endpoint_frames, period_frames) =
-        setup_client(config, eRender)?;
-    let render =
-        unsafe { client.GetService::<IAudioRenderClient>() }.map_err(|error| error.to_string())?;
-    unsafe { client.Start() }.map_err(|error| error.to_string())?;
+fn setup_render(
+    config: StreamConfig,
+    device_id: Option<&str>,
+) -> Result<RenderSetup, WasapiInitError> {
+    let InitializedClient {
+        client,
+        clock,
+        event,
+        stream_latency_hns,
+        block_align,
+        endpoint_frames,
+        period_frames,
+    } = setup_client(config, eRender, device_id)?;
+    let render = unsafe { client.GetService::<IAudioRenderClient>() }.map_err(|e| {
+        WasapiInitError::windows("Get render service", e)
+            .with_endpoint(AudioDirection::Render, device_id)
+    })?;
+    unsafe { client.Start() }.map_err(|e| {
+        WasapiInitError::windows("Start render", e).with_endpoint(AudioDirection::Render, device_id)
+    })?;
     Ok(RenderSetup {
         client,
         render,
@@ -776,20 +730,23 @@ fn run_capture(
     stop: Arc<AtomicBool>,
     stop_event: HANDLE,
     errors: Arc<BackendErrorState>,
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<(), WasapiInitError>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
     clock_state: Arc<ClockDriftState>,
+    device_id: Option<String>,
 ) {
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if let Err(error) = com.ok() {
         let message = format!("failed to initialize COM MTA: {error}");
-        let _ = ready.send(Err(message.clone()));
+        let _ = ready.send(Err(WasapiInitError::from(message.clone())
+            .with_endpoint(AudioDirection::Capture, device_id.as_deref())));
         record_error(&errors, message);
         return;
     }
+    let _com_guard = ComGuard;
     let _mmcss = MmcssGuard::register("Pro Audio");
-    let setup = setup_capture(config);
+    let setup = setup_capture(config, device_id.as_deref());
     let CaptureSetup {
         client,
         capture,
@@ -802,8 +759,7 @@ fn run_capture(
         Ok(setup) => setup,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
-            record_error(&errors, error);
-            unsafe { CoUninitialize() };
+            record_error(&errors, error.to_string());
             return;
         }
     };
@@ -821,10 +777,10 @@ fn run_capture(
         Ok(assembler) => assembler,
         Err(error) => {
             let message = error.to_string();
-            let _ = ready.send(Err(message.clone()));
+            let _ = ready.send(Err(WasapiInitError::from(message.clone())
+                .with_endpoint(AudioDirection::Capture, device_id.as_deref())));
             record_error(&errors, message);
             let _ = unsafe { client.Stop() };
-            unsafe { CoUninitialize() };
             return;
         }
     };
@@ -834,10 +790,10 @@ fn run_capture(
         Ok(samples) => samples,
         Err(error) => {
             let message = error.to_string();
-            let _ = ready.send(Err(message.clone()));
+            let _ = ready.send(Err(WasapiInitError::from(message.clone())
+                .with_endpoint(AudioDirection::Capture, device_id.as_deref())));
             record_error(&errors, message);
             let _ = unsafe { client.Stop() };
-            unsafe { CoUninitialize() };
             return;
         }
     };
@@ -922,6 +878,7 @@ fn run_capture(
                 packet_timestamp(clock.as_ref(), latency.as_deref(), flags, qpc_position);
             if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
                 assembler.reset();
+                input.mark_discontinuity();
             }
             let direct = if assembler.buffered_samples() == 0
                 && frames as usize == config.block_frames
@@ -1004,7 +961,6 @@ fn run_capture(
         }
     }
     let _ = unsafe { client.Stop() };
-    unsafe { CoUninitialize() };
 }
 
 fn run_render(
@@ -1013,20 +969,23 @@ fn run_render(
     stop: Arc<AtomicBool>,
     stop_event: HANDLE,
     errors: Arc<BackendErrorState>,
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<(), WasapiInitError>>,
     clock: Option<AudioClock>,
     latency: Option<Arc<AudioLatencyStats>>,
     clock_state: Arc<ClockDriftState>,
+    device_id: Option<String>,
 ) {
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if let Err(error) = com.ok() {
         let message = format!("failed to initialize COM MTA: {error}");
-        let _ = ready.send(Err(message.clone()));
+        let _ = ready.send(Err(WasapiInitError::from(message.clone())
+            .with_endpoint(AudioDirection::Render, device_id.as_deref())));
         record_error(&errors, message);
         return;
     }
+    let _com_guard = ComGuard;
     let _mmcss = MmcssGuard::register("Pro Audio");
-    let setup = setup_render(config);
+    let setup = setup_render(config, device_id.as_deref());
     let RenderSetup {
         client,
         render,
@@ -1040,8 +999,7 @@ fn run_render(
         Ok(setup) => setup,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
-            record_error(&errors, error);
-            unsafe { CoUninitialize() };
+            record_error(&errors, error.to_string());
             return;
         }
     };
@@ -1059,10 +1017,10 @@ fn run_render(
         Ok(drainer) => drainer,
         Err(error) => {
             let message = error.to_string();
-            let _ = ready.send(Err(message.clone()));
+            let _ = ready.send(Err(WasapiInitError::from(message.clone())
+                .with_endpoint(AudioDirection::Render, device_id.as_deref())));
             record_error(&errors, message);
             let _ = unsafe { client.Stop() };
-            unsafe { CoUninitialize() };
             return;
         }
     };
@@ -1072,10 +1030,10 @@ fn run_render(
         Ok(samples) => samples,
         Err(error) => {
             let message = error.to_string();
-            let _ = ready.send(Err(message.clone()));
+            let _ = ready.send(Err(WasapiInitError::from(message.clone())
+                .with_endpoint(AudioDirection::Render, device_id.as_deref())));
             record_error(&errors, message);
             let _ = unsafe { client.Stop() };
-            unsafe { CoUninitialize() };
             return;
         }
     };
@@ -1121,7 +1079,8 @@ fn run_render(
         let frames = available.min(samples.len() / config.format.channels as usize);
         let sample_count = frames * config.format.channels as usize;
         let queue_stats = output.stats();
-        let source_available = queue_stats.queued_blocks > 0 || drainer.pending_samples() > 0;
+        let source_available = output.ready_for_playback()
+            && (queue_stats.queued_blocks > 0 || drainer.pending_samples() > 0);
         let slip = drift_controller.next_slip(
             queue_stats.queued_blocks,
             source_available,
@@ -1260,7 +1219,6 @@ fn run_render(
         }
     }
     let _ = unsafe { client.Stop() };
-    unsafe { CoUninitialize() };
 }
 
 fn sample_device_clock(
@@ -1350,6 +1308,113 @@ fn record_error(errors: &BackendErrorState, error: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Media::Audio::MMDeviceEnumerator;
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+
+    #[test]
+    #[ignore = "temporarily reserves a live Windows render endpoint in exclusive mode"]
+    fn live_exclusive_owner_reports_busy_and_release_allows_retry() {
+        use windows::Win32::Media::Audio::{
+            AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_SHAREMODE_EXCLUSIVE, WAVEFORMATEX,
+        };
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .unwrap();
+        let _com_guard = ComGuard;
+        let enumerator = unsafe {
+            CoCreateInstance::<_, windows::Win32::Media::Audio::IMMDeviceEnumerator>(
+                &MMDeviceEnumerator,
+                None,
+                CLSCTX_ALL,
+            )
+        }
+        .unwrap();
+        let device = crate::wasapi_devices::select_endpoint(&enumerator, eRender, None).unwrap();
+        let holder: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.unwrap();
+        let mix = CoTaskMemFormat(unsafe { holder.GetMixFormat() }.unwrap());
+        let native_format = unsafe { ptr::read_unaligned(mix.0) };
+        let pcm = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: native_format.nChannels,
+            nSamplesPerSec: native_format.nSamplesPerSec,
+            nAvgBytesPerSec: native_format.nSamplesPerSec * u32::from(native_format.nChannels) * 2,
+            nBlockAlign: native_format.nChannels * 2,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+        let mut period = 0;
+        unsafe { holder.GetDevicePeriod(Some(&mut period), None) }.unwrap();
+        // This opt-in test must fail visibly on endpoints without exclusive
+        // support, rather than claiming that a simulated busy case was live.
+        unsafe { holder.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, period, period, &pcm, None) }
+            .expect("endpoint must support exclusive PCM16 for this live test");
+        unsafe { holder.Start() }.unwrap();
+        let config = StreamConfig {
+            format: vocal_types::AudioFormat {
+                sample_rate: native_format.nSamplesPerSec,
+                channels: native_format.nChannels,
+            },
+            block_frames: 160,
+            queue_blocks: 2,
+        };
+        let error = setup_client(config, eRender, None)
+            .err()
+            .expect("shared open must fail while the exclusive owner holds the device");
+        assert_eq!(error.hresult, Some(AUDCLNT_E_DEVICE_IN_USE.0));
+        assert_eq!(error.direction, Some(AudioDirection::Render));
+        assert!(!error.allows_fallback());
+        unsafe { holder.Stop() }.unwrap();
+        drop(holder);
+        let retried = setup_client(config, eRender, None)
+            .expect("shared open must recover after exclusive owner releases the endpoint");
+        assert!(retried.period_frames > 0);
+        println!(
+            "Live exclusive contention: {}; retry period={} frames",
+            error, retried.period_frames
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a live Windows IAudioClient3 render endpoint"]
+    fn live_native_render_initializes_period_and_clock_after_format_negotiation() {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .unwrap();
+        let _com_guard = ComGuard;
+        let enumerator: windows::Win32::Media::Audio::IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.unwrap();
+        let device = crate::wasapi_devices::select_endpoint(&enumerator, eRender, None).unwrap();
+        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.unwrap();
+        let memory = CoTaskMemFormat(unsafe { client.GetMixFormat() }.unwrap());
+        let format = unsafe { ptr::read_unaligned(memory.0) };
+        let reference = StreamConfig {
+            format: vocal_types::AudioFormat::MONO_16K,
+            block_frames: 160,
+            queue_blocks: 2,
+        };
+        let native = reference
+            .for_endpoint(vocal_types::AudioFormat {
+                sample_rate: format.nSamplesPerSec,
+                channels: format.nChannels,
+            })
+            .unwrap();
+        let setup = setup_render(native, None).unwrap();
+        assert!(setup.period_frames > 0 && setup.endpoint_frames >= setup.period_frames);
+        let clock = setup
+            .clock
+            .as_ref()
+            .expect("clock service must be queried after initialization");
+        let frequency = unsafe { clock.GetFrequency() }.unwrap();
+        assert!(frequency > 0);
+        unsafe { setup.client.Stop() }.unwrap();
+        println!(
+            "Native WASAPI render={} Hz/{} ch, period={} frames, endpoint={} frames, IAudioClock frequency={frequency}",
+            native.format.sample_rate,
+            native.format.channels,
+            setup.period_frames,
+            setup.endpoint_frames
+        );
+    }
     use vocal_types::AudioFormat;
 
     fn config() -> StreamConfig {

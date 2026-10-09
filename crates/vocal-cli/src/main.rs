@@ -26,6 +26,7 @@ mod cli_config;
 mod cli_error;
 mod cli_logging;
 mod cli_state;
+mod offline_command;
 
 use cli_config::CliConfig;
 use cli_error::CliResult;
@@ -33,9 +34,19 @@ use cli_state::CliStatus;
 
 fn usage() {
     eprintln!(
-        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model run-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> <output.wav>\n  model test-pipeline <passthrough|cpu|tensorrt> <model.vfr> <input.wav|input.f32> [pipeline.json]\n  model run-pipeline <passthrough|cpu|tensorrt> <model.vfr> <input.wav|input.f32> <output.wav> [pipeline.json]\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
+        "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model run-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> <output.wav>\n  model test-pipeline <passthrough|cpu|tensorrt|directml> <model.vfr> <input.wav|input.f32> [pipeline.json]\n  model run-pipeline <passthrough|cpu|tensorrt|directml> <model.vfr> <input.wav|input.f32> <output.wav> [pipeline.json]\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
     );
     eprintln!("  model benchmark-trt <output.plan> <input.vin> <output.bin> [iterations]");
+    eprintln!(
+        "  model prepare-dml <synth.vfr> <hubert.vfr> <rmvpe.vfr> <sources.json> [11200|44960]"
+    );
+    eprintln!("  model run-pipeline directml <synth.vfr> <input.wav> <output.wav> <sources.json>");
+    eprintln!(
+        "  model run-streaming-pipeline <backend> <model.vfr> <input.wav|input.f32> <output.wav> [pipeline.json]"
+    );
+    eprintln!(
+        "  run-pipeline uses native-rate Applio offline segments on DML/TRT; run-streaming-pipeline validates realtime callbacks"
+    );
 }
 
 fn main() -> ExitCode {
@@ -68,6 +79,28 @@ fn run(args: Vec<String>) -> CliResult<()> {
     let cli_config = CliConfig::default();
     match args.as_slice() {
         [command] if command == "doctor" => doctor(),
+        [command, subcommand, synth, hubert, rmvpe, output]
+            if command == "model" && subcommand == "prepare-dml" =>
+        {
+            prepare_dml(
+                synth.into(),
+                hubert.into(),
+                rmvpe.into(),
+                output.into(),
+                44960,
+            )
+        }
+        [command, subcommand, synth, hubert, rmvpe, output, window]
+            if command == "model" && subcommand == "prepare-dml" =>
+        {
+            prepare_dml(
+                synth.into(),
+                hubert.into(),
+                rmvpe.into(),
+                output.into(),
+                window.parse()?,
+            )
+        }
         [command, subcommand, manifest] if command == "model" && subcommand == "inspect" => {
             inspect(PathBuf::from(manifest))
         }
@@ -189,6 +222,34 @@ fn run(args: Vec<String>) -> CliResult<()> {
         {
             run_trt_pipeline(artifacts.into(), cache.into(), input.into(), output.into())
         }
+        [command, subcommand, backend, cache, input, output]
+            if command == "model" && subcommand == "run-streaming-pipeline" =>
+        {
+            run_streaming_pipeline(
+                backend,
+                cache.into(),
+                input.into(),
+                Some(output.into()),
+                None,
+            )
+        }
+        [
+            command,
+            subcommand,
+            backend,
+            cache,
+            input,
+            output,
+            artifacts,
+        ] if command == "model" && subcommand == "run-streaming-pipeline" => {
+            run_streaming_pipeline(
+                backend,
+                cache.into(),
+                input.into(),
+                Some(output.into()),
+                Some(artifacts.into()),
+            )
+        }
         [command, subcommand, artifacts, cache, input]
             if command == "model" && subcommand == "profile-trt-pipeline" =>
         {
@@ -251,15 +312,31 @@ fn compile_trt_pipeline(
     rmvpe: PathBuf,
     output: PathBuf,
 ) -> CliResult<()> {
-    let package = load_cache(cache)?;
+    let package = vocal_model::load_voice_cache_shared(cache)?;
     let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
     let profile = trt_config.profile.clone();
-    let artifacts = vocal_tensorrt::RvcTrtPipelineArtifacts::compile_with_config(
+    let artifacts = vocal_tensorrt::RvcTrtPipelineArtifacts::compile_with_config_and_progress(
         &trt_config,
         &package,
         hubert,
         rmvpe,
         &output,
+        |stage| {
+            if stage.finished {
+                println!(
+                    "{}: {} ({:.0} ms), {}/{}",
+                    stage.name,
+                    if stage.cache_hit {
+                        "reused"
+                    } else {
+                        "compiled"
+                    },
+                    stage.elapsed_ms,
+                    stage.completed,
+                    stage.total
+                );
+            }
+        },
     )?;
     let manifest = output.join("pipeline.json");
     fs::write(&manifest, serde_json::to_vec_pretty(&artifacts)?)?;
@@ -304,7 +381,7 @@ fn test_trt_pipeline(
 ) -> CliResult<()> {
     let artifacts: vocal_tensorrt::RvcTrtPipelineArtifacts =
         serde_json::from_slice(&fs::read(&artifacts_path)?)?;
-    let package = load_cache(cache)?;
+    let package = vocal_model::load_voice_cache_shared(cache)?;
     let config = package
         .rvc_synth_config()?
         .ok_or("cache has no rvc_synth config")?;
@@ -374,6 +451,10 @@ fn test_trt_pipeline(
                 "hubert_features": result.hubert_features,
                 "rvc_features": result.rvc_features, "pitchf": result.pitchf,
                 "aligned_pitchf": result.aligned_pitchf, "pitch": result.pitch,
+                "synth_random": result.synth_random, "synth_noise": result.synth_noise,
+                "valid_synth_frames": result.valid_synth_frames,
+                "synth_skip_head": result.synth_skip_head,
+                "synth_output_frames": result.synth_output_frames,
                 "rmvpe_mel": result.rmvpe_mel, "rmvpe_gru": result.rmvpe_gru,
                 "rmvpe_bottleneck": result.rmvpe_bottleneck,
                 "rmvpe_unet": result.rmvpe_unet,
@@ -418,7 +499,10 @@ fn run_trt_pipeline(
 ) -> CliResult<()> {
     let artifacts: vocal_tensorrt::RvcTrtPipelineArtifacts =
         serde_json::from_slice(&fs::read(&artifacts_path)?)?;
-    let package = load_cache(cache)?;
+    if artifacts.synth_tail_mode {
+        return Err("run-trt-pipeline concatenates full contexts, but this artifact emits only a realtime tail; use model run-pipeline tensorrt <model.vfr> <input.wav> <output.wav> <pipeline.json> for streaming audio".into());
+    }
+    let package = vocal_model::load_voice_cache_shared(cache)?;
     let synth_config = package
         .rvc_synth_config()?
         .ok_or("cache has no rvc_synth config")?;
@@ -495,7 +579,27 @@ fn run_offline_pipeline(
     artifacts: Option<PathBuf>,
 ) -> CliResult<()> {
     let backend = parse_offline_backend(backend_name)?;
-    let package = load_cache(&cache)?;
+    if backend == BackendKind::RvcCpuPipeline && !cfg!(feature = "cpu-graph") {
+        return Err("CPU model inference requires --features cpu-graph".into());
+    }
+    if matches!(backend, BackendKind::DirectMl | BackendKind::TensorRtRtx)
+        || (cfg!(feature = "cpu-graph") && backend == BackendKind::RvcCpuPipeline)
+    {
+        offline_command::run(backend, cache, input, output, artifacts)
+    } else {
+        run_streaming_pipeline(backend_name, cache, input, output, artifacts)
+    }
+}
+
+fn run_streaming_pipeline(
+    backend_name: &str,
+    cache: PathBuf,
+    input: PathBuf,
+    output: Option<PathBuf>,
+    artifacts: Option<PathBuf>,
+) -> CliResult<()> {
+    let backend = parse_offline_backend(backend_name)?;
+    let package = vocal_model::load_voice_cache_shared(&cache)?;
     let descriptor = package.manifest.descriptor();
     let (engine, window_samples) = create_offline_engine(
         backend,
@@ -557,11 +661,54 @@ fn parse_offline_backend(value: &str) -> CliResult<BackendKind> {
         "passthrough" | "pass" => Ok(BackendKind::Passthrough),
         "cpu" | "rvc-cpu" | "rvc_cpu" => Ok(BackendKind::RvcCpuPipeline),
         "tensorrt" | "trt" | "tensorrt-rtx" | "tensorrt_rtx" => Ok(BackendKind::TensorRtRtx),
+        "directml" | "dml" => Ok(BackendKind::DirectMl),
         _ => Err(format!(
-            "unknown offline backend {value}; expected passthrough, cpu, or tensorrt"
+            "unknown offline backend {value}; expected passthrough, cpu, tensorrt, or directml"
         )
         .into()),
     }
+}
+
+#[cfg(feature = "directml")]
+fn prepare_dml(
+    synth: PathBuf,
+    hubert: PathBuf,
+    rmvpe: PathBuf,
+    output: PathBuf,
+    window: usize,
+) -> CliResult<()> {
+    let config = match window {
+        44960 => vocal_directml::DirectMlConfig::realtime_44960(),
+        11200 => vocal_directml::DirectMlConfig::realtime_11200(),
+        _ => return Err("prepare-dml supports the 11200 and 44960 reference windows".into()),
+    };
+    load_cache(&synth)?.validate_rvc_synth()?;
+    load_cache(&hubert)?.validate_acoustic(Some(vocal_model::AcousticKind::Hubert))?;
+    load_cache(&rmvpe)?.validate_acoustic(Some(vocal_model::AcousticKind::Rmvpe))?;
+    let sources = vocal_directml::DirectMlSources {
+        synth: fs::canonicalize(synth)?,
+        hubert: fs::canonicalize(hubert)?,
+        rmvpe: fs::canonicalize(rmvpe)?,
+        config,
+        enable_retrieval: false,
+    };
+    sources.save(&output)?;
+    println!(
+        "{}",
+        serde_json::json!({"sources":output,"window_samples":window,"backend":"directml"})
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "directml"))]
+fn prepare_dml(
+    _synth: PathBuf,
+    _hubert: PathBuf,
+    _rmvpe: PathBuf,
+    _output: PathBuf,
+    _window: usize,
+) -> CliResult<()> {
+    Err("DirectML preparation requires --features directml".into())
 }
 
 fn create_offline_engine(
@@ -571,7 +718,72 @@ fn create_offline_engine(
     artifacts: Option<PathBuf>,
 ) -> CliResult<(Box<dyn InferenceEngine>, usize)> {
     match backend {
-        BackendKind::Passthrough | BackendKind::RvcCpuPipeline => {
+        BackendKind::DirectMl => {
+            #[cfg(feature = "directml")]
+            {
+                let (sources, path) = if let Some(path) = artifacts {
+                    (vocal_directml::DirectMlSources::load(&path)?, path)
+                } else {
+                    vocal_directml::DirectMlSources::prepare_bundle(
+                        &cache,
+                        vocal_directml::DirectMlSources::default_cache_root(),
+                        vocal_directml::DirectMlConfig::realtime_44960(),
+                    )?
+                };
+                let chunk =
+                    vocal_engine::DirectMlStreamConfig::for_window(sources.config.window_samples)
+                        .chunk_samples_16k;
+                let engine =
+                    vocal_engine::create_engine(EngineConfig::with_directml(descriptor, path))?;
+                Ok((engine, chunk))
+            }
+            #[cfg(not(feature = "directml"))]
+            {
+                let _ = (descriptor, cache, artifacts);
+                Err("DirectML offline execution requires --features directml".into())
+            }
+        }
+        BackendKind::RvcCpuPipeline => {
+            #[cfg(feature = "cpu-graph")]
+            {
+                let sources = vocal_engine::offline::OfflineModelSources::from_bundle(
+                    &cache,
+                    vocal_engine::offline::OfflineModelSources::default_cache_root(),
+                )?;
+                let threads = env::var("VOCAL_CPU_THREADS")
+                    .ok()
+                    .map(|v| v.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(0);
+                let window = env::var("VOCAL_CPU_WINDOW_SAMPLES")
+                    .ok()
+                    .map(|v| v.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(11200);
+                let config = EngineConfig::with_cpu_graph(
+                    descriptor,
+                    vocal_engine::CpuEngineSpec {
+                        synth: sources.synth,
+                        hubert: sources.hubert,
+                        rmvpe: sources.rmvpe,
+                        execution: vocal_engine::CpuExecutionConfig {
+                            threads,
+                            ..Default::default()
+                        },
+                        window_samples: window,
+                        speaker_id: 0,
+                    },
+                );
+                let chunk = vocal_engine::CpuStreamConfig::for_window(window).chunk_samples_16k;
+                Ok((vocal_engine::create_engine(config)?, chunk))
+            }
+            #[cfg(not(feature = "cpu-graph"))]
+            {
+                let _ = (descriptor, cache, artifacts);
+                Err("CPU model inference requires --features cpu-graph".into())
+            }
+        }
+        BackendKind::Passthrough => {
             let engine = vocal_engine::create_engine(EngineConfig::portable(backend, descriptor))?;
             Ok((engine, offline_window_from_env()))
         }
@@ -668,7 +880,7 @@ fn compare_trt_pipeline(
 ) -> CliResult<()> {
     let artifacts: vocal_tensorrt::RvcTrtPipelineArtifacts =
         serde_json::from_slice(&fs::read(&artifacts_path)?)?;
-    let package = load_cache(cache)?;
+    let package = vocal_model::load_voice_cache_shared(cache)?;
     let synth_config = package
         .rvc_synth_config()?
         .ok_or("cache has no rvc_synth config")?;
@@ -1035,13 +1247,12 @@ fn build_graph(cache: PathBuf, output: PathBuf) -> CliResult<()> {
 fn compile_trt(cache: PathBuf, output: PathBuf, onnx: Option<PathBuf>) -> CliResult<()> {
     #[cfg(feature = "tensorrt-rtx")]
     {
-        let package = load_cache(cache)?;
         let mut options = vocal_tensorrt::TensorRtConfig::from_env()?.build;
         options.output = output;
         let builder = vocal_tensorrt::NativeTensorRtBuilder::new(options);
         let path = match onnx {
             Some(onnx) => builder.compile_onnx_file(onnx)?,
-            None => builder.compile_vfrm(&package)?,
+            None => builder.compile_vfrm(vocal_model::load_voice_cache_shared(cache)?.as_ref())?,
         };
         println!(
             "compiled {} with TensorRT-RTX native builder",
@@ -1091,8 +1302,8 @@ fn compile_hubert_trt(_cache: PathBuf, _output: PathBuf) -> CliResult<()> {
 fn test_hubert_trt(plan: PathBuf, input: PathBuf) -> CliResult<()> {
     let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
     let samples = read_f32_audio(&input)?;
-    let runtime = vocal_tensorrt::Runtime::load(&plan)?;
-    let mut context = runtime.context()?;
+    let runtime = vocal_tensorrt::Runtime::shared(&plan)?;
+    let mut context = vocal_tensorrt::OwnedContext::create(runtime)?;
     let stream = vocal_tensorrt::CudaStream::new()?;
     let waveform = vocal_tensorrt::CudaBuffer::new(samples.len() * 4)?;
     let max_frames = (samples.len() / 320).saturating_add(8);
@@ -1142,8 +1353,8 @@ fn test_hubert_trt(_plan: PathBuf, _input: PathBuf) -> CliResult<()> {
 #[cfg(feature = "tensorrt-rtx")]
 fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
     let trt_config = vocal_tensorrt::TensorRtConfig::from_env()?;
-    let runtime = vocal_tensorrt::Runtime::load(&plan)?;
-    let mut context = runtime.context()?;
+    let runtime = vocal_tensorrt::Runtime::shared(&plan)?;
+    let mut context = vocal_tensorrt::OwnedContext::create(runtime)?;
     let stream = vocal_tensorrt::CudaStream::new()?;
     let Some(cache) = cache else {
         let buffer = vocal_tensorrt::CudaBuffer::new(4096)?;
@@ -1154,7 +1365,7 @@ fn test_trt(plan: PathBuf, cache: Option<PathBuf>) -> CliResult<()> {
         );
         return Ok(());
     };
-    let package = vocal_model::load_cache(cache)?;
+    let package = vocal_model::load_voice_cache_shared(cache)?;
     let config = package
         .rvc_synth_config()?
         .ok_or("cache has no rvc_synth config")?;

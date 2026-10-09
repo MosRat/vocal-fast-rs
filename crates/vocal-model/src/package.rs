@@ -28,14 +28,11 @@ impl RvcModelManifest {
             version: self.version.clone(),
         }
     }
+    /// Feature width of a validated RVC manifest. Invalid manifests return
+    /// zero; importers must use `rvc_version()` to report the actual error.
     pub fn feature_dims(&self) -> usize {
-        if self.version.to_ascii_lowercase().contains("v2")
-            || self.architecture.to_ascii_lowercase().contains("v2")
-        {
-            768
-        } else {
-            256
-        }
+        self.rvc_version()
+            .map_or(0, |version| version.feature_width())
     }
     pub fn uses_f0(&self) -> bool {
         !self.architecture.to_ascii_lowercase().contains("nono")
@@ -143,7 +140,12 @@ impl ModelPackage {
         let config = self.rvc_synth_config()?.ok_or_else(|| {
             ModelError::InvalidCache("canonical package has no rvc_config".into())
         })?;
+        crate::rvc_version::validate_feature_metadata(
+            &self.metadata,
+            self.manifest.rvc_version()?,
+        )?;
         schema::validate_tensors(&config, &self.manifest, &self.tensors)?;
+        crate::inspection::validate_embedded_acoustics(self)?;
         Ok(config)
     }
     /// Find a tensor by its canonical RVC parameter name.

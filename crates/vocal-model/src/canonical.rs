@@ -23,6 +23,13 @@ pub(crate) fn finalize(
         .as_object_mut()
         .ok_or_else(|| ModelError::InvalidCache("model metadata must be a JSON object".into()))?;
     object.insert("canonical_schema".into(), RVC_TENSOR_SCHEMA.into());
+    let version = manifest.rvc_version()?;
+    object.insert("rvc_features".into(), json!({
+        "version": version,
+        "width": version.feature_width(),
+        "hubert_output_layer": version.hubert_output_layer(),
+        "hubert_projection": if version == crate::RvcVersion::V1 { Some("hubert.model.final_proj") } else { None },
+    }));
     object.insert(
         "canonical_layout".into(),
         "contiguous-row-major-little-endian".into(),

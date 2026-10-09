@@ -73,6 +73,22 @@ pub enum RuntimeBackend {
     Passthrough,
     RvcCpu,
     TensorRtRtx,
+    DirectMl,
+}
+
+/// Backend-only changes applied atomically with model loading. Other session
+/// edits remain the controller's draft until explicitly saved.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelBackendSelection {
+    pub expected_revision: u64,
+    pub backend: RuntimeBackend,
+    pub automatic: bool,
+    pub artifacts_path: Option<String>,
+    #[serde(default)]
+    pub directml_sources_path: Option<String>,
+    #[serde(default)]
+    pub directml_device_id: Option<String>,
 }
 
 /// Result of applying a configuration edit to an idle runtime.
@@ -100,6 +116,7 @@ impl RuntimeBackend {
             Self::Passthrough => BackendKind::Passthrough,
             Self::RvcCpu => BackendKind::RvcCpuPipeline,
             Self::TensorRtRtx => BackendKind::TensorRtRtx,
+            Self::DirectMl => BackendKind::DirectMl,
         }
     }
 }
@@ -114,6 +131,10 @@ pub struct RuntimeConfig {
     pub output_format: AudioFormat,
     pub conversion: ConversionConfig,
     pub backend: RuntimeBackend,
+    /// Fresh installs choose the fastest available complete implementation.
+    /// Legacy files without this field preserve their explicit backend.
+    #[serde(default)]
+    pub backend_auto: bool,
     pub model_path: Option<String>,
     /// Optional library root used by controllers to discover model artifacts.
     /// It is intentionally independent from `model_path`, which remains the
@@ -127,6 +148,11 @@ pub struct RuntimeConfig {
     /// for config files written before this group was introduced.
     #[serde(default)]
     pub tensorrt: TensorRtPipelineConfig,
+    pub cpu: vocal_engine::CpuExecutionConfig,
+    /// DML graph source manifest; precision and static shape are typed there.
+    pub directml_sources_path: Option<String>,
+    /// None chooses the first compatible GPU in DXGI high-performance order.
+    pub directml_device_id: Option<String>,
     pub speaker_id: i32,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
@@ -142,11 +168,15 @@ impl Default for RuntimeConfig {
             output_format: AudioFormat::MONO_48K,
             conversion: ConversionConfig::default(),
             backend: RuntimeBackend::Passthrough,
+            backend_auto: true,
             model_path: None,
             model_directory: None,
             tensorrt_artifacts_path: None,
             tensorrt_window_samples: None,
             tensorrt: TensorRtPipelineConfig::default(),
+            cpu: vocal_engine::CpuExecutionConfig::default(),
+            directml_sources_path: None,
+            directml_device_id: None,
             speaker_id: 0,
             input_device: None,
             output_device: None,
@@ -157,7 +187,32 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Session profiles have the same context geometry across controllers.
+    /// Reference selects the compact CPU shape to preserve its realtime budget.
+    pub fn cpu_window_samples(&self) -> usize {
+        if self.tensorrt.profile == "realtime_44960" {
+            44960
+        } else {
+            11200
+        }
+    }
+
     pub fn validate(&self) -> RuntimeResult<()> {
+        self.cpu
+            .validate()
+            .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        if self.speaker_id < 0 {
+            return Err(RuntimeError::Config(
+                "speaker ID must be nonnegative".into(),
+            ));
+        }
+        if self
+            .directml_device_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty() || id.len() > 2048 || id.contains('\0'))
+        {
+            return Err(RuntimeError::Config("DirectML device ID must be nonempty, at most 2048 bytes and contain no null characters".into()));
+        }
         if self.schema_version > RUNTIME_CONFIG_SCHEMA_VERSION {
             return Err(RuntimeError::Config(format!(
                 "configuration schema {} is newer than supported schema {}",
@@ -181,26 +236,8 @@ impl RuntimeConfig {
                 "block_frames must be <= 8192 and queue_blocks must be <= 64".into(),
             ));
         }
-        if self.input_format != self.output_format {
-            return Err(RuntimeError::Config(
-                "input and output formats must match for duplex streaming".into(),
-            ));
-        }
-        let artifacts_path = self
-            .tensorrt
-            .artifacts_path
-            .as_deref()
-            .filter(|path| !path.is_empty())
-            .or_else(|| {
-                self.tensorrt_artifacts_path
-                    .as_deref()
-                    .filter(|path| !path.is_empty())
-            });
-        if self.backend == RuntimeBackend::TensorRtRtx && artifacts_path.is_none() {
-            return Err(RuntimeError::Config(
-                "TensorRT backend requires tensorrt_artifacts_path".into(),
-            ));
-        }
+        // Selecting a GPU backend before preparing plans is valid idle state.
+        // An engine is constructed only once its artifact manifest exists.
         if self
             .tensorrt
             .window_samples
@@ -256,6 +293,11 @@ pub fn classify_config_change(
     }
     if old.backend == RuntimeBackend::TensorRtRtx {
         let artifacts_changed = old.tensorrt_artifacts() != next.tensorrt_artifacts();
+        // An execution change cannot make stale precision/source/profile plans
+        // current. Publishing a new manifest is the preparation acknowledgement.
+        if !artifacts_changed && trt_plan_config_changed(old, next) {
+            return ConfigUpdateKind::PlanBuildRequired;
+        }
         let runtime_changed = old.speaker_id != next.speaker_id
             || old.tensorrt_window() != next.tensorrt_window()
             || old.tensorrt.graph_mode != next.tensorrt.graph_mode
@@ -271,13 +313,38 @@ pub fn classify_config_change(
                 ConfigUpdateKind::HotReload
             };
         }
-        if trt_plan_config_changed(old, next) {
-            return ConfigUpdateKind::PlanBuildRequired;
-        }
     }
-    if old.input_format != next.input_format
+    if old.backend == RuntimeBackend::DirectMl
+        && (old.directml_sources_path != next.directml_sources_path
+            || old.directml_device_id != next.directml_device_id
+            || old.speaker_id != next.speaker_id)
+    {
+        return if model_loaded {
+            ConfigUpdateKind::RebuildEngine
+        } else {
+            ConfigUpdateKind::HotReload
+        };
+    }
+    if old.backend == RuntimeBackend::RvcCpu
+        && (old.cpu != next.cpu
+            || old.speaker_id != next.speaker_id
+            || old.cpu_window_samples() != next.cpu_window_samples())
+    {
+        return if model_loaded {
+            ConfigUpdateKind::RebuildEngine
+        } else {
+            ConfigUpdateKind::HotReload
+        };
+    }
+    if old.backend_auto != next.backend_auto
+        || old.cpu != next.cpu
+        || old.speaker_id != next.speaker_id
+        || old.tensorrt.profile != next.tensorrt.profile
+        || old.directml_device_id != next.directml_device_id
+        || old.input_format != next.input_format
         || old.output_format != next.output_format
         || old.conversion.pitch_semitones != next.conversion.pitch_semitones
+        || old.conversion.auto_pitch != next.conversion.auto_pitch
         || old.conversion.index_ratio != next.conversion.index_ratio
         || old.conversion.protect != next.conversion.protect
         || old.conversion.rms_mix_rate != next.conversion.rms_mix_rate
@@ -408,6 +475,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_configuration_defaults_to_bounded_cpu_policy() {
+        let config: RuntimeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.cpu, vocal_engine::CpuExecutionConfig::default());
+        let mut next = config.clone();
+        next.cpu.threads = 257;
+        assert!(next.validate().is_err());
+        next.cpu.threads = 0;
+        next.speaker_id = -1;
+        assert!(next.validate().is_err());
+    }
+
+    #[test]
+    fn cpu_execution_edits_replace_only_the_selected_cpu_engine() {
+        let old = RuntimeConfig {
+            backend: RuntimeBackend::RvcCpu,
+            ..Default::default()
+        };
+        let mut next = old.clone();
+        next.tensorrt.profile = "realtime_44960".into();
+        assert_eq!(next.cpu_window_samples(), 44960);
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::RebuildEngine
+        );
+        next.tensorrt.profile = "voice_changer".into();
+        assert_eq!(next.cpu_window_samples(), 11200);
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::HotReload
+        );
+        next = old.clone();
+        next.conversion.protect = 0.2;
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::HotReload
+        );
+        next.cpu.threads = 2;
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::RebuildEngine
+        );
+        assert_eq!(
+            classify_config_change(&old, &next, false),
+            ConfigUpdateKind::HotReload
+        );
+        let mut old = old;
+        old.backend = RuntimeBackend::Passthrough;
+        next.backend = RuntimeBackend::Passthrough;
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::HotReload
+        );
+        let mut speaker = old.clone();
+        speaker.backend = RuntimeBackend::RvcCpu;
+        let mut selected = speaker.clone();
+        selected.speaker_id = 1;
+        assert_eq!(
+            classify_config_change(&speaker, &selected, true),
+            ConfigUpdateKind::RebuildEngine
+        );
+    }
+
+    #[test]
     fn classifies_idle_updates_without_rebuilding_engine() {
         let old = RuntimeConfig::default();
         let mut next = old.clone();
@@ -416,6 +546,54 @@ mod tests {
             classify_config_change(&old, &next, true),
             ConfigUpdateKind::HotReload
         );
+    }
+
+    #[test]
+    fn gpu_selection_can_be_persisted_before_preparing_plans() {
+        let mut config = RuntimeConfig::default();
+        config.backend = RuntimeBackend::TensorRtRtx;
+        config.validate().expect("valid idle selection");
+    }
+
+    #[test]
+    fn dml_device_selection_rebuilds_only_the_idle_dml_engine() {
+        let old = RuntimeConfig {
+            backend: RuntimeBackend::DirectMl,
+            ..Default::default()
+        };
+        let next = RuntimeConfig {
+            directml_device_id: Some("dxgi:test-gpu".into()),
+            ..old.clone()
+        };
+        next.validate().unwrap();
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::RebuildEngine
+        );
+        assert_eq!(
+            classify_config_change(&old, &next, false),
+            ConfigUpdateKind::HotReload
+        );
+        let old = RuntimeConfig::default();
+        let mut next = old.clone();
+        next.directml_device_id = Some("dxgi:test-gpu".into());
+        assert_eq!(
+            classify_config_change(&old, &next, true),
+            ConfigUpdateKind::HotReload
+        );
+        next.directml_device_id = Some("invalid\0id".into());
+        assert!(next.validate().is_err());
+        let restored: RuntimeConfig = serde_json::from_str("{}").unwrap();
+        assert!(restored.directml_device_id.is_none());
+    }
+
+    #[test]
+    fn legacy_configuration_preserves_manual_backend_and_fresh_defaults_are_automatic() {
+        let mut json = serde_json::to_value(RuntimeConfig::default()).unwrap();
+        json.as_object_mut().unwrap().remove("backendAuto");
+        let legacy: RuntimeConfig = serde_json::from_value(json).unwrap();
+        assert!(!legacy.backend_auto);
+        assert!(RuntimeConfig::default().backend_auto);
     }
 
     #[test]

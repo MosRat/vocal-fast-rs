@@ -12,10 +12,13 @@
 mod abi;
 pub mod acoustic;
 mod builder;
+mod cache_io;
 mod config;
 mod cufft;
 mod error;
 mod options;
+mod pitch_matching;
+mod plan_cache;
 mod retrieval;
 mod runtime;
 mod timing;
@@ -35,14 +38,18 @@ pub use options::{
     DEFAULT_TRT_ROOT, DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode,
 };
 pub use pipeline::{
-    RMVPE_REALTIME_SAMPLES, RVC_F0_CACHE_FRAMES, RvcCudaGraphStats, RvcRealtimeConfig,
-    RvcTrtOutput, RvcTrtPipeline, RvcTrtPipelineArtifacts, RvcTrtProfile, RvcTrtTimings,
+    PlanBuildProgress, RMVPE_REALTIME_SAMPLES, RVC_F0_CACHE_FRAMES, RvcCudaGraphStats,
+    RvcRealtimeConfig, RvcTrtOutput, RvcTrtPipeline, RvcTrtPipelineArtifacts, RvcTrtProfile,
+    RvcTrtTimings,
 };
 pub use retrieval::GpuRetrievalIndex;
 pub use runtime::{
     Context, CudaBuffer, CudaGraphCapture, CudaGraphExec, CudaStream, OwnedContext,
     PinnedHostBuffer, PinnedHostRing, Runtime,
 };
+
+/// Identifies the statically linked native graph builder and SDK revision.
+pub const BUILDER_FINGERPRINT: &str = env!("VOCAL_TRT_BUILDER_FINGERPRINT");
 
 pub(crate) fn cstring(value: &str) -> Result<std::ffi::CString, NativeBuildError> {
     std::ffi::CString::new(value.as_bytes())

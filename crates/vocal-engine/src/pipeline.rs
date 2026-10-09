@@ -8,7 +8,7 @@ use std::f32::consts::PI;
 use std::time::Instant;
 
 use crate::{EngineError, config::validate_conversion};
-use vocal_types::ConversionConfig;
+use vocal_types::{ConversionConfig, PitchMatcher};
 
 pub const HUBERT_SAMPLE_RATE: u32 = 16_000;
 pub const PITCH_HOP_SAMPLES: usize = 160;
@@ -213,6 +213,7 @@ pub struct RvcPipeline {
     pitch: Box<dyn PitchExtractor>,
     index: Option<Box<dyn FeatureIndex>>,
     synthesizer: Box<dyn Synthesizer>,
+    pitch_matcher: PitchMatcher,
 }
 
 impl RvcPipeline {
@@ -230,6 +231,7 @@ impl RvcPipeline {
             pitch,
             index,
             synthesizer,
+            pitch_matcher: PitchMatcher::default(),
         })
     }
 
@@ -239,6 +241,10 @@ impl RvcPipeline {
 
     pub fn set_index(&mut self, index: Option<Box<dyn FeatureIndex>>) {
         self.index = index;
+    }
+
+    pub fn reset_stream(&mut self) {
+        self.pitch_matcher.reset();
     }
 
     pub fn run(
@@ -283,12 +289,25 @@ impl RvcPipeline {
                 &padded,
                 HUBERT_SAMPLE_RATE,
                 padded.len().div_ceil(PITCH_HOP_SAMPLES),
-                conversion.pitch_semitones,
+                0.0,
                 self.config.f0_method,
             )?)
         } else {
             None
         };
+        if let Some(track) = &mut pitch {
+            let effective = self.pitch_matcher.resolve(
+                &track.hz,
+                conversion.auto_pitch,
+                conversion.pitch_semitones,
+                true,
+            );
+            let factor = 2.0_f32.powf(effective / 12.0);
+            for (hz, coarse) in track.hz.iter_mut().zip(&mut track.coarse) {
+                *hz *= factor;
+                *coarse = f0_to_coarse(*hz);
+            }
+        }
         timings.pitch_micros = started.elapsed().as_micros() as u64;
 
         let features_before_interpolation = if pitch.is_some() && conversion.protect < 0.5 {
@@ -676,6 +695,60 @@ mod tests {
     }
 
     struct MockTensorRt;
+
+    struct FixedPitch;
+    impl PitchExtractor for FixedPitch {
+        fn extract(
+            &mut self,
+            _: &[f32],
+            _: u32,
+            frames: usize,
+            manual: f32,
+            _: F0Method,
+        ) -> Result<PitchTrack, EngineError> {
+            assert_eq!(manual, 0., "extraction must retain raw F0");
+            Ok(PitchTrack {
+                hz: vec![140.; frames],
+                coarse: vec![f0_to_coarse(140.); frames],
+            })
+        }
+    }
+    struct ObservedPitch(std::sync::Arc<std::sync::Mutex<Vec<PitchTrack>>>);
+    impl Synthesizer for ObservedPitch {
+        fn synthesize(&mut self, input: SynthesisInput<'_>) -> Result<Vec<f32>, EngineError> {
+            self.0.lock().unwrap().push(input.pitch.unwrap().clone());
+            Ok(vec![0.; input.output_samples])
+        }
+    }
+    #[test]
+    fn cpu_pipeline_updates_coarse_and_continuous_pitch_once_before_synthesis() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut pipeline = RvcPipeline::new(
+            RvcPipelineConfig::default(),
+            Box::new(FrameEnergyEncoder::new(1, HUBERT_HOP_SAMPLES)),
+            Box::new(FixedPitch),
+            None,
+            Box::new(ObservedPitch(observed.clone())),
+        )
+        .unwrap();
+        let mut config = ConversionConfig::default();
+        for _ in 0..2 {
+            pipeline.run(&vec![0.1; 1600], 16000, config).unwrap();
+        }
+        config.pitch_semitones = 2.;
+        pipeline.run(&vec![0.1; 1600], 16000, config).unwrap();
+        config.auto_pitch.enabled = false;
+        pipeline.run(&vec![0.1; 1600], 16000, config).unwrap();
+        pipeline.reset_stream();
+        config.auto_pitch.enabled = true;
+        config.auto_pitch.target_hz = 155.;
+        pipeline.run(&vec![0.1; 1600], 16000, config).unwrap();
+        for (track, effective) in observed.lock().unwrap().iter().zip([10., 10., 12., 2., 4.]) {
+            let expected = 140. * 2f32.powf(effective / 12.);
+            assert!(track.hz.iter().all(|&hz| (hz - expected).abs() < 1e-5));
+            assert!(track.coarse.iter().all(|&p| p == f0_to_coarse(expected)));
+        }
+    }
 
     impl TensorRtRtxExecutor for MockTensorRt {
         fn enqueue(&mut self, input: TensorRtRtxInput<'_>) -> Result<Vec<f32>, EngineError> {

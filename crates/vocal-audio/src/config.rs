@@ -22,6 +22,9 @@ pub struct StreamConfig {
 pub struct StreamQueueConfig {
     pub input_blocks: usize,
     pub output_blocks: usize,
+    /// Render starts only after this many complete blocks have been published.
+    /// Zero preserves immediate playback. Priming silence is not an underflow.
+    pub render_prefill_blocks: usize,
 }
 
 impl StreamQueueConfig {
@@ -29,6 +32,7 @@ impl StreamQueueConfig {
         Self {
             input_blocks,
             output_blocks,
+            render_prefill_blocks: 0,
         }
     }
 
@@ -36,10 +40,20 @@ impl StreamQueueConfig {
         Self::new(blocks, blocks)
     }
 
+    pub const fn with_render_prefill(mut self, blocks: usize) -> Self {
+        self.render_prefill_blocks = blocks;
+        self
+    }
+
     pub fn validate(self) -> Result<Self, AudioError> {
         if self.input_blocks == 0 || self.output_blocks == 0 {
             return Err(AudioError::InvalidConfig(
                 "input_blocks and output_blocks must be non-zero".into(),
+            ));
+        }
+        if self.render_prefill_blocks > self.output_blocks {
+            return Err(AudioError::InvalidConfig(
+                "render prefill exceeds output queue capacity".into(),
             ));
         }
         if self.input_blocks > isize::MAX as usize || self.output_blocks > isize::MAX as usize {
@@ -112,6 +126,46 @@ impl Default for StreamQueueConfig {
     }
 }
 
+/// Device slots stay small; capacities cover complete model batches and
+/// render primes beyond one batch to absorb variation in inference duration.
+#[derive(Clone, Copy, Debug)]
+pub struct RealtimeBufferConfig {
+    pub batch_frames: usize,
+    pub queues: StreamQueueConfig,
+}
+
+impl RealtimeBufferConfig {
+    pub fn for_batch(stream: StreamConfig, batch_frames: usize) -> Result<Self, AudioError> {
+        stream.validate()?;
+        if batch_frames == 0 {
+            return Ok(Self {
+                batch_frames: 0,
+                queues: StreamQueueConfig::new(
+                    stream.queue_blocks,
+                    stream.queue_blocks.clamp(1, 2),
+                ),
+            });
+        }
+        let batch_frames = batch_frames.max(stream.block_frames);
+        let blocks = batch_frames.div_ceil(stream.block_frames);
+        let input = blocks.checked_mul(2).and_then(|v| v.checked_add(2));
+        let output = blocks.checked_mul(3).and_then(|v| v.checked_add(2));
+        let (Some(input), Some(output)) = (input, output) else {
+            return Err(AudioError::InvalidConfig(
+                "batch queue capacity overflows usize".into(),
+            ));
+        };
+        let prefill = blocks + blocks.div_ceil(2);
+        let queues = StreamQueueConfig::new(input.max(stream.queue_blocks), output)
+            .with_render_prefill(prefill)
+            .validate()?;
+        Ok(Self {
+            batch_frames,
+            queues,
+        })
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
@@ -128,6 +182,26 @@ impl Default for StreamConfig {
 }
 
 impl StreamConfig {
+    /// Keep a duration budget while selecting an endpoint's actual format.
+    /// Fractional frame ratios are retained by the streaming converter; this
+    /// rounding only defines ring slot capacity and does not change playback speed.
+    pub fn for_endpoint(self, format: AudioFormat) -> Result<Self, AudioError> {
+        self.validate()?;
+        format
+            .validate()
+            .map_err(|error| AudioError::InvalidConfig(error.to_string()))?;
+        let frames = (self.block_frames as u128 * u128::from(format.sample_rate))
+            .div_ceil(u128::from(self.format.sample_rate));
+        let block_frames = usize::try_from(frames)
+            .map_err(|_| AudioError::InvalidConfig("endpoint block size overflows usize".into()))?;
+        Self {
+            format,
+            block_frames,
+            ..self
+        }
+        .validate()
+    }
+
     pub const fn with_queue_blocks(mut self, queue_blocks: usize) -> Self {
         self.queue_blocks = queue_blocks;
         self

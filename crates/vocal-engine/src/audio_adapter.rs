@@ -9,7 +9,9 @@ use std::collections::VecDeque;
 
 use vocal_types::AudioFormat;
 
-use crate::{EngineError, pipeline};
+use crate::EngineError;
+#[cfg(any(feature = "cpu-graph", feature = "directml", feature = "tensorrt-rtx"))]
+pub(crate) use crate::streaming_output::StreamingOutputJoiner;
 
 /// Convert an interleaved block to mono by averaging its channels.
 pub(crate) fn to_mono(format: AudioFormat, samples: &[f32]) -> Vec<f32> {
@@ -35,6 +37,7 @@ pub(crate) fn interleave(mono: &[f32], channels: u16) -> Vec<f32> {
 }
 
 /// Crop or left-pad a converted waveform to exactly `frames` samples.
+#[cfg_attr(not(feature = "tensorrt-rtx"), allow(dead_code))]
 pub(crate) fn tail_with_length(samples: &[f32], frames: usize) -> Vec<f32> {
     if samples.len() >= frames {
         return samples[samples.len() - frames..].to_vec();
@@ -46,6 +49,7 @@ pub(crate) fn tail_with_length(samples: &[f32], frames: usize) -> Vec<f32> {
 
 /// Apply the RVC RMS mix policy to a block after it has been converted back to
 /// the public output sample rate.
+#[cfg_attr(not(feature = "tensorrt-rtx"), allow(dead_code))]
 pub(crate) fn apply_rms_mix(source: &[f32], output: &mut [f32], rate: f32) {
     if source.is_empty() || output.is_empty() || rate >= 1.0 {
         return;
@@ -59,6 +63,7 @@ pub(crate) fn apply_rms_mix(source: &[f32], output: &mut [f32], rate: f32) {
     }
 }
 
+#[cfg_attr(not(feature = "tensorrt-rtx"), allow(dead_code))]
 fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
 }
@@ -79,7 +84,7 @@ impl StreamingWindow {
     pub(crate) fn new(target_samples: usize) -> Result<Self, EngineError> {
         if target_samples == 0 {
             return Err(EngineError::InvalidConfig(
-                "TensorRT window length must be non-zero".into(),
+                "inference window length must be non-zero".into(),
             ));
         }
         Ok(Self {
@@ -106,7 +111,7 @@ impl StreamingWindow {
         }
         if samples.len() > self.target_samples {
             return Err(EngineError::InvalidInput(format!(
-                "audio block of {} internal samples exceeds TensorRT window {}",
+                "audio block of {} internal samples exceeds inference window {}",
                 samples.len(),
                 self.target_samples
             )));
@@ -197,152 +202,6 @@ impl RealtimeBufferState {
     }
 }
 
-/// Convert a mono public-rate block to the internal waveform domain.
-pub(crate) fn to_internal_rate(mono: &[f32], sample_rate: u32) -> Vec<f32> {
-    pipeline::resample_linear(mono, sample_rate, pipeline::HUBERT_SAMPLE_RATE)
-}
-
-/// Join the extended output returned by a realtime voice-conversion window.
-///
-/// The model window contains the current playback block plus a short
-/// crossfade/SOLA lookahead. The joiner keeps the previous crossfade tail,
-/// selects the best aligned candidate in the next block, and emits exactly
-/// `block_frames` samples. This is the same state boundary used by the
-/// Applio/WebUI realtime workers, expressed as a backend-neutral adapter.
-pub(crate) struct StreamingOutputJoiner {
-    sample_rate: u32,
-    crossfade_samples: usize,
-    sola_search_samples: usize,
-    sola_buffer: Vec<f32>,
-    initialized: bool,
-}
-
-impl StreamingOutputJoiner {
-    pub(crate) fn new(
-        sample_rate: u32,
-        crossfade_samples_16k: usize,
-        sola_search_samples_16k: usize,
-    ) -> Self {
-        let crossfade_samples = pipeline::resampled_len(crossfade_samples_16k, 16_000, sample_rate);
-        let sola_search_samples =
-            pipeline::resampled_len(sola_search_samples_16k, 16_000, sample_rate);
-        Self {
-            sample_rate,
-            crossfade_samples,
-            sola_search_samples,
-            sola_buffer: vec![0.0; crossfade_samples],
-            initialized: false,
-        }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.sola_buffer.fill(0.0);
-        self.initialized = false;
-    }
-
-    pub(crate) fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    pub(crate) fn required_samples(&self, block_frames: usize) -> usize {
-        block_frames
-            .saturating_add(self.crossfade_samples)
-            .saturating_add(self.sola_search_samples)
-    }
-
-    pub(crate) fn process(&mut self, audio: &[f32], block_frames: usize) -> Vec<f32> {
-        if block_frames == 0 {
-            return Vec::new();
-        }
-        let required = self.required_samples(block_frames);
-        let mut input = audio.to_vec();
-        if input.len() < required {
-            input.resize(required, 0.0);
-        }
-
-        let search_end = self
-            .crossfade_samples
-            .saturating_add(self.sola_search_samples)
-            .min(input.len());
-        let offset = if self.initialized {
-            find_sola_offset(
-                &self.sola_buffer,
-                &input[..search_end],
-                self.crossfade_samples,
-                self.sola_search_samples,
-            )
-        } else {
-            0
-        };
-        self.initialized = true;
-
-        let required_after_offset = offset
-            .saturating_add(block_frames)
-            .saturating_add(self.crossfade_samples);
-        if input.len() < required_after_offset {
-            input.resize(required_after_offset, 0.0);
-        }
-
-        let current = &input[offset..];
-        let overlap = self.crossfade_samples.min(block_frames);
-        let mut output = current[..block_frames].to_vec();
-        let fade_in = |index: usize| {
-            let phase = if overlap <= 1 {
-                1.0
-            } else {
-                index as f32 / (overlap - 1) as f32
-            };
-            (0.5 * std::f32::consts::PI * phase).sin().powi(2)
-        };
-        if overlap > 0 {
-            for index in 0..overlap {
-                let fade_in = fade_in(index);
-                output[index] = self.sola_buffer[index] * (1.0 - fade_in) + output[index] * fade_in;
-            }
-        }
-        self.sola_buffer
-            .copy_from_slice(&current[block_frames..block_frames + self.crossfade_samples]);
-        output
-    }
-}
-
-fn find_sola_offset(
-    previous: &[f32],
-    candidates: &[f32],
-    overlap: usize,
-    max_offset: usize,
-) -> usize {
-    if overlap == 0 || candidates.len() < overlap {
-        return 0;
-    }
-    let previous_energy = previous
-        .iter()
-        .take(overlap)
-        .map(|sample| f64::from(*sample) * f64::from(*sample))
-        .sum::<f64>();
-    if previous_energy <= 1e-12 {
-        return 0;
-    }
-    let max_offset = max_offset.min(candidates.len().saturating_sub(overlap));
-    let mut best_offset = 0;
-    let mut best_score = f64::NEG_INFINITY;
-    for offset in 0..=max_offset {
-        let candidate = &candidates[offset..offset + overlap];
-        let mut numerator = 0.0;
-        let mut candidate_energy = 0.0;
-        for (&left, &right) in previous.iter().take(overlap).zip(candidate) {
-            numerator += f64::from(left) * f64::from(right);
-            candidate_energy += f64::from(right) * f64::from(right);
-        }
-        let score = numerator / (previous_energy * candidate_energy + 1e-8).sqrt();
-        if score > best_score {
-            best_score = score;
-            best_offset = offset;
-        }
-    }
-    best_offset
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,37 +271,5 @@ mod tests {
     fn tail_crop_and_padding_are_deterministic() {
         assert_eq!(tail_with_length(&[1.0, 2.0, 3.0], 2), vec![2.0, 3.0]);
         assert_eq!(tail_with_length(&[1.0], 3), vec![0.0, 0.0, 1.0]);
-    }
-
-    #[test]
-    fn streaming_output_joiner_preserves_block_length() {
-        let mut joiner = StreamingOutputJoiner::new(16_000, 800, 160);
-        let block = 1_600usize;
-        let required = joiner.required_samples(block);
-        let first = vec![0.0; required];
-        let second = vec![1.0; required];
-        assert_eq!(joiner.process(&first, block).len(), block);
-        assert_eq!(joiner.process(&second, block).len(), block);
-    }
-
-    #[test]
-    fn streaming_output_joiner_allows_crossfade_to_be_disabled() {
-        let mut joiner = StreamingOutputJoiner::new(16_000, 0, 0);
-        assert_eq!(joiner.required_samples(4), 4);
-        assert_eq!(
-            joiner.process(&[1.0, 2.0, 3.0, 4.0], 4),
-            vec![1.0, 2.0, 3.0, 4.0]
-        );
-        assert_eq!(
-            joiner.process(&[5.0, 6.0, 7.0, 8.0], 4),
-            vec![5.0, 6.0, 7.0, 8.0]
-        );
-    }
-
-    #[test]
-    fn sola_search_selects_the_normalized_correlation_peak() {
-        let previous = [1.0, 0.0, 0.0, 0.0];
-        let candidates = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
-        assert_eq!(find_sola_offset(&previous, &candidates, 4, 3), 3);
     }
 }

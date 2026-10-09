@@ -13,3 +13,4 @@ vocal-types.workspace = true
 zip = { version = "8", default-features = false, features = ["deflate"] }
 prost = "0.14"
 half = "2.6"
+sha2 = "0.10"

@@ -81,6 +81,9 @@ impl DispatchTune {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeBuildOptions {
+    /// Model feature contract. Full pipeline builds derive this from Synth metadata.
+    #[serde(default)]
+    pub rvc_version: vocal_model::RvcVersion,
     pub sdk_root: PathBuf,
     pub output: PathBuf,
     /// Optional TensorRT timing-cache file used by native VFRM builds.
@@ -298,6 +301,7 @@ pub(crate) fn default_tactic_sources() -> u32 {
 impl Default for NativeBuildOptions {
     fn default() -> Self {
         Self {
+            rvc_version: vocal_model::RvcVersion::V2,
             sdk_root: PathBuf::from(DEFAULT_TRT_ROOT),
             output: "rvc.plan".into(),
             timing_cache: None,

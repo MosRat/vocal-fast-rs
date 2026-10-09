@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 
 mod config;
 mod error;
+mod pitch_matching;
 mod state;
 
-pub use config::{AudioProcessingConfig, ConversionConfig};
+pub use config::{AudioProcessingConfig, AutoPitchConfig, ConversionConfig};
 pub use error::TypesError;
+pub use pitch_matching::{PitchMatcher, estimate_pitch_offset, pitch_calibration_frames};
 pub use state::{LifecycleState, ProcessingStatus};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

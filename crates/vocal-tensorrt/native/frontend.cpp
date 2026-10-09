@@ -1,14 +1,15 @@
 #include "graph/layers.h"
 
-// RVC v2 alignment: repeat each HuBERT frame twice, then crop RMVPE F0
+// RVC v1/v2 alignment: repeat each HuBERT frame twice, then crop RMVPE F0
 // to that length. Never stretch F0: its 10 ms time grid is already correct.
 namespace vocal {
 extern "C" int vocal_trt_build_rvc_frontend(
-    uint64_t workspace, int min_frames, int opt_frames, int max_frames,
+    uint64_t workspace, int feature_width, int min_frames, int opt_frames, int max_frames,
     Build** out, char** error) noexcept {
     return guarded(error, [&] {
         require(out && min_frames > 0 && min_frames <= opt_frames &&
                 opt_frames <= max_frames, "invalid frontend build arguments");
+        require(feature_width == 256 || feature_width == 768, "unsupported RVC frontend feature width");
         *out = nullptr;
         auto b = std::unique_ptr<IBuilder>(createInferBuilder(logger()));
         require(bool(b), "create frontend builder");
@@ -32,14 +33,14 @@ extern "C" int vocal_trt_build_rvc_frontend(
             require(profile->setDimensions(name, OptProfileSelector::kMAX,z), "frontend max");
             return t;
         };
-        auto h = input("hubert_features", dims({1,-1,768}));
+        auto h = input("hubert_features", dims({1,-1,feature_width}));
         auto f0 = input("pitchf_in", dims({1,-1}));
         // fairseq HuBERT realtime inference appends the final feature frame
         // before the 2x RVC interpolation. Recreate that boundary in the
         // native graph so p_len and F0 cache lengths match WebUI/Applio.
         auto h_len = g.dimension(h,1);
         auto h_start = g.concat({g.iv({0}), g.sub(h_len,g.iv({1})), g.iv({0})},0);
-        auto h_last_layer = n->addSlice(*h,dims({0,0,0}),dims({1,1,768}),dims({1,1,1}));
+        auto h_last_layer = n->addSlice(*h,dims({0,0,0}),dims({1,1,feature_width}),dims({1,1,1}));
         require(h_last_layer,"HuBERT final frame slice");
         h_last_layer->setInput(1,*h_start);
         auto h_last = g.output(h_last_layer,"hubert.final_frame");
@@ -57,7 +58,7 @@ extern "C" int vocal_trt_build_rvc_frontend(
         crop->setInput(2,*pitch_shape);
         auto pitchf = g.output(crop,"crop_f0");
         auto resized = g.transpose(g.resize(g.transpose(h_aug,{0,2,1}),2),{0,2,1});
-        auto feat_shape = g.concat({g.iv({1}),target_frames,g.iv({768})},0);
+        auto feat_shape = g.concat({g.iv({1}),target_frames,g.iv({feature_width})},0);
         auto feat_crop_layer = n->addSlice(*resized,dims({0,0,0}),dims({1,1,1}),dims({1,1,1}));
         require(feat_crop_layer,"crop HuBERT");
         feat_crop_layer->setInput(2,*feat_shape);

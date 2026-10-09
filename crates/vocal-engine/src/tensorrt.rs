@@ -150,7 +150,12 @@ pub fn build_rvc_graph(
         .metadata
         .get("graph_schema")
         .and_then(Value::as_str)
-        .unwrap_or("rvc-v2-f0-feats")
+        .unwrap_or(match (config.feature_width, config.uses_f0) {
+            (256, true) => "rvc-v1-f0-feats",
+            (256, false) => "rvc-v1-nof0-feats",
+            (_, true) => "rvc-v2-f0-feats",
+            (_, false) => "rvc-v2-nof0-feats",
+        })
         .to_owned();
     let shapes = config.tensor_shapes()?;
     let mut weights = Vec::with_capacity(shapes.len());

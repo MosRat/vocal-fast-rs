@@ -2,6 +2,8 @@
 
 #[path = "config.rs"]
 mod config;
+#[path = "conversion.rs"]
+mod conversion;
 #[path = "error.rs"]
 mod error;
 #[path = "format.rs"]
@@ -20,6 +22,7 @@ mod timing;
 mod wake;
 
 pub use config::*;
+pub use conversion::*;
 pub use error::*;
 pub use format::*;
 pub use ring::*;
@@ -124,6 +127,112 @@ mod tests {
         assert!(matches!(
             StreamIo::new_with_queue_config(config(), StreamQueueConfig::new(0, 2)),
             Err(AudioError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn playback_priming_preserves_fifo_and_is_not_underflow() {
+        let queues = StreamQueueConfig::new(2, 3).with_render_prefill(2);
+        let io = StreamIo::new_with_queue_config(config(), queues).unwrap();
+        assert_eq!(io.queue_config(), queues);
+        let (mut device, mut worker) = io.split();
+        let mut drainer = BlockDrainer::new(config()).unwrap();
+        let mut output = [9.; 2];
+        worker.output.try_push(&[1., 2.]).unwrap();
+        assert_eq!(
+            drainer
+                .drain(&mut output, &mut device.output)
+                .unwrap()
+                .underflow_samples,
+            0
+        );
+        assert_eq!(output, [0.; 2]);
+        assert_eq!(device.output.stats().queued_blocks, 1);
+        worker.output.try_push(&[3., 4.]).unwrap();
+        drainer.drain(&mut output, &mut device.output).unwrap();
+        assert_eq!(output, [1., 2.]);
+        drainer.drain(&mut output, &mut device.output).unwrap();
+        assert_eq!(output, [3., 4.]);
+        assert_eq!(
+            drainer
+                .drain(&mut output, &mut device.output)
+                .unwrap()
+                .underflow_samples,
+            2
+        );
+    }
+
+    #[test]
+    fn capture_loss_advances_sequence_but_aborted_reservation_does_not() {
+        let (mut producer, mut consumer) = AudioRing::new(config().with_queue_blocks(1))
+            .unwrap()
+            .split();
+        producer.try_push(&[1., 2.]).unwrap();
+        assert!(matches!(
+            producer.try_push(&[3., 4.]),
+            Err(AudioError::QueueFull)
+        ));
+        assert_eq!(consumer.try_pop().unwrap().sequence, 0);
+        drop(producer.try_acquire().unwrap());
+        assert_eq!(producer.try_push(&[5., 6.]).unwrap(), 2);
+        assert_eq!(consumer.try_pop().unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn model_batches_define_capacity_independently_of_device_period() {
+        let stream = StreamConfig::default();
+        let buffering = RealtimeBufferConfig::for_batch(stream, 12_000).unwrap();
+        assert_eq!(stream.block_frames, 480);
+        assert_eq!(buffering.queues.input_blocks, 52);
+        assert_eq!(buffering.queues.output_blocks, 77);
+        assert_eq!(buffering.queues.render_prefill_blocks, 38);
+        assert!(
+            StreamQueueConfig::new(1, 1)
+                .with_render_prefill(2)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_assembler_accounts_for_every_lost_block_in_large_callback() {
+        let config = config().with_queue_blocks(1);
+        let (mut producer, mut consumer) = AudioRing::new(config).unwrap().split();
+        let mut assembler = BlockAssembler::new(config).unwrap();
+        assert!(matches!(
+            assembler.push(&[1., 2., 3., 4., 5., 6., 7.], &mut producer),
+            Err(AudioError::QueueFull)
+        ));
+        assert_eq!(assembler.dropped_blocks(), 2);
+        assert_eq!(producer.stats().dropped_full, 2);
+        assert_eq!(consumer.try_pop().unwrap().sequence, 0);
+        assert_eq!(assembler.buffered_samples(), 1);
+        assembler.push(&[8.], &mut producer).unwrap();
+        let next = consumer.try_pop().unwrap();
+        assert_eq!(next.sequence, 3);
+        assert_eq!(next.samples, [7., 8.]);
+    }
+
+    #[test]
+    fn playback_priming_does_not_hide_partial_interleaved_frames() {
+        let config = StreamConfig {
+            format: AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            block_frames: 2,
+            queue_blocks: 2,
+        };
+        let (mut device, _) = StreamIo::new_with_queue_config(
+            config,
+            StreamQueueConfig::new(2, 2).with_render_prefill(2),
+        )
+        .unwrap()
+        .split();
+        let mut drainer = BlockDrainer::new(config).unwrap();
+        assert!(matches!(
+            drainer.drain_with_slip(&mut [0.; 3], &mut device.output, FrameSlip::Drop),
+            Err(AudioError::PartialFrame)
         ));
     }
 

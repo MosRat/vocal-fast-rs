@@ -29,7 +29,7 @@ use crate::{
 };
 
 pub use crate::threading::MmcssGuard;
-pub use crate::wasapi_native::{NativeWasapiError, NativeWasapiStream};
+pub use crate::wasapi_native::{NativeWasapiError, NativeWasapiStream, WasapiInitError};
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("the WASAPI f32 path requires a little-endian Windows target");
@@ -76,6 +76,20 @@ pub enum WasapiStream {
 }
 
 impl WasapiStream {
+    /// Native independent-format duplex graph, also supporting stable endpoint
+    /// IDs obtained from CPAL's `DeviceId::id()` on the WASAPI host.
+    pub fn open_devices_profiled(
+        reference: StreamConfig,
+        queues: StreamQueueConfig,
+        clock: AudioClock,
+        capture_id: Option<String>,
+        render_id: Option<String>,
+    ) -> Result<(Self, WorkerIo), WasapiBackendError> {
+        NativeWasapiStream::open_devices_profiled(reference, queues, clock, capture_id, render_id)
+            .map(|(stream, worker)| (Self::Native(stream), worker))
+            .map_err(WasapiBackendError::Native)
+    }
+
     pub fn open(
         config: StreamConfig,
         mode: WasapiMode,

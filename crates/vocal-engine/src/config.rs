@@ -11,6 +11,7 @@ pub enum BackendKind {
     Passthrough,
     RvcCpuPipeline,
     TensorRtRtx,
+    DirectMl,
 }
 
 #[derive(Clone, Debug)]
@@ -21,6 +22,27 @@ pub struct EngineConfig {
     /// preserves the portable constructors while making the backend choice
     /// explicit for callers that have a compiled VFRM pipeline.
     pub tensorrt: Option<TensorRtEngineSpec>,
+    pub directml: Option<DirectMlEngineSpec>,
+    pub cpu: Option<CpuEngineSpec>,
+}
+
+/// Real CPU graphs require canonical Synth and acoustic VFRM sources.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuEngineSpec {
+    pub synth: PathBuf,
+    pub hubert: PathBuf,
+    pub rmvpe: PathBuf,
+    pub execution: crate::CpuExecutionConfig,
+    pub window_samples: usize,
+    pub speaker_id: usize,
+}
+
+/// Native DML graphs are compiled from VFRM when the idle engine is created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectMlEngineSpec {
+    pub sources_path: PathBuf,
+    pub speaker_id: usize,
+    pub adapter_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,6 +87,8 @@ impl EngineConfig {
             backend,
             model,
             tensorrt: None,
+            directml: None,
+            cpu: None,
         }
     }
 
@@ -82,6 +106,32 @@ impl EngineConfig {
                 speaker_id: 0,
                 window_samples: None,
             }),
+            directml: None,
+            cpu: None,
+        }
+    }
+
+    pub fn with_directml(model: ModelDescriptor, sources_path: impl Into<PathBuf>) -> Self {
+        Self {
+            backend: BackendKind::DirectMl,
+            model,
+            tensorrt: None,
+            directml: Some(DirectMlEngineSpec {
+                sources_path: sources_path.into(),
+                speaker_id: 0,
+                adapter_id: None,
+            }),
+            cpu: None,
+        }
+    }
+
+    pub fn with_cpu_graph(model: ModelDescriptor, spec: CpuEngineSpec) -> Self {
+        Self {
+            backend: BackendKind::RvcCpuPipeline,
+            model,
+            tensorrt: None,
+            directml: None,
+            cpu: Some(spec),
         }
     }
 
@@ -92,6 +142,11 @@ impl EngineConfig {
         if self.backend == BackendKind::TensorRtRtx && self.tensorrt.is_none() {
             return Err(EngineError::InvalidConfig(
                 "TensorRT backend requires pipeline artifacts and a VFRM model package".into(),
+            ));
+        }
+        if self.backend == BackendKind::DirectMl && self.directml.is_none() {
+            return Err(EngineError::InvalidConfig(
+                "DirectML backend requires a VFRM sources manifest".into(),
             ));
         }
         Ok(())

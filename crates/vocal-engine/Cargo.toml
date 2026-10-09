@@ -5,17 +5,26 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+cpu-graph = ["dep:vocal-cpu"]
 default = ["passthrough"]
 passthrough = []
 tensorrt-rtx = ["dep:vocal-tensorrt"]
+directml = ["dep:vocal-directml"]
 
 [dependencies]
+vocal-cpu = { path = "../vocal-cpu", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 vocal-types.workspace = true
+vocal-audio.workspace = true
 vocal-model.workspace = true
 half = "2.6"
 prost = "0.14"
 vocal-tensorrt = { path = "../vocal-tensorrt", optional = true }
+vocal-directml = { path = "../vocal-directml", optional = true }
+
+[[example]]
+name = "cpu_streaming_benchmark"
+required-features = ["cpu-graph"]

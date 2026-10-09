@@ -13,29 +13,45 @@ use std::{
 };
 
 mod acoustic;
+mod bundle;
 mod cache;
 mod canonical;
 mod config;
 mod error;
+mod import;
+mod inspection;
 mod logging;
+mod metadata;
 mod onnx;
 mod package;
 mod pickle;
 mod retrieval;
+mod rvc_version;
 mod schema;
 mod state;
 
 pub use acoustic::{
     ACOUSTIC_TENSOR_SCHEMA, AcousticConfig, AcousticKind, AcousticPort, AcousticTensorMap,
+    HubertFeatureMode,
 };
+pub use bundle::{bundle_rvc_cache, materialize_acoustic_sources};
 pub use cache::{ModelPackageCache, shared_model_cache};
 pub use config::{
     CACHE_ALIGNMENT, CACHE_HEADER_BYTES, CACHE_MAGIC, DEFAULT_MAX_METADATA_BYTES,
     DEFAULT_MAX_TENSOR_BYTES, DEFAULT_MAX_TENSORS, ModelLoadConfig,
 };
 pub use error::ModelError;
+pub use import::load_rvc_pth_auto;
+pub use inspection::{
+    HUBERT_BUNDLE_TENSOR, ModelArtifactInspection, ModelComponent, ModelComponents,
+    RMVPE_BUNDLE_TENSOR, inspect_model_artifact, inspect_model_artifact_with_config,
+};
+pub use metadata::{
+    ModelMetadataEdit, ModelMetadataView, edit_model_metadata, read_model_metadata,
+};
 pub use package::{ModelPackage, RvcModelManifest, Tensor, TensorDType};
 pub use retrieval::RetrievalIndex;
+pub use rvc_version::{RvcFeatureSpec, RvcVersion};
 pub use schema::{RVC_TENSOR_SCHEMA, RvcSynthConfig};
 pub use state::{ModelLoadState, ModelLoadStatus};
 
@@ -151,6 +167,17 @@ impl ModelLoader {
     ) -> Result<Arc<ModelPackage>, ModelError> {
         let config = self.config.clone();
         self.run("cache-shared", || shared_model_cache().load(path, &config))
+    }
+
+    /// Load Synth and retrieval tensors without retaining bundled acoustic files.
+    pub fn load_voice_cache_shared(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<Arc<ModelPackage>, ModelError> {
+        let config = self.config.clone();
+        self.run("voice-cache-shared", || {
+            shared_model_cache().load_voice(path, &config)
+        })
     }
 
     pub fn load_directory(
@@ -468,9 +495,16 @@ fn validate_rvc_checkpoint_metadata(
     metadata: &Value,
 ) -> Result<(), ModelError> {
     if let Some(version) = metadata.get("version").and_then(Value::as_str) {
-        let is_v2 = version.to_ascii_lowercase().contains('2');
-        let expected_v2 = manifest.feature_dims() == 768;
-        if is_v2 != expected_v2 {
+        let checkpoint_version = match version.to_ascii_lowercase().as_str() {
+            "v1" | "1" => RvcVersion::V1,
+            "v2" | "2" => RvcVersion::V2,
+            _ => {
+                return Err(ModelError::UnsupportedModel(format!(
+                    "unsupported checkpoint RVC version {version}"
+                )));
+            }
+        };
+        if checkpoint_version != manifest.rvc_version()? {
             return Err(ModelError::UnsupportedModel(format!(
                 "checkpoint version {version} does not match manifest {}",
                 manifest.version
@@ -588,100 +622,67 @@ pub fn load_cache_with_config(
     path: impl AsRef<Path>,
     load_config: &ModelLoadConfig,
 ) -> Result<ModelPackage, ModelError> {
+    load_cache_selected(path.as_ref(), load_config, false)
+}
+
+pub(crate) fn load_cache_selected(
+    path: &Path,
+    load_config: &ModelLoadConfig,
+    voice_only: bool,
+) -> Result<ModelPackage, ModelError> {
     load_config.validate()?;
     let mut input = io::BufReader::new(fs::File::open(path)?);
-    let mut magic = [0_u8; 8];
-    input.read_exact(&mut magic)?;
-    if &magic != CACHE_MAGIC {
-        return Err(ModelError::InvalidCache("bad magic/version".into()));
-    }
-    let _flags = read_u32(&mut input)?;
-    let header_size = read_u32(&mut input)? as u64;
-    let metadata_len = read_u64(&mut input)?;
-    let tensor_count = read_u64(&mut input)?;
-    let directory_len = read_u64(&mut input)?;
-    let data_offset = read_u64(&mut input)?;
-    let _reserved0 = read_u64(&mut input)?;
-    let _reserved1 = read_u64(&mut input)?;
-    if header_size != CACHE_HEADER_BYTES
-        || metadata_len > load_config.max_metadata_bytes
-        || tensor_count > load_config.max_tensors
-        || directory_len > load_config.max_tensor_bytes
-        || data_offset < CACHE_HEADER_BYTES + metadata_len + directory_len
+    let directory =
+        inspection::read_directory(&mut input, 0, fs::metadata(path)?.len(), load_config)?;
+    if voice_only
+        || load_config.validate_canonical
+            && directory
+                .tensors
+                .iter()
+                .any(|t| matches!(t.name.as_str(), HUBERT_BUNDLE_TENSOR | RMVPE_BUNDLE_TENSOR))
     {
-        return Err(ModelError::InvalidCache("invalid header bounds".into()));
+        inspection::inspect_directory(
+            &mut input,
+            &directory,
+            &path.display().to_string(),
+            load_config,
+        )?;
     }
-    let mut config_bytes = vec![0; metadata_len as usize];
-    input.read_exact(&mut config_bytes)?;
-    let config: Value = serde_json::from_slice(&config_bytes)?;
-    let manifest: RvcModelManifest = serde_json::from_value(
-        config
-            .get("manifest")
-            .cloned()
-            .ok_or_else(|| ModelError::InvalidCache("config has no manifest".into()))?,
-    )?;
-    let metadata = config.get("metadata").cloned().unwrap_or(Value::Null);
-    let directory_end = CACHE_HEADER_BYTES + metadata_len + directory_len;
-    let mut descriptors = Vec::with_capacity(tensor_count as usize);
-    for _ in 0..tensor_count {
-        let name_len = read_u32(&mut input)? as usize;
-        let mut attrs = [0_u8; 4];
-        input.read_exact(&mut attrs)?;
-        let dtype = TensorDType::from_byte(attrs[0])?;
-        let rank = attrs[1] as usize;
-        if name_len > u16::MAX as usize || rank > 64 {
-            return Err(ModelError::InvalidCache(
-                "invalid tensor directory entry".into(),
-            ));
-        }
-        let mut name_bytes = vec![0; name_len];
-        input.read_exact(&mut name_bytes)?;
-        let name = String::from_utf8(name_bytes)
-            .map_err(|_| ModelError::InvalidCache("tensor name is not UTF-8".into()))?;
-        let mut shape = Vec::with_capacity(rank);
-        for _ in 0..rank {
-            shape.push(read_u64(&mut input)?);
-        }
-        let offset = read_u64(&mut input)?;
-        let len = read_u64(&mut input)?;
-        if offset < data_offset
-            || len > load_config.max_tensor_bytes
-            || offset.checked_add(len).is_none()
+    let mut tensors = Vec::with_capacity(directory.tensors.len());
+    for entry in directory.tensors {
+        if voice_only
+            && matches!(
+                entry.name.as_str(),
+                HUBERT_BUNDLE_TENSOR | RMVPE_BUNDLE_TENSOR
+            )
         {
-            return Err(ModelError::InvalidCache(
-                "tensor data range is invalid".into(),
-            ));
+            continue;
         }
-        descriptors.push((name, dtype, shape, offset, len));
-    }
-    if input.stream_position()? > directory_end {
-        return Err(ModelError::InvalidCache(
-            "tensor directory exceeds declared length".into(),
-        ));
-    }
-    let mut tensors = Vec::with_capacity(descriptors.len());
-    for (name, dtype, shape, offset, len) in descriptors {
-        input.seek(SeekFrom::Start(offset))?;
-        let mut data = vec![0; len as usize];
+        input.seek(SeekFrom::Start(entry.offset))?;
+        let mut data = vec![0; entry.len as usize];
         input.read_exact(&mut data)?;
         let tensor = Tensor {
-            name,
-            dtype,
-            shape,
+            name: entry.name,
+            dtype: entry.dtype,
+            shape: entry.shape,
             data,
         };
         tensor.validate()?;
         tensors.push(tensor);
     }
     let package = ModelPackage {
-        manifest,
-        metadata,
+        manifest: directory.manifest,
+        metadata: directory.metadata,
         tensors,
     };
     if load_config.validate_canonical {
         validate_canonical_package(&package)?;
     }
     Ok(package)
+}
+
+pub fn load_voice_cache_shared(path: impl AsRef<Path>) -> Result<Arc<ModelPackage>, ModelError> {
+    shared_model_cache().load_voice(path, &ModelLoadConfig::default())
 }
 
 /// Load a VFRM package through the process-wide weak cache.
@@ -709,11 +710,27 @@ fn validate_canonical_package(package: &ModelPackage) -> Result<(), ModelError> 
         .and_then(Value::as_str)
         == Some(RVC_TENSOR_SCHEMA)
     {
+        let manifest_version = package.manifest.rvc_version()?;
+        if let Some(graph_schema) = package.metadata.get("graph_schema").and_then(Value::as_str) {
+            let graph_version = if graph_schema.starts_with("rvc-v1-") {
+                Some(RvcVersion::V1)
+            } else if graph_schema.starts_with("rvc-v2-") {
+                Some(RvcVersion::V2)
+            } else {
+                None
+            };
+            if graph_version.is_some_and(|version| version != manifest_version) {
+                return Err(ModelError::InvalidCache(
+                    "canonical graph_schema disagrees with RVC manifest version".into(),
+                ));
+            }
+        }
         let config: RvcSynthConfig =
             serde_json::from_value(package.metadata.get("rvc_config").cloned().ok_or_else(
                 || ModelError::InvalidCache("canonical cache has no rvc_config".into()),
             )?)?;
         schema::validate_tensors(&config, &package.manifest, &package.tensors)?;
+        inspection::validate_embedded_acoustics(package)?;
     }
     if package
         .metadata

@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+cpu-graph = ["vocal-engine/cpu-graph", "vocal-runtime/cpu-graph", "dep:vocal-cpu"]
+directml = ["vocal-engine/directml", "vocal-runtime/directml", "dep:vocal-directml"]
 tensorrt-rtx = [
     "vocal-engine/tensorrt-rtx",
     "vocal-runtime/tensorrt-rtx",
@@ -15,7 +17,24 @@ tensorrt-rtx = [
 name = "vocal-fast"
 path = "src/main.rs"
 
+[[example]]
+name = "plan_build_probe"
+required-features = ["tensorrt-rtx"]
+
+[[example]]
+name = "rvc_version_probe"
+required-features = ["cpu-graph", "directml", "tensorrt-rtx"]
+
+[[example]]
+name = "cpu_runtime_probe"
+required-features = ["cpu-graph"]
+
+[[example]]
+name = "trt_context_memory_probe"
+required-features = ["tensorrt-rtx"]
+
 [dependencies]
+vocal-cpu = { path = "../vocal-cpu", optional = true }
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -26,6 +45,7 @@ vocal-model.workspace = true
 vocal-runtime.workspace = true
 vocal-types.workspace = true
 vocal-tensorrt = { path = "../vocal-tensorrt", optional = true }
+vocal-directml = { path = "../vocal-directml", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 mimalloc = { workspace = true, features = ["win_direct_tls"] }

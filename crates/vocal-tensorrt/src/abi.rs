@@ -4,6 +4,7 @@
 //! structures and VFRM storage never cross the FFI boundary directly.
 
 use half::{bf16, f16};
+use std::borrow::Cow;
 use std::ffi::CString;
 use vocal_model::{RvcSynthConfig, Tensor, TensorDType};
 
@@ -98,6 +99,7 @@ pub(crate) struct NativeOptions {
     pub rmvpe_fft_mode: i32,
     pub fused_rvc_qkv: i32,
     pub hubert_feature_precision: i32,
+    pub rvc_feature_width: i32,
     pub rmvpe_external_stft: i32,
     pub tactic_sources: i32,
     pub timing_cache_path: *const std::os::raw::c_char,
@@ -176,7 +178,7 @@ fn i32v(value: u64, field: &str) -> Result<i32, NativeBuildError> {
         .map_err(|_| NativeBuildError::Argument(format!("{field} exceeds i32 range")))
 }
 
-pub(crate) fn tensor_f32(tensor: &Tensor) -> Result<Vec<f32>, NativeBuildError> {
+pub(crate) fn tensor_f32(tensor: &Tensor) -> Result<Cow<'_, [f32]>, NativeBuildError> {
     let count = tensor
         .shape
         .iter()
@@ -186,6 +188,36 @@ pub(crate) fn tensor_f32(tensor: &Tensor) -> Result<Vec<f32>, NativeBuildError> 
         .ok_or_else(|| {
             NativeBuildError::Argument(format!("tensor {} shape overflows", tensor.name))
         })?;
+    let width = match tensor.dtype {
+        TensorDType::F32 => 4,
+        TensorDType::F16 | TensorDType::BF16 => 2,
+        _ => {
+            return Err(NativeBuildError::Argument(format!(
+                "tensor {} is not floating point",
+                tensor.name
+            )));
+        }
+    };
+    if count.checked_mul(width) != Some(tensor.data.len()) {
+        return Err(NativeBuildError::Argument(format!(
+            "tensor {} element count mismatch",
+            tensor.name
+        )));
+    }
+    // VFRM is little-endian. Aligned native F32 storage can be borrowed for
+    // the synchronous build call; unaligned buffers retain a checked fallback.
+    if cfg!(target_endian = "little")
+        && tensor.dtype == TensorDType::F32
+        && tensor.data.as_ptr().cast::<f32>().is_aligned()
+        && tensor.data.len()
+            == count.checked_mul(4).ok_or_else(|| {
+                NativeBuildError::Argument("F32 tensor byte count overflow".into())
+            })?
+    {
+        return Ok(Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(tensor.data.as_ptr().cast(), count)
+        }));
+    }
     let mut values = Vec::with_capacity(count);
     match tensor.dtype {
         TensorDType::F32 => {
@@ -239,7 +271,7 @@ pub(crate) fn tensor_f32(tensor: &Tensor) -> Result<Vec<f32>, NativeBuildError> 
             tensor.name
         )));
     }
-    Ok(values)
+    Ok(Cow::Owned(values))
 }
 
 /// Return the original two-byte representation for F16/BF16 tensors.
@@ -249,9 +281,9 @@ pub(crate) fn tensor_f32(tensor: &Tensor) -> Result<Vec<f32>, NativeBuildError> 
 /// this second buffer lets the ordinary Synth convolution path pass the VFRM
 /// bits directly to TensorRT instead of expanding to F32 and converting back
 /// during graph construction.
-pub(crate) fn tensor_u16(tensor: &Tensor) -> Result<Vec<u16>, NativeBuildError> {
+pub(crate) fn tensor_u16(tensor: &Tensor) -> Result<Cow<'_, [u16]>, NativeBuildError> {
     if !matches!(tensor.dtype, TensorDType::F16 | TensorDType::BF16) {
-        return Ok(Vec::new());
+        return Ok(Cow::Borrowed(&[]));
     }
     let (chunks, remainder) = tensor.data.as_chunks::<2>();
     if !remainder.is_empty() {
@@ -275,10 +307,17 @@ pub(crate) fn tensor_u16(tensor: &Tensor) -> Result<Vec<u16>, NativeBuildError> 
             tensor.name
         )));
     }
-    Ok(chunks
-        .iter()
-        .map(|bytes| u16::from_le_bytes(*bytes))
-        .collect())
+    if cfg!(target_endian = "little") && tensor.data.as_ptr().cast::<u16>().is_aligned() {
+        return Ok(Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(tensor.data.as_ptr().cast(), count)
+        }));
+    }
+    Ok(Cow::Owned(
+        chunks
+            .iter()
+            .map(|bytes| u16::from_le_bytes(*bytes))
+            .collect(),
+    ))
 }
 
 pub(crate) fn c_string(value: impl AsRef<std::path::Path>) -> Result<CString, NativeBuildError> {
@@ -311,5 +350,49 @@ mod tests {
             data: 1.0f32.to_le_bytes().to_vec(),
         };
         assert!(tensor_u16(&tensor).unwrap().is_empty());
+    }
+
+    #[test]
+    fn aligned_weights_borrow_original_storage() {
+        let tensor = Tensor {
+            name: "weight".into(),
+            dtype: TensorDType::F32,
+            shape: vec![2],
+            data: [1f32.to_le_bytes(), (-1f32).to_le_bytes()].concat(),
+        };
+        let view = tensor_f32(&tensor).unwrap();
+        if cfg!(target_endian = "little") && tensor.data.as_ptr().cast::<f32>().is_aligned() {
+            assert!(matches!(view, Cow::Borrowed(_)));
+            assert_eq!(view.as_ptr().cast::<u8>(), tensor.data.as_ptr());
+        }
+        let tensor = Tensor {
+            dtype: TensorDType::F16,
+            data: vec![0, 0x3c, 0, 0xbc],
+            ..tensor
+        };
+        let view = tensor_u16(&tensor).unwrap();
+        if cfg!(target_endian = "little") && tensor.data.as_ptr().cast::<u16>().is_aligned() {
+            assert!(matches!(view, Cow::Borrowed(_)));
+            assert_eq!(view.as_ptr().cast::<u8>(), tensor.data.as_ptr());
+        }
+        assert!(matches!(tensor_f32(&tensor).unwrap(), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn malformed_extent_rejected_before_allocation() {
+        let mut tensor = Tensor {
+            name: "weight".into(),
+            dtype: TensorDType::F32,
+            shape: vec![u64::MAX],
+            data: vec![],
+        };
+        assert!(tensor_f32(&tensor).is_err());
+        tensor.shape = vec![2];
+        tensor.data = 1f32.to_le_bytes().to_vec();
+        assert!(tensor_f32(&tensor).is_err());
+        tensor.dtype = TensorDType::F16;
+        tensor.data = vec![0, 0x3c, 0];
+        assert!(tensor_f32(&tensor).is_err());
+        assert!(tensor_u16(&tensor).is_err());
     }
 }

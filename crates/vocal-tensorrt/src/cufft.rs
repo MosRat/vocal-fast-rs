@@ -23,9 +23,9 @@ unsafe impl Send for CufftFrontend {}
 
 impl CufftFrontend {
     pub(crate) fn new(samples: usize, stream: &CudaStream) -> Result<Self, NativeBuildError> {
-        if samples < MIN_REFLECT_SAMPLES || samples % 160 != 0 {
+        if samples < MIN_REFLECT_SAMPLES {
             return Err(NativeBuildError::Argument(
-                "cuFFT frontend samples must be a 160-sample multiple >= 1024".into(),
+                "cuFFT frontend samples must be >= 1024".into(),
             ));
         }
         let samples_i32 = i32::try_from(samples)
@@ -133,5 +133,46 @@ mod tests {
     fn empty_and_zero_shape_inputs_do_not_create_plans() {
         assert!(unique_shapes([0, 0]).is_empty());
         assert!(unique_shapes(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and cuFFT"]
+    fn unaligned_reflect_stft_preserves_the_final_fractional_hop() {
+        use super::*;
+        let samples = 4963;
+        let frames = samples / 160 + 1;
+        let mut wave = vec![0f32; samples];
+        wave[samples - 3..].copy_from_slice(&[0.25, 0.75, -0.5]);
+        let stream = CudaStream::new().unwrap();
+        let input = CudaBuffer::new(samples * 4).unwrap();
+        input.upload_f32(&wave).unwrap();
+        let output = CudaBuffer::new(513 * frames * 4).unwrap();
+        let mut fft = CufftFrontend::new(samples, &stream).unwrap();
+        fft.enqueue(input.device_ptr(), input.bytes, &output, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let mut magnitude = vec![0.; 513 * frames];
+        output.download_f32(&mut magnitude).unwrap();
+        for bin in [0, 17, 512] {
+            let (mut real, mut imag) = (0f64, 0f64);
+            for offset in 0..1024 {
+                let position = ((frames - 1) * 160 + offset) as isize - 512;
+                let index = if position >= samples as isize {
+                    2 * samples as isize - 2 - position
+                } else if position < 0 {
+                    -position
+                } else {
+                    position
+                } as usize;
+                let window =
+                    0.5f32 - 0.5 * (std::f64::consts::TAU * offset as f64 / 1024.).cos() as f32;
+                let value = (wave[index] * window) as f64;
+                let angle = std::f64::consts::TAU * bin as f64 * offset as f64 / 1024.;
+                real += value * angle.cos();
+                imag -= value * angle.sin();
+            }
+            let expected = real.hypot(imag);
+            assert!((magnitude[bin * frames + frames - 1] as f64 - expected).abs() < 1e-5);
+        }
     }
 }

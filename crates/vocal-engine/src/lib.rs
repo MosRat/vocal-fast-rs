@@ -4,13 +4,28 @@
 use std::time::Instant;
 use vocal_types::{AudioChunk, AudioFormat, ConversionConfig, LatencyMetrics, ModelDescriptor};
 
-#[cfg_attr(not(feature = "tensorrt-rtx"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "tensorrt-rtx", feature = "directml")),
+    allow(dead_code)
+)]
 mod audio_adapter;
 mod config;
+mod cpu_config;
 mod error;
 mod logging;
 mod state;
+#[cfg_attr(
+    not(any(feature = "cpu-graph", feature = "directml", feature = "tensorrt-rtx")),
+    allow(dead_code)
+)]
+mod streaming_output;
+#[cfg(any(feature = "cpu-graph", feature = "directml", feature = "tensorrt-rtx"))]
+mod streaming_resampler;
 
+#[cfg(feature = "cpu-graph")]
+mod cpu_backend;
+#[cfg(feature = "directml")]
+mod directml_backend;
 #[cfg(feature = "tensorrt-rtx")]
 mod tensorrt_backend;
 
@@ -19,20 +34,60 @@ pub mod pipeline;
 pub mod tensorrt;
 
 pub use config::{
-    BackendKind, EngineConfig, EngineReloadConfig, TensorRtEngineSpec, TensorRtReloadConfig,
-    validate_conversion,
+    BackendKind, CpuEngineSpec, DirectMlEngineSpec, EngineConfig, EngineReloadConfig,
+    TensorRtEngineSpec, TensorRtReloadConfig, validate_conversion,
 };
+pub use cpu_config::CpuExecutionConfig;
 pub use error::EngineError;
 pub use state::{EngineLifecycle, EngineStatus};
+#[cfg(feature = "cpu-graph")]
+pub use vocal_cpu::operator_version as cpu_operator_version;
+mod reload;
+pub use reload::PreparedEngineReload;
 
+#[cfg(feature = "cpu-graph")]
+pub use cpu_backend::{CpuEngine, CpuStreamConfig};
+#[cfg(feature = "directml")]
+pub use directml_backend::{DirectMlEngine, DirectMlStreamConfig};
 #[cfg(feature = "tensorrt-rtx")]
 pub use tensorrt_backend::{TensorRtBackendConfig, TensorRtEngine, create_tensorrt_engine};
 
 pub trait InferenceEngine: Send {
-    /// Apply execution-only changes while the engine is idle. Model/backend
-    /// changes are owned by the runtime and must replace the engine instead.
-    /// Backends that do not keep execution state can accept this as a no-op.
-    fn reload_config(&mut self, _config: EngineReloadConfig) -> Result<(), EngineError> {
+    /// Best-effort persistence of runtime compilation caches while idle.
+    /// Controllers call this after the worker has returned engine ownership.
+    fn flush_idle_caches(&mut self) {}
+
+    /// Preferred processing batch in the caller's format. Zero means the
+    /// backend can process each device block. Device periods remain independent.
+    fn preferred_batch_frames(&self, _format: AudioFormat) -> usize {
+        0
+    }
+
+    /// Discard all stream history on a new session or a capture discontinuity.
+    /// The worker owns the engine and invokes this without a control-plane lock.
+    fn reset_stream(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Validate controls against this engine's capabilities before saving an
+    /// idle update. This must not change stream state or poison engine status.
+    fn validate_config(&self, config: ConversionConfig) -> Result<(), EngineError> {
+        validate_conversion(config)
+    }
+
+    /// Prepare all fallible execution changes while idle. The old engine
+    /// remains usable if preparation or the controller's persistence fails.
+    fn prepare_reload_config(
+        &mut self,
+        _config: EngineReloadConfig,
+    ) -> Result<Box<dyn PreparedEngineReload + '_>, EngineError> {
+        Err(EngineError::InvalidConfig(
+            "this engine does not support execution configuration reload".into(),
+        ))
+    }
+
+    fn reload_config(&mut self, config: EngineReloadConfig) -> Result<(), EngineError> {
+        self.prepare_reload_config(config)?.commit();
         Ok(())
     }
 
@@ -76,6 +131,19 @@ pub fn create_engine(config: EngineConfig) -> Result<Box<dyn InferenceEngine>, E
             Ok(Box::new(PassthroughEngine::new(config.model)))
         }
         BackendKind::RvcCpuPipeline => {
+            if let Some(spec) = config.cpu {
+                #[cfg(feature = "cpu-graph")]
+                {
+                    return Ok(Box::new(CpuEngine::from_spec(config.model, spec)?));
+                }
+                #[cfg(not(feature = "cpu-graph"))]
+                {
+                    let _ = spec;
+                    return Err(EngineError::BackendUnavailable(
+                        "CPU graphs require vocal-engine/cpu-graph".into(),
+                    ));
+                }
+            }
             logging::created("rvc-cpu");
             Ok(Box::new(PipelineEngine::new(config.model)?))
         }
@@ -98,6 +166,22 @@ pub fn create_engine(config: EngineConfig) -> Result<Box<dyn InferenceEngine>, E
                 ))
             }
         }
+        BackendKind::DirectMl => {
+            #[cfg(feature = "directml")]
+            {
+                let spec = config
+                    .directml
+                    .ok_or_else(|| EngineError::InvalidConfig("missing DirectML sources".into()))?;
+                logging::created("directml");
+                Ok(Box::new(DirectMlEngine::from_spec(config.model, spec)?))
+            }
+            #[cfg(not(feature = "directml"))]
+            {
+                Err(EngineError::BackendUnavailable(
+                    "DirectML backend requires vocal-engine/directml and Windows".into(),
+                ))
+            }
+        }
     }
 }
 
@@ -105,6 +189,7 @@ pub struct PipelineEngine {
     pipeline: pipeline::RvcPipeline,
     metrics: LatencyMetrics,
     history: Vec<f32>,
+    format: Option<AudioFormat>,
     last_timings: pipeline::PipelineTimings,
     status: EngineStatus,
 }
@@ -117,19 +202,16 @@ impl PipelineEngine {
             } else {
                 model.sample_rate
             },
-            feature_dims: if model.version.to_ascii_lowercase().contains("v2")
-                || model.architecture.to_ascii_lowercase().contains("v2")
-            {
-                768
-            } else {
-                256
-            },
+            feature_dims: vocal_model::RvcVersion::from_labels(&model.version, &model.architecture)
+                .map(|version| version.feature_width())
+                .map_err(|error| EngineError::InvalidConfig(error.to_string()))?,
             ..Default::default()
         };
         Ok(Self {
             pipeline: pipeline::default_cpu_pipeline(config)?,
             metrics: LatencyMetrics::default(),
             history: Vec::new(),
+            format: None,
             last_timings: pipeline::PipelineTimings::default(),
             status: EngineStatus {
                 state: EngineLifecycle::Ready,
@@ -143,6 +225,7 @@ impl PipelineEngine {
             pipeline,
             metrics: LatencyMetrics::default(),
             history: Vec::new(),
+            format: None,
             last_timings: pipeline::PipelineTimings::default(),
             status: EngineStatus {
                 state: EngineLifecycle::Ready,
@@ -152,7 +235,10 @@ impl PipelineEngine {
     }
 
     pub fn reset(&mut self) {
+        self.pipeline.reset_stream();
         self.history.clear();
+        self.format = None;
+        self.status.ready();
     }
 
     pub fn last_timings(&self) -> pipeline::PipelineTimings {
@@ -161,6 +247,23 @@ impl PipelineEngine {
 }
 
 impl InferenceEngine for PipelineEngine {
+    fn prepare_reload_config(
+        &mut self,
+        config: EngineReloadConfig,
+    ) -> Result<Box<dyn PreparedEngineReload + '_>, EngineError> {
+        if config.backend != BackendKind::RvcCpuPipeline || config.tensorrt.is_some() {
+            return Err(EngineError::InvalidConfig(
+                "CPU backend changes require engine replacement".into(),
+            ));
+        }
+        Ok(reload::prepared_reload(|| {}))
+    }
+
+    fn reset_stream(&mut self) -> Result<(), EngineError> {
+        self.reset();
+        Ok(())
+    }
+
     fn process(
         &mut self,
         input: &AudioChunk,
@@ -187,6 +290,10 @@ impl InferenceEngine for PipelineEngine {
             return Err(error);
         }
         let started = Instant::now();
+        if self.format != Some(format) {
+            self.history.clear();
+            self.format = Some(format);
+        }
         let channels = format.channels as usize;
         let mono = if channels == 1 {
             samples.to_vec()
@@ -276,6 +383,23 @@ impl PassthroughEngine {
 }
 
 impl InferenceEngine for PassthroughEngine {
+    fn reset_stream(&mut self) -> Result<(), EngineError> {
+        self.status.ready();
+        Ok(())
+    }
+
+    fn prepare_reload_config(
+        &mut self,
+        config: EngineReloadConfig,
+    ) -> Result<Box<dyn PreparedEngineReload + '_>, EngineError> {
+        if config.backend != BackendKind::Passthrough || config.tensorrt.is_some() {
+            return Err(EngineError::InvalidConfig(
+                "passthrough backend changes require engine replacement".into(),
+            ));
+        }
+        Ok(reload::prepared_reload(|| {}))
+    }
+
     fn process(
         &mut self,
         input: &AudioChunk,
@@ -353,6 +477,45 @@ mod tests {
     use vocal_types::{AudioChunk, AudioFormat};
 
     #[test]
+    fn portable_engines_recover_from_failed_controls_on_stream_reset() {
+        for backend in [BackendKind::Passthrough, BackendKind::RvcCpuPipeline] {
+            let mut engine = create_engine(EngineConfig::portable(
+                backend,
+                ModelDescriptor {
+                    id: "fixture".into(),
+                    display_name: "Fixture".into(),
+                    architecture: "rvc-v2".into(),
+                    sample_rate: 32000,
+                    version: "2".into(),
+                },
+            ))
+            .unwrap();
+            let input = AudioChunk {
+                format: AudioFormat::MONO_16K,
+                samples: vec![0.1; 320],
+                sequence: 0,
+            };
+            assert!(
+                engine
+                    .process(
+                        &input,
+                        ConversionConfig {
+                            protect: f32::NAN,
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(engine.status().state, EngineLifecycle::Failed);
+            engine.reset_stream().unwrap();
+            assert_eq!(engine.status().state, EngineLifecycle::Ready);
+            assert!(engine.status().last_error.is_none());
+            engine.process(&input, ConversionConfig::default()).unwrap();
+            assert_eq!(engine.status().failures, 1);
+        }
+    }
+
+    #[test]
     fn passthrough_preserves_audio() {
         let model = ModelDescriptor {
             id: "fixture".into(),
@@ -365,6 +528,8 @@ mod tests {
             backend: BackendKind::Passthrough,
             model,
             tensorrt: None,
+            directml: None,
+            cpu: None,
         })
         .unwrap();
         let input = AudioChunk {
@@ -386,7 +551,7 @@ mod tests {
         let model = ModelDescriptor {
             id: "fixture".into(),
             display_name: "Fixture".into(),
-            architecture: "rvc-v2".into(),
+            architecture: "rvc-v1".into(),
             sample_rate: 32_000,
             version: "1".into(),
         };
@@ -394,6 +559,8 @@ mod tests {
             backend: BackendKind::RvcCpuPipeline,
             model,
             tensorrt: None,
+            directml: None,
+            cpu: None,
         })
         .unwrap();
         let input = AudioChunk {
@@ -435,6 +602,8 @@ mod tests {
             backend: BackendKind::TensorRtRtx,
             model,
             tensorrt: None,
+            directml: None,
+            cpu: None,
         });
         assert!(matches!(result, Err(EngineError::InvalidConfig(_))));
     }
@@ -458,6 +627,8 @@ mod tests {
                 speaker_id: 0,
                 window_samples: None,
             }),
+            directml: None,
+            cpu: None,
         });
         assert!(matches!(result, Err(EngineError::BackendUnavailable(_))));
     }

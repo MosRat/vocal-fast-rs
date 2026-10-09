@@ -3,10 +3,12 @@
 use std::{
     collections::HashMap,
     fs,
+    hash::{Hash, Hasher},
     os::raw::c_void,
     path::{Path, PathBuf},
     ptr,
     sync::{Arc, Mutex, OnceLock, Weak},
+    time::Instant,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,6 +18,7 @@ use crate::{error::NativeBuildError, ffi};
 /// cannot outlive the engine that owns it.
 pub struct Runtime {
     raw: *mut ffi::Runtime,
+    cache_key: RuntimeCacheKey,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -37,8 +40,16 @@ impl RuntimeCacheKey {
     }
 }
 
-static SHARED_RUNTIME_CACHE: OnceLock<Mutex<HashMap<RuntimeCacheKey, Weak<Runtime>>>> =
+type RuntimeEntry = Arc<Mutex<Weak<Runtime>>>;
+static SHARED_RUNTIME_CACHE: OnceLock<Mutex<HashMap<RuntimeCacheKey, RuntimeEntry>>> =
     OnceLock::new();
+
+fn live_entry(entry: &RuntimeEntry) -> bool {
+    Arc::strong_count(entry) > 1
+        || entry
+            .try_lock()
+            .map_or(true, |runtime| runtime.strong_count() > 0)
+}
 
 unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
@@ -47,28 +58,24 @@ impl Runtime {
     pub fn shared(path: impl AsRef<Path>) -> Result<Arc<Self>, NativeBuildError> {
         let key = RuntimeCacheKey::from_path(path)?;
         let cache = SHARED_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        {
+        let entry = {
             let mut entries = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            entries.retain(|_, runtime| runtime.strong_count() != 0);
-            if let Some(runtime) = entries.get(&key).and_then(Weak::upgrade) {
-                return Ok(runtime);
-            }
-        }
+            entries.retain(|_, entry| live_entry(entry));
+            Arc::clone(entries.entry(key.clone()).or_default())
+        };
 
-        // Keep the cache mutex out of plan IO and TensorRT deserialization.
-        // A concurrent duplicate load is safe; the second insertion reuses the
-        // first live Arc when it observes it.
-        let runtime = Arc::new(Self::load(&key.canonical_path)?);
-        let mut entries = cache
+        // Deduplicate only this plan's deserialization, outside the global
+        // mutex. Failed loads release the gate and can be retried.
+        let mut current = entry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, cached| cached.strong_count() != 0);
-        if let Some(existing) = entries.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
+        if let Some(runtime) = current.upgrade() {
+            return Ok(runtime);
         }
-        entries.insert(key, Arc::downgrade(&runtime));
+        let runtime = Arc::new(Self::load(&key.canonical_path)?);
+        *current = Arc::downgrade(&runtime);
         Ok(runtime)
     }
 
@@ -91,12 +98,14 @@ impl Runtime {
         let mut entries = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, runtime| runtime.strong_count() != 0);
+        entries.retain(|_, entry| live_entry(entry));
         entries.len()
     }
     pub fn load(path: impl AsRef<Path>) -> Result<Self, NativeBuildError> {
+        let started = Instant::now();
         ffi::install_log_bridge();
-        let bytes = fs::read(path)?;
+        let cache_key = RuntimeCacheKey::from_path(path)?;
+        let bytes = crate::cache_io::map(&cache_key.canonical_path)?;
         let (mut raw, mut error) = (ptr::null_mut(), ptr::null_mut());
         let code = unsafe {
             ffi::vocal_trt_runtime_load(bytes.as_ptr(), bytes.len(), &mut raw, &mut error)
@@ -111,7 +120,8 @@ impl Runtime {
                 "runtime load returned null handle".into(),
             ))
         } else {
-            Ok(Self { raw })
+            tracing::info!(path = %cache_key.canonical_path.display(), bytes = bytes.len(), elapsed_ms = started.elapsed().as_secs_f64() * 1000., "loaded TensorRT plan");
+            Ok(Self { raw, cache_key })
         }
     }
 
@@ -148,6 +158,8 @@ impl Runtime {
 pub struct OwnedContext {
     raw: *mut ffi::Context,
     _runtime: Arc<Runtime>,
+    runtime_cache_path: Option<PathBuf>,
+    saved_cache_hash: Option<u64>,
     // TensorRT keeps tensor addresses in the execution context.  Repeating
     // the FFI call for every binding on every callback is unnecessary when a
     // fixed profile reuses the same device allocations.  The cache is
@@ -194,11 +206,30 @@ impl OwnedContext {
         runtime: Arc<Runtime>,
         enabled: bool,
     ) -> Result<Self, NativeBuildError> {
+        let started = Instant::now();
+        let mut key = std::collections::hash_map::DefaultHasher::new();
+        "vocal-trt-runtime-cache-v1".hash(&mut key);
+        runtime.cache_key.hash(&mut key);
+        enabled.hash(&mut key);
+        let cache_path = crate::cache_io::runtime_root()
+            .map(|root| root.join(format!("{:016x}.jit", key.finish())));
+        let cached = cache_path.as_deref().and_then(|path| {
+            // Reject oversized/corrupt files without allocating an unbounded
+            // host buffer. SDK validation handles GPU/driver/version mismatch.
+            fs::metadata(path)
+                .ok()
+                .filter(|m| m.len() > 0 && m.len() <= 512 * 1024 * 1024)?;
+            crate::cache_io::map(path).ok()
+        });
+        let mut accepted = 0;
         let (mut raw, mut error) = (ptr::null_mut(), ptr::null_mut());
         let code = unsafe {
-            ffi::vocal_trt_context_create_with_options(
+            ffi::vocal_trt_context_create_cached(
                 runtime.raw,
                 enabled as i32,
+                cached.as_ref().map_or(ptr::null(), |bytes| bytes.as_ptr()),
+                cached.as_ref().map_or(0, |bytes| bytes.len()),
+                &mut accepted,
                 &mut raw,
                 &mut error,
             )
@@ -213,11 +244,129 @@ impl OwnedContext {
                 "context creation returned null handle".into(),
             ))
         } else {
-            Ok(Self {
+            let saved_cache_hash = cached.as_ref().filter(|_| accepted != 0).map(|bytes| {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                bytes[..].hash(&mut hash);
+                hash.finish()
+            });
+            drop(cached);
+            let mut context = Self {
                 raw,
                 _runtime: runtime,
+                runtime_cache_path: cache_path,
+                saved_cache_hash,
                 bound_addresses: HashMap::new(),
-            })
+            };
+            tracing::info!(
+                cache_accepted = accepted != 0,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.,
+                "created TensorRT context"
+            );
+            context.persist_runtime_cache();
+            if accepted == 0 && context.saved_cache_hash.is_some() {
+                // First JIT contexts retain compiler state. After the cache
+                // has been published, replace just this unused context with
+                // one restored from kernels, before installing any bindings.
+                // The engine/weights remain shared; failure keeps this context.
+                context.release_jit_compiler_state(enabled);
+            }
+            Ok(context)
+        }
+    }
+
+    fn release_jit_compiler_state(&mut self, enabled: bool) {
+        let Some(path) = self.runtime_cache_path.as_deref() else {
+            return;
+        };
+        let Ok(cached) = crate::cache_io::map(path) else {
+            return;
+        };
+        let started = Instant::now();
+        let (mut raw, mut error, mut accepted) = (ptr::null_mut(), ptr::null_mut(), 0);
+        let code = unsafe {
+            ffi::vocal_trt_context_create_cached(
+                self._runtime.raw,
+                enabled as i32,
+                cached.as_ptr(),
+                cached.len(),
+                &mut accepted,
+                &mut raw,
+                &mut error,
+            )
+        };
+        if code != 0 {
+            let error = ffi::native_message(error, "restore compiled context failed");
+            tracing::warn!(%error, "retaining original TensorRT context");
+        } else if !raw.is_null() {
+            if accepted != 0 {
+                unsafe {
+                    ffi::vocal_trt_context_free(self.raw);
+                }
+                self.raw = raw;
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.,
+                    "released initial TensorRT JIT context"
+                );
+            } else {
+                unsafe {
+                    ffi::vocal_trt_context_free(raw);
+                }
+            }
+        }
+    }
+
+    /// Save JIT kernels only at idle construction/worker-return boundaries.
+    /// A disk/cache failure is an optimization miss, never an engine failure.
+    pub fn persist_runtime_cache(&mut self) {
+        let Some(path) = &self.runtime_cache_path else {
+            return;
+        };
+        let result = (|| -> Result<(), NativeBuildError> {
+            let (mut build, mut error) = (ptr::null_mut(), ptr::null_mut());
+            if unsafe { ffi::vocal_trt_context_cache(self.raw, &mut build, &mut error) } != 0 {
+                return Err(NativeBuildError::Api(ffi::native_message(
+                    error,
+                    "serialize runtime cache failed",
+                )));
+            }
+            if build.is_null() {
+                return Ok(());
+            }
+            struct Blob(*mut ffi::Build);
+            impl Drop for Blob {
+                fn drop(&mut self) {
+                    unsafe {
+                        ffi::vocal_trt_build_free(self.0);
+                    }
+                }
+            }
+            let build = Blob(build);
+            let (mut data, mut len) = (ptr::null(), 0);
+            if unsafe { ffi::vocal_trt_build_view(build.0, &mut data, &mut len) } != 0
+                || data.is_null()
+            {
+                return Err(NativeBuildError::Api(
+                    "runtime cache view unavailable".into(),
+                ));
+            }
+            if len == 0 || len > 512 * 1024 * 1024 {
+                return Err(NativeBuildError::Argument(
+                    "runtime cache exceeds the disk size limit".into(),
+                ));
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hash);
+            let hash = hash.finish();
+            if self.saved_cache_hash != Some(hash) {
+                crate::cache_io::publish(path, bytes)?;
+                self.saved_cache_hash = Some(hash);
+                tracing::info!(path = %path.display(), bytes = len, "persisted TensorRT JIT cache");
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%error, "TensorRT runtime cache could not be saved");
         }
     }
 

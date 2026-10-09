@@ -48,6 +48,7 @@ struct Context {
     // explicit, owned part of context lifetime rather than a process-global
     // switch.
     nvinfer1::IRuntimeConfig* runtime_config{};
+    nvinfer1::IRuntimeCache* runtime_cache{};
     LayerProfiler profiler;
 };
 struct Stream { cudaStream_t stream{}; };
@@ -169,6 +170,8 @@ struct Options {
     // HuBERT feature extractor precision is independent from the projection
     // and Transformer encoder precision.
     int32_t hubert_feature_precision;
+    // RVC v1: layer 9 + learned 768->256 projection; v2: layer 12, 768.
+    int32_t rvc_feature_width;
     // 1 = RMVPE receives [1,513,T] cuFFT magnitude from the external CUDA
     // frontend. TensorRT still owns mel projection and all learned layers.
     int32_t rmvpe_external_stft;

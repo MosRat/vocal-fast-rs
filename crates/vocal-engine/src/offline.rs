@@ -13,6 +13,22 @@ use vocal_types::{AudioFormat, ConversionConfig, LatencyMetrics};
 
 use crate::{BackendKind, EngineError, InferenceEngine};
 
+mod aligned;
+pub use aligned::{
+    AlignedOfflineConfig, AlignedOfflineReport, OfflineSegmentOutput, OfflineVoicePipeline,
+    run_aligned_offline,
+};
+#[cfg(any(feature = "cpu-graph", feature = "directml", feature = "tensorrt-rtx"))]
+mod native;
+#[cfg(feature = "cpu-graph")]
+pub use native::CpuOfflinePipeline;
+#[cfg(feature = "directml")]
+pub use native::DirectMlOfflinePipeline;
+#[cfg(any(feature = "cpu-graph", feature = "directml", feature = "tensorrt-rtx"))]
+pub use native::OfflineModelSources;
+#[cfg(feature = "tensorrt-rtx")]
+pub use native::TensorRtOfflinePipeline;
+
 /// The default internal RVC window.  TensorRT profiles use this shape, and it
 /// is also a useful bounded block for the portable CPU and passthrough paths.
 pub const DEFAULT_WINDOW_SAMPLES: usize = 11_200;

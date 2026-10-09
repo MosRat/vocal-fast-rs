@@ -411,7 +411,7 @@ pub(crate) fn validate_tensors(
     manifest: &RvcModelManifest,
     tensors: &[Tensor],
 ) -> Result<(), ModelError> {
-    if config.feature_width != manifest.feature_dims() as u64
+    if config.feature_width != manifest.rvc_version()?.feature_width() as u64
         || config.uses_f0 != manifest.uses_f0()
         || config.sample_rate != manifest.sample_rate
     {
@@ -421,7 +421,12 @@ pub(crate) fn validate_tensors(
     let mut actual = BTreeMap::new();
     for t in tensors {
         t.validate()?;
-        if t.name == "aux.retrieval.faiss" && t.dtype == TensorDType::U8 && t.shape.len() == 1 {
+        if matches!(
+            t.name.as_str(),
+            "aux.retrieval.faiss" | crate::HUBERT_BUNDLE_TENSOR | crate::RMVPE_BUNDLE_TENSOR
+        ) && t.dtype == TensorDType::U8
+            && t.shape.len() == 1
+        {
             continue;
         }
         if !matches!(

@@ -25,10 +25,15 @@ use crate::{
     options::{
         DispatchTune, NativeBuildOptions, OnnxProfileKind, PrecisionMode, default_tactic_sources,
     },
+    pitch_matching::DevicePitchMatcher,
+    retrieval::protection::RetrievalProtection,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RvcTrtProfile {
+    /// Long-segment offline semantics: no appended feature or decoder tail.
+    #[serde(default)]
+    pub offline: bool,
     pub min_samples: i32,
     pub opt_samples: i32,
     pub max_samples: i32,
@@ -162,6 +167,24 @@ impl Default for RvcTrtProfile {
 }
 
 impl RvcTrtProfile {
+    pub fn for_offline(samples: usize) -> Result<Self, NativeBuildError> {
+        if !(4960..=800_000).contains(&samples) {
+            return Err(NativeBuildError::Argument(
+                "offline window must be in 4960..=800000 samples".into(),
+            ));
+        }
+        let mut profile = Self::from_sample_points([samples; 3]);
+        let frames = (samples / 160).min(profile.opt_hubert_frames as usize * 2) as i32;
+        profile.offline = true;
+        profile.min_rvc_frames = frames;
+        profile.opt_rvc_frames = frames;
+        profile.max_rvc_frames = frames;
+        profile.min_synth_frames = frames;
+        profile.opt_synth_frames = frames;
+        profile.max_synth_frames = frames;
+        profile.validate()?;
+        Ok(profile)
+    }
     /// Build an exact TensorRT profile for one application window.  Fixed
     /// profiles let TensorRT choose tactics and CUDA graphs for the shape that
     /// the host actually submits, while still allowing callers to construct a
@@ -217,6 +240,7 @@ impl RvcTrtProfile {
         let o = frame_shape(samples[1]);
         let z = frame_shape(samples[2]);
         Self {
+            offline: false,
             min_samples: samples[0] as i32,
             opt_samples: samples[1] as i32,
             max_samples: samples[2] as i32,
@@ -244,6 +268,7 @@ impl RvcTrtProfile {
     /// realtime window and should only be selected explicitly.
     pub fn legacy() -> Self {
         Self {
+            offline: false,
             min_samples: 3200,
             opt_samples: 6400,
             max_samples: 12800,
@@ -350,7 +375,7 @@ impl RvcTrtProfile {
             ("optimum", self.opt_samples),
             ("maximum", self.max_samples),
         ] {
-            if samples % RVC_HOP_SAMPLES as i32 != 0 {
+            if !self.offline && samples % RVC_HOP_SAMPLES as i32 != 0 {
                 return Err(NativeBuildError::Argument(format!(
                     "{name} waveform sample profile {samples} is not aligned to the 160-sample RVC hop"
                 )));
@@ -362,6 +387,9 @@ impl RvcTrtProfile {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RvcTrtPipelineArtifacts {
+    /// Older artifact manifests describe the v2 feature path.
+    #[serde(default)]
+    pub rvc_version: vocal_model::RvcVersion,
     pub hubert_plan: PathBuf,
     /// Compatibility alias for the full-window RMVPE plan. New manifests also
     /// carry the two fixed-shape plans below.
@@ -472,14 +500,67 @@ pub struct RvcTrtPipelineArtifacts {
     pub fused_rvc_qkv: bool,
 }
 
+/// Progress between native builder calls. A plan being compiled has no reliable time percentage.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanBuildProgress {
+    pub name: &'static str,
+    pub completed: u32,
+    pub total: u32,
+    pub finished: bool,
+    pub cache_hit: bool,
+    pub elapsed_ms: f64,
+}
+
 impl RvcTrtPipelineArtifacts {
-    /// Compile all four plans using one semantic configuration object.
+    /// Compile all five plans using one semantic configuration object.
     pub fn compile_with_config(
         config: &TensorRtConfig,
         package: &ModelPackage,
         hubert_onnx: impl AsRef<Path>,
         rmvpe_onnx: impl AsRef<Path>,
         output_dir: impl AsRef<Path>,
+    ) -> Result<Self, NativeBuildError> {
+        Self::compile_with_config_and_progress(
+            config,
+            package,
+            hubert_onnx,
+            rmvpe_onnx,
+            output_dir,
+            |_| {},
+        )
+    }
+
+    /// Report actual plan boundaries without adding polling or work to the audio path.
+    pub fn compile_with_config_and_progress(
+        config: &TensorRtConfig,
+        package: &ModelPackage,
+        hubert_onnx: impl AsRef<Path>,
+        rmvpe_onnx: impl AsRef<Path>,
+        output_dir: impl AsRef<Path>,
+        progress: impl FnMut(PlanBuildProgress),
+    ) -> Result<Self, NativeBuildError> {
+        let cache = crate::plan_cache::root();
+        Self::compile_with_config_and_plan_cache(
+            config,
+            package,
+            hubert_onnx,
+            rmvpe_onnx,
+            output_dir,
+            cache.as_deref(),
+            progress,
+        )
+    }
+
+    /// Select a shared plan cache, or pass `None` for a reproducible cold build.
+    /// The GUI and CLI use the same stage keys and integrity checks.
+    pub fn compile_with_config_and_plan_cache(
+        config: &TensorRtConfig,
+        package: &ModelPackage,
+        hubert_onnx: impl AsRef<Path>,
+        rmvpe_onnx: impl AsRef<Path>,
+        output_dir: impl AsRef<Path>,
+        cache_directory: Option<&Path>,
+        progress: impl FnMut(PlanBuildProgress),
     ) -> Result<Self, NativeBuildError> {
         let mut build = config.build.clone();
         // Diagnostics are a separate public group, but these three switches
@@ -488,13 +569,15 @@ impl RvcTrtPipelineArtifacts {
         build.debug_outputs |= config.diagnostics.debug_graph_outputs;
         build.rmvpe_debug_outputs |= config.diagnostics.rmvpe_debug_outputs;
         build.log_build_options |= config.diagnostics.log_build_options;
-        Self::compile(
+        Self::compile_with_progress(
             build,
             package,
             hubert_onnx,
             rmvpe_onnx,
             output_dir,
             config.profile.clone(),
+            cache_directory,
+            progress,
         )
     }
 
@@ -506,7 +589,36 @@ impl RvcTrtPipelineArtifacts {
         output_dir: impl AsRef<Path>,
         profile: RvcTrtProfile,
     ) -> Result<Self, NativeBuildError> {
+        let cache = crate::plan_cache::root();
+        Self::compile_with_progress(
+            builder_options,
+            package,
+            hubert_onnx,
+            rmvpe_onnx,
+            output_dir,
+            profile,
+            cache.as_deref(),
+            |_| {},
+        )
+    }
+
+    fn compile_with_progress(
+        mut builder_options: NativeBuildOptions,
+        package: &ModelPackage,
+        hubert_onnx: impl AsRef<Path>,
+        rmvpe_onnx: impl AsRef<Path>,
+        output_dir: impl AsRef<Path>,
+        profile: RvcTrtProfile,
+        cache_directory: Option<&Path>,
+        mut progress: impl FnMut(PlanBuildProgress),
+    ) -> Result<Self, NativeBuildError> {
         profile.validate()?;
+        let model_config = package
+            .validate_rvc_synth()
+            .map_err(|e| NativeBuildError::Argument(e.to_string()))?;
+        let rvc_version = vocal_model::RvcVersion::from_feature_width(model_config.feature_width)
+            .map_err(|e| NativeBuildError::Argument(e.to_string()))?;
+        builder_options.rvc_version = rvc_version;
         fs::create_dir_all(output_dir.as_ref())?;
         let external_stft = builder_options.rmvpe_fft_cufft;
         let is_vfrm = |path: &Path| {
@@ -516,49 +628,124 @@ impl RvcTrtPipelineArtifacts {
                     extension.eq_ignore_ascii_case("vfr") || extension.eq_ignore_ascii_case("vfrm")
                 })
         };
-        let compile = |name: &str,
-                       options: NativeBuildOptions|
-         -> Result<PathBuf, NativeBuildError> {
-            let builder = NativeTensorRtBuilder::new(options);
-            let result = match name {
-                "hubert" if is_vfrm(hubert_onnx.as_ref()) => {
-                    let package = vocal_model::load_cache_shared(hubert_onnx.as_ref())
-                        .map_err(|e| NativeBuildError::Api(e.to_string()))?;
-                    builder.compile_hubert_vfrm(&package)
+        let mut completed = 0;
+        let synth_signature = cache_directory
+            .map(|_| crate::plan_cache::synth_signature(package))
+            .transpose()?;
+        // Hold only RMVPE across its two builds. The weak model cache alone
+        // would drop it after realtime, then decode all weights again for full.
+        let mut rmvpe_package = None;
+        let mut compile =
+            |name: &str, mut options: NativeBuildOptions| -> Result<PathBuf, NativeBuildError> {
+                let label = match options.output.file_stem().and_then(|value| value.to_str()) {
+                    Some("hubert") => "HuBERT",
+                    Some("rmvpe-realtime") => "RMVPE realtime",
+                    Some("rmvpe-full") => "RMVPE full window",
+                    Some("frontend") => "Feature frontend",
+                    _ => "RVC Synth",
+                };
+                progress(PlanBuildProgress {
+                    name: label,
+                    completed,
+                    total: 5,
+                    finished: false,
+                    cache_hit: false,
+                    elapsed_ms: 0.,
+                });
+                let started = Instant::now();
+                let source = match name {
+                    "hubert" => Some(hubert_onnx.as_ref()),
+                    "rmvpe" => Some(rmvpe_onnx.as_ref()),
+                    _ => None,
+                };
+                let entry = cache_directory
+                    .map(|root| {
+                        let source_signature = source
+                            .map(|source| crate::plan_cache::source_signature(root, source))
+                            .transpose()?;
+                        let key = crate::plan_cache::key(
+                            name,
+                            &options,
+                            source_signature,
+                            if name == "synth" {
+                                synth_signature
+                            } else {
+                                None
+                            },
+                        )?;
+                        Ok::<_, NativeBuildError>(crate::plan_cache::Entry::new(root, name, key))
+                    })
+                    .transpose()?;
+                let cache_hit = entry.as_ref().is_some_and(|entry| entry.valid());
+                if let Some(entry) = &entry {
+                    options.output = entry.path.clone();
                 }
-                "hubert" => builder
-                    .compile_onnx_file_with_profile(hubert_onnx.as_ref(), OnnxProfileKind::Samples),
-                "rmvpe" if is_vfrm(rmvpe_onnx.as_ref()) => {
-                    let package = vocal_model::load_cache_shared(rmvpe_onnx.as_ref())
-                        .map_err(|e| NativeBuildError::Api(e.to_string()))?;
-                    builder.compile_rmvpe_vfrm(&package)
-                }
-                "rmvpe" => {
-                    if external_stft {
-                        return Err(NativeBuildError::Argument(
-                            "cuFFT RMVPE frontend requires an RMVPE VFRM package".into(),
-                        ));
+                let builder = NativeTensorRtBuilder::new(options);
+                let result = if cache_hit {
+                    Ok(entry.as_ref().unwrap().path.clone())
+                } else {
+                    match name {
+                        "hubert" if is_vfrm(hubert_onnx.as_ref()) => {
+                            let package = vocal_model::load_cache_shared(hubert_onnx.as_ref())
+                                .map_err(|e| NativeBuildError::Api(e.to_string()))?;
+                            builder.compile_hubert_vfrm(&package)
+                        }
+                        "hubert" => builder.compile_onnx_file_with_profile(
+                            hubert_onnx.as_ref(),
+                            OnnxProfileKind::Samples,
+                        ),
+                        "rmvpe" if is_vfrm(rmvpe_onnx.as_ref()) => {
+                            if rmvpe_package.is_none() {
+                                rmvpe_package = Some(
+                                    vocal_model::load_cache_shared(rmvpe_onnx.as_ref())
+                                        .map_err(|e| NativeBuildError::Api(e.to_string()))?,
+                                );
+                            }
+                            builder.compile_rmvpe_vfrm(rmvpe_package.as_ref().unwrap())
+                        }
+                        "rmvpe" => {
+                            if external_stft {
+                                return Err(NativeBuildError::Argument(
+                                    "cuFFT RMVPE frontend requires an RMVPE VFRM package".into(),
+                                ));
+                            }
+                            builder.compile_onnx_file_with_profile(
+                                rmvpe_onnx.as_ref(),
+                                OnnxProfileKind::Samples,
+                            )
+                        }
+                        "frontend" => builder.compile_frontend(),
+                        "synth" => builder.compile_vfrm(package),
+                        _ => Err(NativeBuildError::Argument(
+                            "unknown RVC TensorRT graph".into(),
+                        )),
                     }
-                    builder.compile_onnx_file_with_profile(
-                        rmvpe_onnx.as_ref(),
-                        OnnxProfileKind::Samples,
-                    )
+                };
+                let stage = match name {
+                    "hubert" => "build.hubert",
+                    "rmvpe" => "build.rmvpe",
+                    "frontend" => "build.frontend",
+                    "synth" => "build.synth",
+                    _ => "build.unknown",
+                };
+                let path = result.map_err(|error| error.with_stage(stage))?;
+                if !cache_hit && let Some(entry) = &entry {
+                    entry.seal()?;
                 }
-                "frontend" => builder.compile_frontend(),
-                "synth" => builder.compile_vfrm(package),
-                _ => Err(NativeBuildError::Argument(
-                    "unknown RVC TensorRT graph".into(),
-                )),
+                if label == "RMVPE full window" {
+                    rmvpe_package = None;
+                }
+                completed += 1;
+                progress(PlanBuildProgress {
+                    name: label,
+                    completed,
+                    total: 5,
+                    finished: true,
+                    cache_hit,
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.,
+                });
+                Ok(path)
             };
-            let stage = match name {
-                "hubert" => "build.hubert",
-                "rmvpe" => "build.rmvpe",
-                "frontend" => "build.frontend",
-                "synth" => "build.synth",
-                _ => "build.unknown",
-            };
-            result.map_err(|error| error.with_stage(stage))
-        };
         let precision = builder_options.precision;
         let hubert_precision = builder_options.hubert_precision;
         let hubert_feature_precision = builder_options.hubert_feature_precision;
@@ -603,7 +790,11 @@ impl RvcTrtPipelineArtifacts {
         let synth_fp16_coherent_stage_mask = builder_options.synth_fp16_coherent_stage_mask;
         let synth_fp16_fp32_stage_mask = builder_options.synth_fp16_fp32_stage_mask;
         let synth_fp16_post = builder_options.synth_fp16_post;
-        let dispatch_tune = if builder_options.dispatch_tune == DispatchTune::Auto {
+        // Exact offline windows can coincide with realtime presets. They must
+        // still decode the complete sequence instead of the realtime tail.
+        let dispatch_tune = if profile.offline {
+            DispatchTune::Auto
+        } else if builder_options.dispatch_tune == DispatchTune::Auto {
             if profile.min_samples == 11_200 && profile.max_samples == 11_200 {
                 DispatchTune::Realtime11200
             } else if profile.min_samples == 44_960 && profile.max_samples == 44_960 {
@@ -690,7 +881,8 @@ impl RvcTrtPipelineArtifacts {
         // Synth FP16 plan must not silently lower the RVC front half.
         options.precision = precision;
         options.dispatch_tune = dispatch_tune;
-        let synth_tail_mode = profile.min_samples == profile.max_samples
+        let synth_tail_mode = !profile.offline
+            && profile.min_samples == profile.max_samples
             && matches!(
                 dispatch_tune,
                 DispatchTune::Realtime11200 | DispatchTune::Realtime44960
@@ -698,6 +890,7 @@ impl RvcTrtPipelineArtifacts {
         let synth_plan = compile("synth", options)?;
         Ok(Self {
             hubert_plan,
+            rvc_version,
             rmvpe_plan,
             rmvpe_realtime_plan: Some(rmvpe_realtime_plan),
             rmvpe_full_plan: Some(rmvpe_full_plan),
@@ -761,8 +954,8 @@ pub struct RvcTrtTimings {
 
 pub struct RvcTrtOutput {
     pub audio: Vec<f32>,
-    /// Optional debug snapshots used for parity tests. They are copied after
-    /// the final stream synchronization and can be ignored by a live caller.
+    /// Optional debug snapshot AFTER retrieval blending (when enabled).
+    /// Copied after synchronization; use index_ratio=0 to inspect raw HuBERT.
     pub hubert_features: Option<Vec<f32>>,
     /// Features after the native HuBERT append/interpolation/crop frontend.
     /// This is populated only in debug mode so parity tools can compare the
@@ -772,6 +965,13 @@ pub struct RvcTrtOutput {
     /// F0 after the native frontend crop, also only for parity diagnostics.
     pub aligned_pitchf: Option<Vec<f32>>,
     pub pitch: Option<Vec<i32>>,
+    /// Exact stochastic Synth inputs for reproducible reference inference.
+    /// Host-side snapshots are absent outside parity diagnostics.
+    pub synth_random: Option<Vec<f32>>,
+    pub synth_noise: Option<Vec<f32>>,
+    pub valid_synth_frames: usize,
+    pub synth_skip_head: usize,
+    pub synth_output_frames: usize,
     /// RMVPE diagnostic tensors emitted by a debug build. These remain on
     /// device in the production graph and are absent unless the plan was
     /// compiled with `VOCAL_TRT_RMVPE_DEBUG_OUTPUTS=1`.
@@ -904,9 +1104,16 @@ pub struct RvcTrtPipeline {
     threshold: CudaBuffer,
     hubert_features: CudaBuffer,
     retrieval: Option<GpuRetrievalIndex>,
+    retrieval_protection: Option<RetrievalProtection>,
     retrieval_ratio: CudaBuffer,
     last_retrieval_ratio: f32,
+    pending_retrieval_ratio: Option<f32>,
+    protect_value: f32,
     active_hubert_frames: usize,
+    active_rvc_frames: usize,
+    active_pitch_frames: usize,
+    active_streaming_pitch: bool,
+    pitch_matcher: DevicePitchMatcher,
     pitchf_raw: CudaBuffer,
     rmvpe_magnitude: CudaBuffer,
     p_len: CudaBuffer,
@@ -1067,9 +1274,9 @@ impl RvcTrtPipeline {
                 "graph cache size must be in 1..=64".into(),
             ));
         }
-        if config.feature_width != 768 {
+        if config.feature_width != artifacts.rvc_version.feature_width() as u64 {
             return Err(NativeBuildError::Argument(
-                "waveform HuBERT TensorRT pipeline requires a 768-wide RVC v2 model".into(),
+                "TensorRT artifact RVC version disagrees with Synth feature width; rebuild plans for this model".into(),
             ));
         }
         let hubert_runtime = Runtime::shared(&artifacts.hubert_plan)
@@ -1097,13 +1304,32 @@ impl RvcTrtPipeline {
         // while creating each execution context; changing it after the first
         // enqueue is not supported by the SDK.
         let native_cuda_graphs = graph_mode == GraphReplayMode::NativeSubgraphs;
-        let hubert = OwnedContext::create_with_cuda_graphs(hubert_runtime, native_cuda_graphs)?;
+        let mut hubert = OwnedContext::create_with_cuda_graphs(hubert_runtime, native_cuda_graphs)?;
         let mut rmvpe_realtime =
             OwnedContext::create_with_cuda_graphs(rmvpe_realtime_runtime, native_cuda_graphs)?;
         let mut rmvpe_full =
             OwnedContext::create_with_cuda_graphs(rmvpe_full_runtime, native_cuda_graphs)?;
-        let frontend = OwnedContext::create_with_cuda_graphs(frontend_runtime, native_cuda_graphs)?;
+        let mut frontend =
+            OwnedContext::create_with_cuda_graphs(frontend_runtime, native_cuda_graphs)?;
         let mut synth = OwnedContext::create_with_cuda_graphs(synth_runtime, native_cuda_graphs)?;
+        let feature_width = config.feature_width as usize;
+        for (name, shape) in [
+            ("HuBERT features", hubert.tensor_shape("features")?),
+            ("frontend input", frontend.tensor_shape("hubert_features")?),
+            ("Synth feats", synth.tensor_shape("feats")?),
+        ] {
+            if shape.len() != 3 || shape[2] != feature_width as i64 {
+                return Err(NativeBuildError::Argument(format!(
+                    "{name} has shape {shape:?}, expected [1,frames,{feature_width}] for {}",
+                    artifacts.rvc_version.as_str()
+                )));
+            }
+        }
+        if retrieval.is_some_and(|index| index.dimensions() != feature_width) {
+            return Err(NativeBuildError::Argument(
+                "retrieval index dimensions disagree with RVC model version".into(),
+            ));
+        }
         let synth_tail_controls = synth.has_tensor("return_length")?;
         let stream = CudaStream::new()?;
         let acoustic_hubert_stream = CudaStream::new()?;
@@ -1173,6 +1399,14 @@ impl RvcTrtPipeline {
         let rmvpe_debug_outputs = artifacts.rmvpe_debug_outputs || plan_has_rmvpe_debug_outputs;
         let debug_intermediates = diagnostics.debug_intermediates;
         let retrieval = retrieval.map(GpuRetrievalIndex::new).transpose()?;
+        let retrieval_protection = if retrieval.is_some() && config.uses_f0 {
+            Some(RetrievalProtection::new(
+                p.max_hubert_frames as usize,
+                feature_width,
+            )?)
+        } else {
+            None
+        };
         let rmvpe_max_padded_frames = ((p.max_pitch_frames as usize + 31) / 32) * 32;
         let pitch_cache = alloc(RVC_F0_CACHE_FRAMES * 4)?;
         let pitch_cache_scratch = alloc(RVC_F0_CACHE_FRAMES * 4)?;
@@ -1197,19 +1431,30 @@ impl RvcTrtPipeline {
             stage_events,
             waveform: alloc(p.max_samples as usize * 4)?,
             waveform_host_ring: PinnedHostRing::new(3, p.max_samples as usize * 4)?,
-            control_host_ring: PinnedHostRing::new(3, std::mem::size_of::<i32>())?,
+            // One inference can upload ratio, p_len, return_length and sid.
+            // None of those pinned slots may be reused before stream completion.
+            control_host_ring: PinnedHostRing::new(4, std::mem::size_of::<i32>())?,
             audio_host_ring: PinnedHostRing::new(3, p.max_rvc_frames as usize * up * 4)?,
             threshold: alloc(4)?,
-            hubert_features: alloc(p.max_hubert_frames as usize * 768 * 4)?,
+            hubert_features: alloc(p.max_hubert_frames as usize * feature_width * 4)?,
             retrieval,
+            retrieval_protection,
             retrieval_ratio: alloc(4)?,
             last_retrieval_ratio: 0.0,
+            pending_retrieval_ratio: None,
+            protect_value: 0.33,
             active_hubert_frames: 0,
+            active_rvc_frames: 0,
+            active_pitch_frames: 0,
+            active_streaming_pitch: false,
+            pitch_matcher: DevicePitchMatcher::new(
+                p.max_pitch_frames.max(p.max_rvc_frames) as usize
+            )?,
             pitchf_raw: alloc(p.max_pitch_frames as usize * 4)?,
             rmvpe_magnitude: alloc(p.max_pitch_frames as usize * 513 * 4)?,
             p_len: alloc(4)?,
             sid: alloc(4)?,
-            feats: alloc(p.max_rvc_frames as usize * 768 * 4)?,
+            feats: alloc(p.max_rvc_frames as usize * feature_width * 4)?,
             pitch: alloc(p.max_rvc_frames as usize * 4)?,
             pitchf: alloc(p.max_rvc_frames as usize * 4)?,
             rmvpe_debug_mel: alloc(p.max_pitch_frames as usize * 128 * 4)?,
@@ -1269,9 +1514,23 @@ impl RvcTrtPipeline {
         self.retrieval.is_some()
     }
 
-    /// Set the RVC feature index blend ratio. The value is uploaded through
-    /// the pipeline stream and remains at a fixed device address, so changing
-    /// it does not invalidate an already captured CUDA graph.
+    /// Called after worker ownership returns to the control plane, never from
+    /// an audio callback or inference enqueue.
+    pub fn persist_runtime_caches(&mut self) {
+        for context in [
+            &mut self.hubert,
+            &mut self.rmvpe_realtime,
+            &mut self.rmvpe_full,
+            &mut self.frontend,
+            &mut self.synth,
+        ] {
+            context.persist_runtime_cache();
+        }
+    }
+
+    /// Stage the RVC feature index blend ratio for the next inference. Repeated
+    /// idle edits collapse to one upload at a fixed device address, so they
+    /// cannot overwrite in-flight staging slots or invalidate a CUDA graph.
     pub fn set_retrieval_ratio(&mut self, ratio: f32) -> Result<(), NativeBuildError> {
         if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
             return Err(NativeBuildError::Argument(
@@ -1283,12 +1542,30 @@ impl RvcTrtPipeline {
                 "retrieval ratio is non-zero but no FAISS index is loaded".into(),
             ));
         }
-        if (ratio - self.last_retrieval_ratio).abs() > f32::EPSILON {
-            self.control_host_ring
-                .upload_f32(&self.retrieval_ratio, &[ratio], &self.stream)?;
-            self.last_retrieval_ratio = ratio;
-        }
+        self.pending_retrieval_ratio = (ratio != self.last_retrieval_ratio).then_some(ratio);
         Ok(())
+    }
+
+    /// Set unvoiced protection without changing captured graph bindings.
+    /// Values >= 0.5 disable protection, matching the shared conversion API.
+    pub fn set_protect(&mut self, value: f32) -> Result<(), NativeBuildError> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(NativeBuildError::Argument(
+                "protect must be finite and in [0,1]".into(),
+            ));
+        }
+        self.protect_value = value;
+        Ok(())
+    }
+
+    /// Change pitch controls while idle; captured graphs read stable device
+    /// scalars and the existing frontend plan remains usable.
+    pub fn set_pitch_controls(
+        &mut self,
+        manual: f32,
+        policy: vocal_types::AutoPitchConfig,
+    ) -> Result<(), NativeBuildError> {
+        self.pitch_matcher.set(manual, policy)
     }
 
     /// Enable intermediate downloads for parity/debug reports. Keep this off
@@ -1345,6 +1622,7 @@ impl RvcTrtPipeline {
     /// reset performed by the reference realtime workers after a device/model
     /// change and prevents stale pitch context crossing sessions.
     pub fn reset_streaming_state(&mut self) -> Result<(), NativeBuildError> {
+        self.pitch_matcher.reset()?;
         self.pitch_cache.zero()?;
         self.pitch_cache_scratch.zero()?;
         self.pitch_cache_initialized = false;
@@ -1367,9 +1645,11 @@ impl RvcTrtPipeline {
 
     /// Run one complete waveform window through HuBERT, RMVPE, frontend, and
     /// Synth. `waveform` is the entire inference window in internal 16 kHz
-    /// samples. The non-realtime entry point consumes and returns the full
-    /// aligned RVC frame range; realtime cropping is handled by
-    /// [`Self::process_realtime`].
+    /// samples. This uses full-window F0 extraction. A full-context Synth plan
+    /// returns the valid offline prefix; a static realtime plan always emits
+    /// its compiled tail, described by `synth_skip_head`/`synth_output_frames`.
+    /// File conversion through a static plan must use the streaming engine
+    /// adapter, which advances by playback blocks and retains input history.
     pub fn process(
         &mut self,
         waveform: &[f32],
@@ -1394,7 +1674,7 @@ impl RvcTrtPipeline {
         sid: i32,
         advance_frames: usize,
     ) -> Result<RvcTrtOutput, NativeBuildError> {
-        if advance_frames == 0 || advance_frames > RVC_F0_CACHE_FRAMES {
+        if self.profile.offline || advance_frames == 0 || advance_frames > RVC_F0_CACHE_FRAMES {
             return Err(NativeBuildError::Argument(
                 "realtime F0 advance must be in 1..=1024 frames".into(),
             ));
@@ -1523,11 +1803,29 @@ impl RvcTrtPipeline {
     fn enqueue_decode_sequence(&mut self) -> Result<(), NativeBuildError> {
         let trace = self.diagnostics.trace;
         self.stage_events.frontend_start.record(&self.stream)?;
+        if self.active_streaming_pitch {
+            self.pitch_matcher.enqueue(
+                &self.pitch_cache,
+                RVC_F0_CACHE_FRAMES - self.active_pitch_frames,
+                self.active_pitch_frames,
+                true,
+                &self.stream,
+            )?;
+        } else {
+            self.pitch_matcher.enqueue(
+                &self.pitchf_raw,
+                0,
+                self.active_pitch_frames,
+                false,
+                &self.stream,
+            )?;
+        }
         if trace {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: enqueue frontend");
         }
         self.frontend
             .enqueue_named(&self.stream, Some("rvc.frontend"))?;
+        self.enqueue_retrieval_protection()?;
         self.stage_events.frontend_end.record(&self.stream)?;
         self.stage_events.synth_start.record(&self.stream)?;
         if trace {
@@ -1543,11 +1841,28 @@ impl RvcTrtPipeline {
 
     fn enqueue_retrieval(&self, stream: &CudaStream) -> Result<(), NativeBuildError> {
         if let Some(index) = self.retrieval.as_ref() {
+            if let Some(protection) = &self.retrieval_protection {
+                protection.save_raw(&self.hubert_features, self.active_hubert_frames, stream)?;
+            }
             index.blend(
                 &self.hubert_features,
                 self.active_hubert_frames,
                 &self.retrieval_ratio,
                 stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_retrieval_protection(&self) -> Result<(), NativeBuildError> {
+        if let Some(protection) = &self.retrieval_protection {
+            protection.apply(
+                &self.feats,
+                &self.pitchf,
+                &self.retrieval_ratio,
+                self.active_rvc_frames,
+                self.active_hubert_frames,
+                &self.stream,
             )?;
         }
         Ok(())
@@ -1669,6 +1984,7 @@ impl RvcTrtPipeline {
         }
         self.frontend
             .enqueue_named(&self.stream, Some("rvc.frontend"))?;
+        self.enqueue_retrieval_protection()?;
         self.stage_events.frontend_end.record(&self.stream)?;
         self.stage_events.synth_start.record(&self.stream)?;
         if trace {
@@ -1817,6 +2133,15 @@ impl RvcTrtPipeline {
                 p.max_samples
             )));
         }
+        if let Some(protection) = &mut self.retrieval_protection {
+            protection.set_amount(self.protect_value)?;
+        }
+        if let Some(ratio) = self.pending_retrieval_ratio {
+            self.control_host_ring
+                .upload_f32(&self.retrieval_ratio, &[ratio], &self.stream)?;
+            self.last_retrieval_ratio = ratio;
+            self.pending_retrieval_ratio = None;
+        }
         self.waveform_host_ring
             .upload_f32(&self.waveform, waveform, &self.stream)?;
         if trace {
@@ -1953,7 +2278,9 @@ impl RvcTrtPipeline {
         }
 
         let p_len_frames = waveform.len() / RVC_HOP_SAMPLES;
-        let rvc_frames = if streaming_f0 {
+        let rvc_frames = if p.offline {
+            p_len_frames.min(hubert_frames * 2).min(pitch_frames)
+        } else if streaming_f0 {
             p_len_frames.min((hubert_frames + 1) * 2)
         } else {
             p_len_frames.min((hubert_frames + 1) * 2).min(pitch_frames)
@@ -1963,7 +2290,15 @@ impl RvcTrtPipeline {
                 "aligned RVC frame count {rvc_frames} outside profile"
             )));
         }
-        let (synth_skip_head, synth_return_frames) = if realtime_mode {
+        self.active_rvc_frames = rvc_frames;
+        // A fixed realtime Synth plan is compiled with a static tail crop
+        // (for 44960 this is 31 frames after skipping 250 context frames).
+        // The graph therefore writes only that tail even when a caller uses
+        // the legacy non-realtime `process()` entry point. Keep the same crop
+        // metadata in both modes so the host never downloads unwritten bytes
+        // from the reusable audio buffer. Broad profiles still decode the
+        // complete context for non-realtime calls.
+        let (synth_skip_head, synth_return_frames) = if realtime_mode || self.synth_tail_mode {
             realtime_crop_for_samples(waveform.len(), rvc_frames)
         } else {
             (0, rvc_frames)
@@ -2009,8 +2344,10 @@ impl RvcTrtPipeline {
                 && key.streaming_f0 == streaming_f0
         });
         if !same_shape {
-            self.frontend
-                .set_input_shape("hubert_features", &[1, hubert_frames as i64, 768])?;
+            self.frontend.set_input_shape(
+                "hubert_features",
+                &[1, hubert_frames as i64, self.config.feature_width as i64],
+            )?;
             self.frontend
                 .set_input_shape("pitchf_in", &[1, frontend_pitch_frames as i64])?;
         }
@@ -2019,7 +2356,7 @@ impl RvcTrtPipeline {
         }
         for (name, buffer) in [
             ("hubert_features", &self.hubert_features),
-            ("pitchf_in", &self.pitchf_raw),
+            ("pitchf_in", &self.pitch_matcher.scaled),
             ("feats", &self.feats),
             ("pitch", &self.pitch),
             ("pitchf", &self.pitchf),
@@ -2030,14 +2367,14 @@ impl RvcTrtPipeline {
         if trace {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: frontend addresses set");
         }
-        let pitchf_input = if streaming_f0 {
-            self.pitch_cache
-                .device_ptr_offset((RVC_F0_CACHE_FRAMES - rvc_frames) * 4)
+        // Estimate offline register from all RMVPE frames, including its
+        // boundary frame, then let the frontend consume only the valid prefix.
+        self.active_pitch_frames = if streaming_f0 {
+            rvc_frames
         } else {
-            self.pitchf_raw.device_ptr()
+            pitch_frames
         };
-        self.frontend
-            .set_tensor_address_cached("pitchf_in", pitchf_input)?;
+        self.active_streaming_pitch = streaming_f0;
 
         let up = self
             .config
@@ -2071,7 +2408,20 @@ impl RvcTrtPipeline {
         if trace {
             tracing::trace!(target: "vocal_tensorrt", "trt trace: synth shapes set");
         }
-        let p_len_value = i32::try_from(synth_frames)
+        // Applio's offline `voice_conversion` does not append the final
+        // HuBERT frame. The realtime path does append it before interpolation
+        // and keeps the extra boundary frame in the context. Keep one graph
+        // shape for both callers, but mask the extra offline frame and expose
+        // only the valid 2x-upsampled prefix to the host.
+        let valid_synth_frames = if realtime_mode {
+            synth_frames
+        } else {
+            p_len_frames
+                .min(hubert_frames.saturating_mul(2))
+                .min(pitch_frames)
+                .min(synth_frames)
+        };
+        let p_len_value = i32::try_from(valid_synth_frames)
             .map_err(|_| NativeBuildError::Argument("RVC frame length exceeds i32".into()))?;
         if self.last_p_len != Some(p_len_value) {
             self.control_host_ring.upload_bytes(
@@ -2432,8 +2782,14 @@ impl RvcTrtPipeline {
         // Pageable cudaMemcpy after synchronization adds a second host-side
         // synchronization point on every callback.  A pinned ring keeps the
         // copy ordered with the graph while retaining an owned Vec API.
-        let audio_frames = if self.synth_tail_mode && realtime_mode {
+        // Static realtime plans emit only `synth_return_frames`; downloading
+        // `synth_frames` here would include stale data from the previous
+        // enqueue and is heard as broadband/mechanical noise by offline
+        // callers that use `process()`.
+        let audio_frames = if self.synth_tail_mode {
             synth_return_frames
+        } else if !realtime_mode {
+            valid_synth_frames
         } else {
             synth_frames
         };
@@ -2443,6 +2799,12 @@ impl RvcTrtPipeline {
         let audio_bytes_len = audio_samples
             .checked_mul(4)
             .ok_or_else(|| NativeBuildError::Argument("audio byte length overflow".into()))?;
+        if !same_shape {
+            // Validate the actual plan binding as well as the manifest. A
+            // stale or mismatched manifest must never make us expose the
+            // unwritten portion of the reusable audio allocation.
+            validate_audio_binding(&self.synth.tensor_shape("audio")?, audio_samples)?;
+        }
         let async_audio_d2h = self.runtime_config.async_audio_d2h;
         let audio_host_slot = if self.debug_intermediates || !async_audio_d2h {
             None
@@ -2496,13 +2858,15 @@ impl RvcTrtPipeline {
             rmvpe_gru,
             rmvpe_logits,
         ) = if self.debug_intermediates {
-            let mut feature_bytes = vec![0_u8; hubert_frames * 768 * 4];
+            let mut feature_bytes =
+                vec![0_u8; hubert_frames * self.config.feature_width as usize * 4];
             self.hubert_features.download_bytes(&mut feature_bytes)?;
             let features = feature_bytes
                 .chunks_exact(4)
                 .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
                 .collect::<Vec<_>>();
-            let mut rvc_feature_bytes = vec![0_u8; rvc_frames * 768 * 4];
+            let mut rvc_feature_bytes =
+                vec![0_u8; rvc_frames * self.config.feature_width as usize * 4];
             self.feats.download_bytes(&mut rvc_feature_bytes)?;
             let rvc_features = rvc_feature_bytes
                 .chunks_exact(4)
@@ -2614,6 +2978,18 @@ impl RvcTrtPipeline {
             pitchf,
             aligned_pitchf,
             pitch,
+            synth_random: self
+                .debug_intermediates
+                .then(|| self.host_rnd_active.clone()),
+            synth_noise: (self.debug_intermediates && self.config.uses_f0)
+                .then(|| self.host_noise.clone()),
+            valid_synth_frames,
+            synth_skip_head: if self.synth_tail_mode {
+                synth_skip_head
+            } else {
+                0
+            },
+            synth_output_frames: audio_frames,
             rmvpe_mel,
             rmvpe_bottleneck,
             rmvpe_unet,
@@ -2644,6 +3020,21 @@ fn concrete_dim(shape: &[i64], axis: usize, fallback: usize) -> Result<usize, Na
     } else {
         Ok(fallback)
     }
+}
+
+fn validate_audio_binding(shape: &[i64], requested: usize) -> Result<(), NativeBuildError> {
+    let written = shape.iter().try_fold(1usize, |size, &dim| {
+        usize::try_from(dim)
+            .ok()
+            .filter(|&dim| dim > 0)?
+            .checked_mul(size)
+    });
+    if shape.is_empty() || written.is_none_or(|written| requested == 0 || requested > written) {
+        return Err(NativeBuildError::Argument(format!(
+            "Synth audio binding {shape:?} cannot supply {requested} samples; check pipeline crop metadata"
+        )));
+    }
+    Ok(())
 }
 
 fn fill_standard_normal(values: &mut [f32], state: &mut u64) {
@@ -2872,6 +3263,24 @@ mod tests {
     }
 
     #[test]
+    fn offline_profiles_use_real_feature_extent_and_full_decoder() {
+        for samples in [465_600, 465_603, 800_000] {
+            let profile = RvcTrtProfile::for_offline(samples).unwrap();
+            let features = ((samples - 400) / 320 + 1) as i32;
+            assert!(profile.offline);
+            assert_eq!(profile.max_hubert_frames, features);
+            assert_eq!(
+                profile.max_rvc_frames,
+                (samples as i32 / 160).min(2 * features)
+            );
+            assert_eq!(profile.min_synth_frames, profile.max_rvc_frames);
+            assert_eq!(profile.min_samples, profile.max_samples);
+        }
+        assert!(RvcTrtProfile::for_offline(800_001).is_err());
+        assert!(RvcTrtProfile::for_offline(4959).is_err());
+    }
+
+    #[test]
     fn full_window_drops_only_the_rmvpe_boundary_frame() {
         let full = frame_shape(44_960);
         assert_eq!((full.hubert, full.pitch, full.rvc), (140, 282, 281));
@@ -2889,6 +3298,17 @@ mod tests {
     fn realtime_crop_matches_reference_skip_head() {
         assert_eq!(realtime_crop_for_samples(11_200, 70), (8, 62));
         assert_eq!(realtime_crop_for_samples(44_960, 281), (250, 31));
+    }
+
+    #[test]
+    fn audio_download_rejects_unwritten_static_tail_capacity() {
+        // 44960 input samples produce 281 context frames, but a realtime
+        // plan writes just 31 after skip_head=250. The larger allocation is
+        // not an output length, even if its stale contents happen to be finite.
+        assert!(super::validate_audio_binding(&[1, 1, 31 * 400], 281 * 400).is_err());
+        assert!(super::validate_audio_binding(&[1, 1, 31 * 400], 31 * 400).is_ok());
+        assert!(super::validate_audio_binding(&[1, 1, 281 * 400], 280 * 400).is_ok());
+        assert!(super::validate_audio_binding(&[1, 1, -1], 400).is_err());
     }
 
     #[test]

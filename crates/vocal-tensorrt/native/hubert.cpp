@@ -43,6 +43,9 @@ struct HubertGraph {
         auto const& p = weight(name);
         require(p.rank <= 4, "HuBERT weight rank exceeds ABI");
         if (active_precision == 0) return {DataType::kFLOAT, p.data, p.count};
+        if (p.data16 && ((active_precision == 1 && p.dtype == 4) ||
+                         (active_precision == 2 && p.dtype == 6)))
+            return {active_precision == 1 ? DataType::kHALF : DataType::kBF16, p.data16, p.count};
         auto* self = const_cast<HubertGraph*>(this);
         self->low_constants.emplace_back(static_cast<size_t>(p.count));
         auto& dst = self->low_constants.back();
@@ -322,7 +325,8 @@ struct HubertGraph {
         pos = reshape(pos, hdims({1, -1, 768}));
         pos = activation(pos, ActivationType::kGELU_ERF);
         x = layer_norm(add(x, pos), "hubert.model.encoder.layer_norm", 768);
-        for (int i = 0; i < 12; ++i) {
+        int const output_layer = o.rvc_feature_width == 256 ? 9 : 12;
+        for (int i = 0; i < output_layer; ++i) {
             auto prefix = std::string("hubert.model.encoder.layers.") + std::to_string(i);
             // HubertEncoderLayer keeps the post-attention residual for the
             // feed-forward block.  The second residual is added after the
@@ -334,6 +338,8 @@ struct HubertGraph {
             y = linear(y, prefix + ".feed_forward.output_dense", 3072, 768);
             x = layer_norm(add(ffn_residual, y), prefix + ".final_layer_norm", 768);
         }
+        if (o.rvc_feature_width == 256)
+            x = linear(x, "hubert.model.final_proj", 768, 256);
         return x;
     }
 };
@@ -343,6 +349,8 @@ extern "C" int vocal_trt_build_hubert(
     Build** out, char** error) noexcept {
     return guarded(error, [&] {
         require(weights && count && options && out, "invalid HuBERT build arguments");
+        require(options->rvc_feature_width == 256 || options->rvc_feature_width == 768,
+                "unsupported RVC HuBERT feature width");
         require(options->min_frames > 0 && options->min_frames <= options->opt_frames &&
                     options->opt_frames <= options->max_frames, "invalid HuBERT sample profile");
         *out = nullptr;

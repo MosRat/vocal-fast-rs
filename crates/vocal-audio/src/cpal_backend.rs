@@ -23,7 +23,7 @@ pub enum CpalError {
     InputConfig(#[source] cpal::Error),
     #[error("cpal output device has no default stream configuration: {0}")]
     OutputConfig(#[source] cpal::Error),
-    #[error("cpal callback format must be f32 (input={input:?}, output={output:?})")]
+    #[error("unsupported cpal PCM sample format (input={input:?}, output={output:?})")]
     UnsupportedSampleFormat {
         input: cpal::SampleFormat,
         output: cpal::SampleFormat,
@@ -131,7 +131,56 @@ fn build_duplex_inner(
     error_handler: impl Fn(cpal::Error) + Send + Sync + 'static,
 ) -> Result<(CpalDuplexStream, WorkerIo), CpalError> {
     let config = config.validate()?;
-    if config.block_frames > u32::MAX as usize {
+    build_duplex_formats_inner(
+        input_device,
+        output_device,
+        config,
+        config,
+        device_io,
+        worker_io,
+        clock,
+        error_handler,
+    )
+}
+
+/// Open capture and render in their respective native formats. Conversion is
+/// performed by `DuplexWorkerAdapter` outside callbacks, with no format equality
+/// requirement between directions.
+pub fn build_duplex_formats_profiled(
+    input_device: &cpal::Device,
+    output_device: &cpal::Device,
+    capture: StreamConfig,
+    render: StreamConfig,
+    device_io: DeviceIo,
+    worker_io: WorkerIo,
+    clock: AudioClock,
+    error_handler: impl Fn(cpal::Error) + Send + Sync + 'static,
+) -> Result<(CpalDuplexStream, WorkerIo), CpalError> {
+    build_duplex_formats_inner(
+        input_device,
+        output_device,
+        capture,
+        render,
+        device_io,
+        worker_io,
+        Some(clock),
+        error_handler,
+    )
+}
+
+fn build_duplex_formats_inner(
+    input_device: &cpal::Device,
+    output_device: &cpal::Device,
+    config: StreamConfig,
+    render_config: StreamConfig,
+    device_io: DeviceIo,
+    worker_io: WorkerIo,
+    clock: Option<AudioClock>,
+    error_handler: impl Fn(cpal::Error) + Send + Sync + 'static,
+) -> Result<(CpalDuplexStream, WorkerIo), CpalError> {
+    let config = config.validate()?;
+    let render_config = render_config.validate()?;
+    if config.block_frames > u32::MAX as usize || render_config.block_frames > u32::MAX as usize {
         return Err(CpalError::InvalidConfig(AudioError::InvalidConfig(
             "cpal buffer size exceeds u32::MAX frames".into(),
         )));
@@ -142,14 +191,6 @@ fn build_duplex_inner(
     let output_default = output_device
         .default_output_config()
         .map_err(CpalError::OutputConfig)?;
-    if input_default.sample_format() != cpal::SampleFormat::F32
-        || output_default.sample_format() != cpal::SampleFormat::F32
-    {
-        return Err(CpalError::UnsupportedSampleFormat {
-            input: input_default.sample_format(),
-            output: output_default.sample_format(),
-        });
-    }
     let expected_channels = config.format.channels;
     let expected_sample_rate = config.format.sample_rate;
     if input_default.channels() != expected_channels
@@ -163,22 +204,29 @@ fn build_duplex_inner(
             expected_channels,
         });
     }
-    if output_default.channels() != expected_channels
-        || output_default.sample_rate() != expected_sample_rate
+    if output_default.channels() != render_config.format.channels
+        || output_default.sample_rate() != render_config.format.sample_rate
     {
         return Err(CpalError::DeviceFormatMismatch {
             direction: "output",
             sample_rate: output_default.sample_rate(),
             channels: output_default.channels(),
-            expected_sample_rate,
-            expected_channels,
+            expected_sample_rate: render_config.format.sample_rate,
+            expected_channels: render_config.format.channels,
         });
     }
 
-    let native_config = cpal::StreamConfig {
+    // Native driver periods need not equal ring slot sizes. Default lets CPAL
+    // select a legal callback period; assembler/drainer retain exact slot sizes.
+    let capture_native = cpal::StreamConfig {
         channels: config.format.channels,
         sample_rate: config.format.sample_rate,
-        buffer_size: cpal::BufferSize::Fixed(config.block_frames as u32),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let render_native = cpal::StreamConfig {
+        channels: render_config.format.channels,
+        sample_rate: render_config.format.sample_rate,
+        buffer_size: cpal::BufferSize::Default,
     };
     let state = Arc::new(StreamState::new());
     state.set(StreamLifecycle::Starting);
@@ -195,7 +243,6 @@ fn build_duplex_inner(
     let latency = clock
         .as_ref()
         .map(|_| Arc::new(AudioLatencyStats::default()));
-    let expected_period = config.block_duration();
 
     let DeviceIo {
         input: mut input_producer,
@@ -206,102 +253,123 @@ fn build_duplex_inner(
     let input_latency = latency.clone();
     let input_error = Arc::clone(&callback_error);
     let mut input_last_callback = None;
-    let input = input_device
-        .build_input_stream(
-            native_config,
-            move |data: &[f32], _| {
+    let input = crate::cpal_samples::build_input(
+        input_device,
+        capture_native,
+        input_default.sample_format(),
+        move |data: &[f32], info, callback_frames, offset_frames| {
+            if offset_frames == 0 {
                 record_callback_tick(
                     input_latency.as_deref(),
                     &mut input_last_callback,
-                    expected_period,
+                    Duration::from_secs_f64(
+                        callback_frames as f64 / f64::from(config.format.sample_rate),
+                    ),
                     AudioDirection::Capture,
                 );
-                // A full queue is a real-time overflow. Dropping the newest
-                // block bounds latency; the ring and assembler expose counters
-                // for diagnostics.
-                let timestamp = input_clock
-                    .as_ref()
-                    .map(AudioClock::now)
-                    .unwrap_or(AudioTimestamp::ZERO);
-                let _ = assembler.push_at(data, &mut input_producer, timestamp);
-                if let Some(latency) = input_latency.as_ref() {
-                    latency.record_block_path(AudioDirection::Capture, false);
-                    latency.record_assembler_buffered(
-                        assembler
-                            .buffered_samples()
-                            .checked_div(config.format.channels as usize)
-                            .unwrap_or(0),
+            }
+            // A full queue is a real-time overflow. Dropping the newest
+            // block bounds latency; the ring and assembler expose counters
+            // for diagnostics.
+            let timestamp = input_clock
+                .as_ref()
+                .map(|clock| {
+                    let timing = info.timestamp();
+                    let age = timing.callback.duration_since(timing.capture);
+                    let offset = Duration::from_secs_f64(
+                        offset_frames as f64 / f64::from(config.format.sample_rate),
                     );
-                    let stats = input_producer.stats();
-                    latency.record_queue_state_for(
-                        AudioDirection::Capture,
-                        stats.queued_blocks,
-                        stats.high_water_blocks,
-                        stats.dropped_full,
-                        stats.dropped_stale,
-                    );
-                }
-            },
-            move |error| input_error(error),
-            None,
-        )
-        .map_err(CpalError::BuildInput)?;
+                    clock.now().earlier_by(age.saturating_sub(offset))
+                })
+                .unwrap_or(AudioTimestamp::ZERO);
+            let _ = assembler.push_at(data, &mut input_producer, timestamp);
+            if let Some(latency) = input_latency.as_ref() {
+                latency.record_block_path(AudioDirection::Capture, false);
+                latency.record_assembler_buffered(
+                    assembler
+                        .buffered_samples()
+                        .checked_div(config.format.channels as usize)
+                        .unwrap_or(0),
+                );
+                let stats = input_producer.stats();
+                latency.record_queue_state_for(
+                    AudioDirection::Capture,
+                    stats.queued_blocks,
+                    stats.high_water_blocks,
+                    stats.dropped_full,
+                    stats.dropped_stale,
+                );
+            }
+        },
+        move |error| input_error(error),
+    )?;
 
-    let mut drainer = BlockDrainer::new(config)?;
+    let mut drainer = BlockDrainer::new(render_config)?;
     let output_clock = clock;
     let output_latency = latency.clone();
     let output_error = Arc::clone(&callback_error);
     let mut output_last_callback = None;
-    let output = output_device
-        .build_output_stream(
-            native_config,
-            move |data: &mut [f32], _| {
+    let output = crate::cpal_samples::build_output(
+        output_device,
+        render_native,
+        output_default.sample_format(),
+        move |data: &mut [f32], info, callback_frames, offset_frames| {
+            if offset_frames == 0 {
                 record_callback_tick(
                     output_latency.as_deref(),
                     &mut output_last_callback,
-                    expected_period,
+                    Duration::from_secs_f64(
+                        callback_frames as f64 / f64::from(render_config.format.sample_rate),
+                    ),
                     AudioDirection::Render,
                 );
-                // Silence is written on underflow so the native callback never
-                // blocks behind inference.
-                match drainer.drain(data, &mut output_consumer) {
-                    Ok(report) => {
-                        if let Some(latency) = output_latency.as_ref() {
-                            latency.record_block_path(AudioDirection::Render, false);
-                            latency.record_drainer_pending(
-                                drainer
-                                    .pending_samples()
-                                    .checked_div(config.format.channels as usize)
-                                    .unwrap_or(0),
-                            );
-                            latency.record_underflow(report.underflow_samples);
-                            let stats = output_consumer.stats();
-                            latency.record_queue_state_for(
-                                AudioDirection::Render,
-                                stats.queued_blocks,
-                                stats.high_water_blocks,
-                                stats.dropped_full,
-                                stats.dropped_stale,
-                            );
-                            if let Some(clock) = output_clock.as_ref() {
-                                let age = report
-                                    .source_timestamp
-                                    .is_set()
-                                    .then(|| clock.elapsed(report.source_timestamp))
-                                    .flatten();
-                                if let Some(age) = age {
-                                    latency.record(age);
-                                }
+            }
+            // Silence is written on underflow so the native callback never
+            // blocks behind inference.
+            match drainer.drain(data, &mut output_consumer) {
+                Ok(report) => {
+                    if let Some(latency) = output_latency.as_ref() {
+                        latency.record_block_path(AudioDirection::Render, false);
+                        latency.record_drainer_pending(
+                            drainer
+                                .pending_samples()
+                                .checked_div(render_config.format.channels as usize)
+                                .unwrap_or(0),
+                        );
+                        latency.record_underflow(report.underflow_samples);
+                        let stats = output_consumer.stats();
+                        latency.record_queue_state_for(
+                            AudioDirection::Render,
+                            stats.queued_blocks,
+                            stats.high_water_blocks,
+                            stats.dropped_full,
+                            stats.dropped_stale,
+                        );
+                        if let Some(clock) = output_clock.as_ref() {
+                            let age = report
+                                .source_timestamp
+                                .is_set()
+                                .then(|| clock.elapsed(report.source_timestamp))
+                                .flatten();
+                            if let Some(age) = age {
+                                let timing = info.timestamp();
+                                let padding = timing
+                                    .playback
+                                    .duration_since(timing.callback)
+                                    .saturating_add(Duration::from_secs_f64(
+                                        offset_frames as f64
+                                            / f64::from(render_config.format.sample_rate),
+                                    ));
+                                latency.record(age.saturating_add(padding));
                             }
                         }
                     }
-                    Err(_) => data.fill(0.0),
                 }
-            },
-            move |error| output_error(error),
-            None,
-        )
-        .map_err(CpalError::BuildOutput)?;
+                Err(_) => data.fill(0.0),
+            }
+        },
+        move |error| output_error(error),
+    )?;
 
     input.play().map_err(CpalError::PlayInput)?;
     output.play().map_err(CpalError::PlayOutput)?;

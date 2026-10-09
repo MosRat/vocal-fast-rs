@@ -1,0 +1,18 @@
+[package]
+name = "vocal-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vocal-graph = { path = "../vocal-graph" }
+vocal-model.workspace = true
+vocal-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustfft = "6.4"
+
+[build-dependencies]
+cc = "1.2"

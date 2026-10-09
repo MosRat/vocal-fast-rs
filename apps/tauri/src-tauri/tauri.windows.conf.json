@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "windows": { "staticVCRuntime": false }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "vocal-fast",
+    "category": "Music",
+    "shortDescription": "Low latency voice conversion",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "bundleVCRuntime": true,
+      "allowDowngrades": false,
+      "webviewInstallMode": { "type": "embedBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "SimpChinese"],
+        "displayLanguageSelector": true,
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "compression": "lzma"
+      }
+    }
+  }
+}

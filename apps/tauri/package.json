@@ -3,7 +3,21 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": { "dev": "vite --host 127.0.0.1 --port 1420", "build": "vite build", "tauri": "tauri" },
-  "dependencies": { "@tauri-apps/api": "^2.9.0" },
-  "devDependencies": { "@tauri-apps/cli": "^2.9.0", "vite": "latest", "typescript": "latest" }
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "build": "tsc --noEmit && vite build",
+    "build:windows": "pwsh -NoProfile -File ../../scripts/build-windows.ps1",
+    "debug:windows": "pwsh -NoProfile -File ../../scripts/build-windows.ps1 -Profile Debug -NoBundle -Launch",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0",
+    "morphdom": "^2.7.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "typescript": "latest",
+    "vite": "latest"
+  }
 }

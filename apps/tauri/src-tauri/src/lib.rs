@@ -1,19 +1,21 @@
 mod audio;
+mod audio_error;
+mod audio_telemetry;
 mod commands;
 mod config;
 mod error;
 mod events;
+mod model_commands;
+mod preparation;
 mod snapshot;
+mod startup;
 mod state;
-mod tray;
 mod tensorrt;
-
-use std::path::PathBuf;
+mod tray;
 
 use tauri::{Manager, WindowEvent};
 
-use config::{ConfigStore, GuiConfig};
-use snapshot::BootPhase;
+use config::GuiConfig;
 use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -27,14 +29,14 @@ pub fn run() {
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                // Hide immediately; joining audio/model threads happens away
+                // from the UI thread, even while engine preparation is busy.
+                let _ = window.hide();
                 let handle = window.app_handle().clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     let state = handle.state::<AppState>();
                     if let Err(error) = state.stop() {
                         state.report(&error);
-                    }
-                    if let Some(main) = handle.get_webview_window("main") {
-                        let _ = main.hide();
                     }
                 });
             }
@@ -53,82 +55,34 @@ pub fn run() {
                 .join("config.json");
             let state = app.state::<AppState>().inner().clone();
             let handle = app.handle().clone();
-            let _ = state.set_boot_phase(BootPhase::RestoringConfig, None);
-            if let Err(error) = state.set_config_store(ConfigStore::new(PathBuf::from(path))) {
-                tracing::warn!(target: "vocal.gui", error = %error, "failed to load persisted GUI config");
-                state.fail_boot(&error);
-                reveal_main(&handle);
-                return Ok(());
-            }
-            if let Ok(cache_dir) = app.path().app_cache_dir() {
-                let _ = state.set_default_tensorrt_cache_directory(
-                    cache_dir.join("vocal-fast").join("tensorrt"),
-                );
-            }
-
-            match state.persisted_model_path() {
-                Ok(Some(model_path))
-                    if std::path::Path::new(&model_path).is_file()
-                        || std::path::Path::new(&model_path).is_dir() =>
-                {
-                    let _ = state.set_boot_phase(
-                        BootPhase::RestoringModel,
-                        Some("Restoring the last voice model…".into()),
-                    );
-                    let worker_state = state.clone();
-                    let worker_handle = handle.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        let result = worker_state.load_model(model_path);
-                        match result {
-                            Ok(_) => worker_state.mark_boot_ready(),
-                            Err(error) => {
-                                tracing::warn!(target: "vocal.gui", error = %error, "failed to restore persisted model");
-                                worker_state.fail_boot(&error);
-                            }
-                        }
-                        reveal_main(&worker_handle);
-                    });
-
-                    // A slow disk scan must not leave the user staring at an
-                    // invisible main window forever. The restore worker keeps
-                    // running and can still publish Ready afterwards.
-                    let timeout_state = state.clone();
-                    let timeout_handle = handle.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(30));
-                        if matches!(
-                            timeout_state.snapshot().ok().map(|snapshot| snapshot.boot.phase),
-                            Some(BootPhase::RestoringConfig | BootPhase::RestoringModel)
-                        ) {
-                            timeout_state.mark_boot_timeout();
-                            reveal_main(&timeout_handle);
-                        }
-                    });
-                }
-                Ok(Some(model_path)) => {
-                    tracing::warn!(target: "vocal.gui", path = %model_path, "persisted model path is unavailable");
-                    let _ = state.set_boot_phase(
-                        BootPhase::Ready,
-                        Some("The saved model path is unavailable; choose a model to continue.".into()),
-                    );
-                    reveal_main(&handle);
-                }
-                Ok(None) => {
-                    state.mark_boot_ready();
-                    reveal_main(&handle);
-                }
-                Err(error) => {
-                    state.fail_boot(&error);
-                    reveal_main(&handle);
-                }
-            }
+            let cache_path = app
+                .path()
+                .app_cache_dir()
+                .ok()
+                .map(|path| path.join("vocal-fast").join("tensorrt"));
+            startup::launch(handle, state, path, cache_path);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
+            model_commands::read_model_metadata,
+            model_commands::edit_model_metadata,
+            model_commands::list_remote_models,
+            model_commands::get_model_import_status,
+            model_commands::start_model_import,
+            model_commands::cancel_model_import,
+            model_commands::default_model_library,
+            model_commands::pick_model_file,
+            commands::get_boot_status,
+            commands::get_startup_resources,
+            commands::subscribe_boot,
+            commands::restore_saved_model,
             commands::subscribe,
+            commands::subscribe_preparation,
             commands::list_audio_devices,
+            commands::list_processing_backends,
             commands::list_models,
+            commands::inspect_model_artifact,
             commands::pick_model_directory,
             commands::update_config,
             commands::prepare_tensorrt_pipeline,
@@ -146,6 +100,13 @@ pub fn run() {
 }
 
 fn reveal_main<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if app
+        .state::<AppState>()
+        .boot_status()
+        .is_ok_and(|status| status.phase == snapshot::BootPhase::ShuttingDown)
+    {
+        return;
+    }
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.show();
         let _ = main.set_focus();

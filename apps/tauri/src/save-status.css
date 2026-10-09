@@ -1,0 +1,55 @@
+.config-persistence {
+  display: flex;
+  min-width: 0;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text-tertiary);
+  background: transparent;
+  transition: color .2s ease, background .2s ease, border-color .2s ease;
+}
+
+.config-save-icon { display: grid; width: 16px; height: 16px; flex: 0 0 16px; place-items: center; }
+.config-save-label { min-width: 0; flex: 1; overflow: hidden; font-size: 11px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.config-persistence.is-saving, .config-persistence.is-pending { color: var(--accent); }
+.config-persistence.is-saving .config-save-icon .icon { animation: config-save-spin 1.2s linear infinite; }
+.config-persistence.is-saved { color: var(--positive); background: color-mix(in srgb, var(--positive-soft) 55%, transparent); }
+.config-persistence.is-profile { color: var(--text-secondary); }
+.config-persistence.is-error { color: var(--critical); background: var(--critical-soft); border-color: color-mix(in srgb, var(--critical) 20%, transparent); }
+
+.config-save-action {
+  display: inline-flex;
+  min-height: 26px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: inherit;
+  background: transparent;
+  font-size: 10px;
+  cursor: pointer;
+  transition: background .16s ease;
+}
+.config-save-action:hover { background: color-mix(in srgb, var(--critical) 10%, transparent); }
+.config-save-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.sidebar-connection { display: flex; min-height: 26px; align-items: center; gap: 7px; padding: 0 9px; }
+.sidebar-connection .connection-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@keyframes config-save-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 900px) {
+  .sidebar-footer { display: flex; padding: 10px 0 0; }
+  .config-persistence { height: 56px; min-height: 56px; justify-content: center; flex-wrap: wrap; gap: 2px; padding: 5px; }
+  .config-save-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .config-save-action { min-width: 26px; justify-content: center; padding: 0; }
+  .config-save-action span, .sidebar-connection .connection-label { display: none; }
+  .sidebar-connection { justify-content: center; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .config-persistence.is-saving .config-save-icon .icon { animation: none; }
+}

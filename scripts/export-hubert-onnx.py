@@ -1,8 +1,8 @@
 """Export the local RVC HuBERT checkpoint as a TensorRT-friendly ONNX graph.
 
-The RVC frontend consumes only ``last_hidden_state``.  The final projection used
-by v1 checkpoints stays outside this graph and is selected by the model
-manifest.  The export deliberately keeps the waveform input dynamic and uses
+This exports the complete layer-12/768 backbone. The acoustic VFRM converter
+also reads the adjacent checkpoint's learned ``final_proj`` so handwritten
+builders can select layer 9 plus projection for RVC v1. The export keeps the waveform input dynamic and uses
 opset 17, which is supported by TensorRT-RTX 1.6's ONNX parser.
 """
 

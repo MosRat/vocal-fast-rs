@@ -1,5 +1,9 @@
 # Realtime RVC boundary artifact analysis
 
+Historical report. The current shared transition policy supersedes the scalar
+RMS multiplier and 13-block startup muting described below. See
+[Realtime speech transitions](realtime-speech-transitions.md).
+
 `target/offline-augmented-rvc.wav` was generated before the realtime fixes. It
 uses the legacy `run-trt-pipeline` loop: each 44,960 sample context is passed
 to `RvcTrtPipeline::process()` and the returned waveforms are concatenated. That

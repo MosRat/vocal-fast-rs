@@ -10,10 +10,67 @@ use crate::{
 };
 
 #[tauri::command]
+pub fn get_boot_status(state: State<'_, AppState>) -> GuiResult<crate::snapshot::UiBootStatus> {
+    state.boot_status()
+}
+
+#[tauri::command]
+pub fn get_startup_resources(
+    state: State<'_, AppState>,
+) -> Option<crate::startup::StartupResources> {
+    state.startup_resources()
+}
+
+#[tauri::command]
+pub fn subscribe_boot(
+    state: State<'_, AppState>,
+    window_label: String,
+    channel: Channel<BackendEvent>,
+) -> GuiResult<crate::snapshot::UiBootStatus> {
+    state.attach_boot_channel(window_label, channel)
+}
+
+#[tauri::command]
+pub async fn restore_saved_model(
+    state: State<'_, AppState>,
+    window: WebviewWindow,
+    expected_revision: u64,
+) -> GuiResult<UiSnapshot> {
+    if window.label() != "main" || !window.is_visible()? {
+        return Err(crate::error::GuiError::InvalidState {
+            state: "main_window_not_visible".into(),
+            action: "restore_saved_model".into(),
+        });
+    }
+    run_blocking(state.inner().clone(), move |state| {
+        state.restore_saved_model(expected_revision)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_processing_backends() -> GuiResult<vocal_runtime::ProcessingBackendCatalog> {
+    tauri::async_runtime::spawn_blocking(vocal_runtime::detect_processing_backends)
+        .await
+        .map_err(|error| crate::error::GuiError::Internal(error.to_string()))
+}
+
+#[tauri::command]
 pub async fn list_audio_devices(
     state: State<'_, AppState>,
 ) -> GuiResult<crate::audio::AudioDeviceCatalog> {
     run_blocking(state.inner().clone(), |state| state.list_audio_devices()).await
+}
+
+#[tauri::command]
+pub async fn inspect_model_artifact(
+    path: String,
+) -> GuiResult<vocal_model::ModelArtifactInspection> {
+    tauri::async_runtime::spawn_blocking(move || {
+        vocal_model::inspect_model_artifact(path).map_err(crate::error::GuiError::from)
+    })
+    .await
+    .map_err(|error| crate::error::GuiError::Internal(error.to_string()))?
 }
 
 #[tauri::command]
@@ -70,6 +127,15 @@ pub async fn subscribe(
 }
 
 #[tauri::command]
+pub fn subscribe_preparation(
+    state: State<'_, AppState>,
+    window_label: String,
+    channel: Channel<BackendEvent>,
+) -> GuiResult<crate::preparation::PreparationStatus> {
+    state.attach_preparation_channel(window_label, channel)
+}
+
+#[tauri::command]
 pub async fn update_config(
     state: State<'_, AppState>,
     config: GuiConfig,
@@ -93,10 +159,19 @@ pub async fn prepare_tensorrt_pipeline(
 }
 
 #[tauri::command]
-pub async fn load_model(state: State<'_, AppState>, path: String) -> GuiResult<UiSnapshot> {
+pub async fn load_model(
+    state: State<'_, AppState>,
+    path: String,
+    selection: Option<vocal_runtime::ModelBackendSelection>,
+) -> GuiResult<UiSnapshot> {
     let state = state.inner().clone();
     let reporter = state.clone();
-    match tauri::async_runtime::spawn_blocking(move || state.load_model(path)).await {
+    match tauri::async_runtime::spawn_blocking(move || match selection {
+        Some(selection) => state.load_model_with_backend(path, Some(selection)),
+        None => state.load_model(path),
+    })
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             let error = crate::error::GuiError::Internal(error.to_string());

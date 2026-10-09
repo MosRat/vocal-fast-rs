@@ -1,6 +1,6 @@
 use crate::{
     error::{GuiError, GuiResult},
-    state::{UiMetrics, UiSnapshot},
+    state::UiSnapshot,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,21 +15,51 @@ use tauri::ipc::Channel;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum BackendEvent {
-    Snapshot { sequence: u64, payload: UiSnapshot },
-    Metrics { sequence: u64, payload: UiMetrics },
-    Error { sequence: u64, payload: ErrorReport },
+    ModelImport {
+        sequence: u64,
+        payload: vocal_runtime::model_library::ModelImportStatus,
+    },
+    Boot {
+        sequence: u64,
+        payload: crate::snapshot::UiBootStatus,
+    },
+    Snapshot {
+        sequence: u64,
+        payload: UiSnapshot,
+    },
+    Error {
+        sequence: u64,
+        payload: ErrorReport,
+    },
+    Preparation {
+        sequence: u64,
+        payload: crate::preparation::PreparationStatus,
+    },
 }
 
 impl BackendEvent {
-    pub fn snapshot(payload: UiSnapshot) -> Self {
-        Self::Snapshot {
+    pub fn model_import(payload: vocal_runtime::model_library::ModelImportStatus) -> Self {
+        Self::ModelImport {
+            sequence: 0,
+            payload,
+        }
+    }
+    pub fn boot(payload: crate::snapshot::UiBootStatus) -> Self {
+        Self::Boot {
             sequence: 0,
             payload,
         }
     }
 
-    pub fn metrics(payload: UiMetrics) -> Self {
-        Self::Metrics {
+    pub fn preparation(payload: crate::preparation::PreparationStatus) -> Self {
+        Self::Preparation {
+            sequence: 0,
+            payload,
+        }
+    }
+
+    pub fn snapshot(payload: UiSnapshot) -> Self {
+        Self::Snapshot {
             sequence: 0,
             payload,
         }
@@ -44,9 +74,11 @@ impl BackendEvent {
 
     fn with_sequence(self, sequence: u64) -> Self {
         match self {
+            Self::Boot { payload, .. } => Self::Boot { sequence, payload },
             Self::Snapshot { payload, .. } => Self::Snapshot { sequence, payload },
-            Self::Metrics { payload, .. } => Self::Metrics { sequence, payload },
             Self::Error { payload, .. } => Self::Error { sequence, payload },
+            Self::Preparation { payload, .. } => Self::Preparation { sequence, payload },
+            Self::ModelImport { payload, .. } => Self::ModelImport { sequence, payload },
         }
     }
 }
@@ -57,6 +89,8 @@ pub struct ErrorReport {
     pub code: String,
     pub message: String,
     pub recoverable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<crate::audio_error::AudioStartError>,
 }
 
 impl ErrorReport {
@@ -65,6 +99,10 @@ impl ErrorReport {
             code: error.code().into(),
             message: error.to_string(),
             recoverable: !matches!(error, GuiError::Internal(_)),
+            details: match error {
+                GuiError::AudioStartup(error) => Some(error.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -158,9 +196,15 @@ mod tests {
 
     #[test]
     fn event_shape_contains_sequence_and_payload() {
-        let value = serde_json::to_value(BackendEvent::metrics(UiMetrics::default()))
-            .expect("event serialization");
-        assert_eq!(value["type"], "metrics");
+        let value = serde_json::to_value(BackendEvent::boot(crate::snapshot::UiBootStatus {
+            revision: 0,
+            phase: crate::snapshot::BootPhase::Ready,
+            message: None,
+            elapsed_ms: 0,
+            recoverable: false,
+        }))
+        .expect("event serialization");
+        assert_eq!(value["type"], "boot");
         assert_eq!(value["sequence"], 0);
         assert!(value["payload"].is_object());
     }

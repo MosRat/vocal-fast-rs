@@ -5,7 +5,7 @@
 //! becoming coupled to the JSON shape consumed by the frontend.
 
 use serde::Serialize;
-use vocal_types::{LatencyMetrics, LifecycleState};
+use vocal_types::LifecycleState;
 
 use crate::{audio::AudioTelemetry, config::GuiConfig, events::ErrorReport};
 
@@ -24,11 +24,12 @@ pub struct UiSnapshot {
     pub config_revision: u64,
     pub last_config_update: vocal_runtime::ConfigUpdateKind,
     pub model: Option<ModelSummary>,
-    pub metrics: UiMetrics,
     pub engine: Option<UiEngineStatus>,
     pub last_error: Option<ErrorReport>,
     pub audio: AudioTelemetry,
     pub tensorrt_pipeline: TensorRtPipelineStatus,
+    pub preparation: crate::preparation::PreparationStatus,
+    pub model_restore_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -37,7 +38,6 @@ pub enum TensorRtPipelinePhase {
     #[default]
     Idle,
     CheckingCache,
-    Building,
     Ready,
     Failed,
 }
@@ -53,15 +53,15 @@ pub struct TensorRtPipelineStatus {
 }
 
 /// Application startup is intentionally separate from the runtime lifecycle.
-/// A model may still be restoring while the runtime itself is in `Created`,
-/// and the UI needs to represent that distinction without guessing from
-/// individual subsystem states.
+/// Ready means the shell and device/file catalogs are initialized. Model
+/// weights, cached plans and execution contexts belong to model preparation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BootPhase {
     Starting,
     RestoringConfig,
-    RestoringModel,
+    InitializingIo,
+    DetectingDevices,
     Ready,
     Failed,
     ShuttingDown,
@@ -70,6 +70,7 @@ pub enum BootPhase {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiBootStatus {
+    pub revision: u64,
     pub phase: BootPhase,
     pub message: Option<String>,
     pub elapsed_ms: u64,
@@ -85,40 +86,10 @@ pub struct UiStatus {
     pub audio: LifecycleState,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UiMetrics {
-    pub input_frames: u64,
-    pub processing_micros: u64,
-    pub output_frames: u64,
-}
-
-impl From<LatencyMetrics> for UiMetrics {
-    fn from(metrics: LatencyMetrics) -> Self {
-        Self {
-            input_frames: metrics.input_frames,
-            processing_micros: metrics.processing_micros,
-            output_frames: metrics.output_frames,
-        }
-    }
-}
-
-impl From<vocal_runtime::RuntimeMetrics> for UiMetrics {
-    fn from(metrics: vocal_runtime::RuntimeMetrics) -> Self {
-        Self {
-            input_frames: metrics.input_frames,
-            processing_micros: metrics.processing_micros,
-            output_frames: metrics.output_frames,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiEngineStatus {
     pub state: LifecycleState,
-    pub processed_chunks: u64,
-    pub failures: u64,
     pub last_error: Option<String>,
 }
 
@@ -126,8 +97,6 @@ impl From<vocal_runtime::RuntimeEngineStatus> for UiEngineStatus {
     fn from(status: vocal_runtime::RuntimeEngineStatus) -> Self {
         Self {
             state: status.state,
-            processed_chunks: status.processed_chunks,
-            failures: status.failures,
             last_error: status.last_error,
         }
     }

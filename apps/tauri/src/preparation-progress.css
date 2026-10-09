@@ -1,0 +1,21 @@
+.preparation-progress { margin: 14px 0 4px; padding: 15px 16px 12px; border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border)); border-radius: 10px; background: color-mix(in srgb, var(--accent) 7%, var(--surface-1)); box-shadow: inset 0 1px color-mix(in srgb, var(--accent) 10%, transparent); }
+.preparation-heading { display: flex; align-items: flex-start; gap: 11px; min-width: 0; }
+.preparation-heading > div { flex: 1; min-width: 0; }
+.preparation-heading strong { font-size: 13px; font-weight: 650; color: var(--text); }
+.preparation-heading p { margin: 5px 0 0; font-size: 11px; line-height: 1.55; color: var(--text-secondary); overflow-wrap: anywhere; }
+.preparation-mark { display: grid; place-items: center; width: 22px; height: 22px; flex: 0 0 auto; color: var(--accent); }
+.preparation-time { flex: 0 0 auto; font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+.preparation-cache { display: inline-block; margin-left: 9px; padding: 2px 6px; border-radius: 4px; color: var(--accent); background: var(--accent-soft); font-size: 10px; font-weight: 600; vertical-align: 1px; }
+.preparation-track { overflow: hidden; height: 5px; margin-top: 14px; border-radius: 4px; background: var(--surface-3); }
+.preparation-track > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); box-shadow: 0 0 9px color-mix(in srgb, var(--accent) 35%, transparent); }
+.preparation-track.is-counted > span { transition: width .3s ease; }
+.preparation-track.is-indeterminate > span { width: 38%; animation: preparation-slide 1.65s ease-in-out infinite; }
+.preparation-footnote { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 9px; color: var(--text-tertiary); font-size: 10px; line-height: 1.5; }
+.preparation-progress.is-ready { padding-block: 11px; background: color-mix(in srgb, var(--accent) 3%, var(--surface-1)); border-color: var(--border); }
+.preparation-progress.has-error { border-color: color-mix(in srgb, var(--danger, #e5484d) 45%, var(--border)); background: color-mix(in srgb, var(--danger, #e5484d) 7%, var(--surface-1)); }
+.preparation-progress.has-error .preparation-mark { color: var(--danger, #e5484d); }
+.button-spinner { display: inline-block; flex: 0 0 auto; width: 15px; height: 15px; border: 2px solid currentColor; border-right-color: transparent; border-bottom-color: transparent; border-radius: 50%; animation: preparation-spin .85s linear infinite; }
+.button[aria-busy="true"] { opacity: .85; }
+@keyframes preparation-spin { to { transform: rotate(360deg); } }
+@keyframes preparation-slide { from { transform: translateX(-110%); } to { transform: translateX(370%); } }
+@media (prefers-reduced-motion: reduce) { .button-spinner { animation: none; } .preparation-track.is-indeterminate > span { animation: none; width: 100%; opacity: .65; } .preparation-track.is-counted > span { transition: none; } }

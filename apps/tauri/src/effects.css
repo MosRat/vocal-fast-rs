@@ -37,21 +37,18 @@ html.splash-window body::before { display: none; }
   .titlebar,
   .sidebar,
   .workspace-tabs,
-  .panel,
-  .splash-card { backdrop-filter: none; }
+  .panel { backdrop-filter: none; }
   .titlebar { background: var(--surface-1); }
   .sidebar,
   .workspace-tabs,
-  .panel,
-  .splash-card { background: var(--surface-1); }
+  .panel { background: var(--surface-1); }
 }
 
 @supports not (backdrop-filter: blur(1px)) {
   .titlebar,
   .sidebar,
   .workspace-tabs,
-  .panel,
-  .splash-card { background: var(--surface-1); }
+  .panel { background: var(--surface-1); }
 }
 
 #app { position: relative; z-index: 1; }
@@ -104,6 +101,9 @@ html.splash-window body::before { display: none; }
 .settings-card p { margin: 4px 0 0; color: var(--text-tertiary); font-size: 11px; line-height: 1.45; }
 
 .settings-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--surface-1) 86%, transparent); box-shadow: inset 0 1px 0 var(--surface-highlight), var(--shadow-1); backdrop-filter: blur(18px); }
+.settings-toolbar-caption { min-width: 0; color: var(--text-secondary); }
+.settings-toolbar-caption strong { display: block; font-size: 11px; font-weight: 600; }
+.settings-toolbar-caption span { display: block; margin-top: 3px; color: var(--text-tertiary); font-size: 10px; }
 .settings-save-state { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .settings-save-state > div { min-width: 0; }
 .settings-save-state strong, .settings-save-state span { display: block; }
@@ -149,7 +149,6 @@ html.splash-window body::before { display: none; }
 .theme-button,
 .button,
 .panel,
-.metric,
 .headline-status {
   transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, color .18s ease, transform .18s ease;
 }
@@ -210,7 +209,6 @@ html.splash-window body::before { display: none; }
 }
 .panel > * { position: relative; z-index: 1; }
 .panel:hover { transform: translateY(-1px); box-shadow: var(--shadow-1), 0 12px 30px color-mix(in srgb, var(--accent) 5%, transparent), inset 0 1px 0 var(--surface-highlight); }
-.metric:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); background: color-mix(in srgb, var(--surface-2) 88%, var(--accent-soft)); transform: translateY(-1px); }
 
 .button { white-space: nowrap; box-shadow: 0 1px 0 var(--surface-highlight); }
 .button:hover:not(:disabled) { box-shadow: 0 5px 16px color-mix(in srgb, var(--accent) 14%, transparent), 0 1px 0 var(--surface-highlight); }
@@ -267,6 +265,5 @@ html.splash-window body::before { display: none; }
 
 @media (prefers-reduced-motion: reduce) {
   .panel:hover,
-  .metric:hover,
   .hero-panel:hover .orb-core { transform: none; }
 }

@@ -1,5 +1,27 @@
 import type { ConfigUpdateKind, Lifecycle, ThemePreference } from './types';
 
+export function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g,
+    (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character] ?? character);
+}
+
+/** Hide Windows verbatim prefixes in the UI; keep device and volume paths intact. */
+export function displayPath(path: string): string {
+  if (/^\\\\\?\\UNC\\/i.test(path)) return '\\\\' + path.slice(8);
+  if (/^\\\\\?\\[a-z]:\\/i.test(path)) return path.slice(4);
+  return path;
+}
+
+export function samePath(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalize = (path: string) => {
+    const readable = displayPath(path);
+    return /^[a-z]:[\\/]|^\\\\/i.test(readable)
+      ? readable.replaceAll('\\', '/').toLowerCase()
+      : readable;
+  };
+  return left != null && right != null && normalize(left) === normalize(right);
+}
+
 export function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
 }

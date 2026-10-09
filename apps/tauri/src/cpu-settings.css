@@ -1,0 +1,15 @@
+.cpu-settings { display: grid; gap: 14px; margin-top: 16px; }
+.cpu-settings-grid { display: grid; grid-template-columns: minmax(170px, 0.85fr) minmax(0, 1.4fr); gap: 16px; align-items: center; }
+.cpu-engine-summary { display: grid; gap: 5px; min-width: 0; }
+.cpu-engine-summary strong { font-size: 13px; }
+.cpu-engine-summary span, .cpu-model-note, .cpu-stream-note p { font-size: 12px; line-height: 1.55; color: var(--text-secondary); overflow-wrap: anywhere; }
+.cpu-toggle { display: flex; align-items: flex-start; gap: 9px; font-size: 12px; cursor: pointer; }
+.cpu-toggle input { margin-top: 3px; accent-color: var(--accent); }
+.cpu-toggle span { display: grid; gap: 3px; }
+.cpu-toggle small { font-size: 11px; line-height: 1.5; color: var(--text-secondary); }
+.cpu-stream-note { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-subtle, rgba(128,128,128,0.06)); }
+.cpu-stream-note strong { font-size: 12px; font-weight: 600; }
+.cpu-stream-note p, .cpu-model-note { margin: 5px 0 0; }
+.cpu-advanced summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+.cpu-advanced .field-label, .cpu-advanced .cpu-toggle { margin-top: 12px; }
+@media (max-width: 650px) { .cpu-settings-grid { grid-template-columns: 1fr; } }

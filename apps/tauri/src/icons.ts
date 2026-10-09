@@ -4,6 +4,7 @@ export type IconName =
   | 'stop'
   | 'sparkle'
   | 'folder'
+  | 'download'
   | 'refresh'
   | 'settings'
   | 'speaker'
@@ -32,6 +33,7 @@ const paths: Record<IconName, string> = {
     '<path d="m12 3 1.4 5.6L19 10l-5.6 1.4L12 17l-1.4-5.6L5 10l5.6-1.4L12 3Z"/><path d="m19 15 .6 2.4L22 18l-2.4.6L19 21l-.6-2.4L16 18l2.4-.6L19 15Z"/>',
   folder:
     '<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4l2 2H18.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5v-9Z"/>',
+  download:'<path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/>',
   refresh:
     '<path d="M20 11a8 8 0 0 0-14.9-4L3 10"/><path d="M3 5v5h5"/><path d="M4 13a8 8 0 0 0 14.9 4L21 14"/><path d="M21 19v-5h-5"/>',
   settings:

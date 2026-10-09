@@ -9,18 +9,24 @@ use thiserror::Error;
 pub enum GuiError {
     #[error("invalid GUI configuration: {0}")]
     InvalidConfig(String),
+    #[error("idle configuration update failed; previous settings remain active: {0}")]
+    ConfigUpdate(Box<GuiError>),
     #[error("configuration revision conflict: expected {expected}, actual {actual}")]
     ConfigConflict { expected: u64, actual: u64 },
     #[error("invalid application state for {action}: {state}")]
     InvalidState { state: String, action: String },
     #[error("model error: {0}")]
     Model(String),
+    #[error("{0}")]
+    ModelLibrary(vocal_runtime::model_library::LibraryError),
     #[error("engine error: {0}")]
     Engine(String),
     #[error("invalid audio input: {0}")]
     InvalidAudio(String),
     #[error("audio device error: {0}")]
     Audio(String),
+    #[error(transparent)]
+    AudioStartup(#[from] crate::audio_error::AudioStartError),
     #[error("audio device discovery error: {0}")]
     AudioDiscovery(String),
     #[error("I/O error at {path}: {message}")]
@@ -34,15 +40,30 @@ pub enum GuiError {
 }
 
 impl GuiError {
+    pub(crate) fn idle_update(error: vocal_runtime::RuntimeError) -> Self {
+        Self::idle_candidate(Self::from(error))
+    }
+
+    pub(crate) fn idle_candidate(cause: Self) -> Self {
+        if matches!(cause, Self::Engine(_)) {
+            Self::ConfigUpdate(Box::new(cause))
+        } else {
+            cause
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidConfig(_) => "invalid_config",
+            Self::ConfigUpdate(_) => "config_update_failed",
             Self::ConfigConflict { .. } => "config_conflict",
             Self::InvalidState { .. } => "invalid_state",
             Self::Model(_) => "model_error",
+            Self::ModelLibrary(_) => "model_library",
             Self::Engine(_) => "engine_error",
             Self::InvalidAudio(_) => "invalid_audio",
             Self::Audio(_) => "audio_error",
+            Self::AudioStartup(error) => error.kind.code(),
             Self::AudioDiscovery(_) => "audio_discovery_error",
             Self::Io { .. } => "io_error",
             Self::Binary(_) => "binary_error",

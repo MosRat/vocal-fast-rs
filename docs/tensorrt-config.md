@@ -46,6 +46,9 @@ RVC 目录中的 `.index` 文件会作为 `aux.retrieval.faiss` 写入 VFRM。�
 `ConversionConfig.index_ratio`。TensorRT pipeline 也可以显式调用
 `set_retrieval_ratio`，其设备地址在 CUDA Graph 捕获期间保持不变。
 
+GUI / Runtime 的 idle 更新、protect 范围、内部 plan 提交以及失败回滚见
+[Idle 引擎参数更新](idle-engine-reload.md)。
+
 库代码使用 `tracing`，不再用 `eprintln!` 输出运行诊断。CLI 在入口初始化 `tracing-subscriber`；可以用标准 `RUST_LOG` 过滤，例如：
 
 ```text

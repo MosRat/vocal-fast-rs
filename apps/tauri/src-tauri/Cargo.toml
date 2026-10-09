@@ -7,7 +7,9 @@ publish = false
 [workspace]
 
 [features]
-default = []
+cpu-graph = ["vocal-engine/cpu-graph", "vocal-runtime/cpu-graph"]
+default = ["directml", "cpu-graph"]
+directml = ["vocal-engine/directml", "vocal-runtime/directml"]
 tensorrt-rtx = ["vocal-engine/tensorrt-rtx", "vocal-runtime/tensorrt-rtx", "dep:vocal-tensorrt"]
 
 [lib]
@@ -48,6 +50,17 @@ codegen-units = 256
 [profile.dev.package."*"]
 opt-level = 1
 debug = false
+
+[profile.dev.package.vocal-model]
+opt-level = 2
+[profile.dev.package.vocal-cpu]
+opt-level = 2
+[profile.dev.package.vocal-graph]
+opt-level = 2
+[profile.dev.package.vocal-directml]
+opt-level = 2
+[profile.dev.package.vocal-tensorrt]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

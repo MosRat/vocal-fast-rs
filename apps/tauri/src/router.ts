@@ -11,11 +11,12 @@ export function navigate(route: ViewRoute, onNavigate: () => void): void {
   const nextHash = `#/${route}`;
   if (window.location.hash !== nextHash) window.history.pushState({ route }, '', nextHash);
   onNavigate();
-  requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+  requestAnimationFrame(() => document.querySelector<HTMLElement>('.content-scroll')?.scrollTo({ top: 0, behavior: 'instant' }));
 }
 
 export function routeCopy(route: ViewRoute): { title: string; description: string } {
   return {
+    models: {title:'A home for every voice.',description:'Edit model details, browse remote repositories and import complete portable models.'},
     studio: {
       title: 'Make every take sound like you.',
       description: 'Configure your voice chain, start the stream, and keep an eye on the audio path.',
@@ -29,8 +30,8 @@ export function routeCopy(route: ViewRoute): { title: string; description: strin
       description: 'Tune the conversion controls while keeping the stream safe to adjust.',
     },
     diagnostics: {
-      title: 'See every edge of the audio path.',
-      description: 'Track processing age, queue health, and device activity as the session runs.',
+      title: 'A clear view of your audio.',
+      description: 'Live latency, worker performance and queue health — one sample at a time.',
     },
     settings: {
       title: 'Make the workspace yours.',

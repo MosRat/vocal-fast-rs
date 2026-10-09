@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import struct
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -117,6 +119,9 @@ def validate(kind: str, graph: onnx.GraphProto) -> tuple[list[dict], list[dict]]
         required = {"Conv", "MatMul", "Softmax", "LayerNormalization"}
         if not required.issubset(ops):
             raise ValueError(f"HuBERT graph misses operators {sorted(required - ops)}")
+        feature = next(x for x in outputs if x["name"] == "features")
+        if len(inputs[0]["shape"]) != 2 or len(feature["shape"]) != 3 or feature["shape"][-1] != 768:
+            raise ValueError("acoustic conversion requires the complete layer-12/768 HuBERT export; attach v1 final_proj with --hubert-checkpoint")
     elif kind == "rmvpe":
         names = {x["name"] for x in inputs}
         if not {"waveform", "threshold"}.issubset(names) or not any(x["name"] == "pitchf" for x in outputs):
@@ -129,7 +134,34 @@ def validate(kind: str, graph: onnx.GraphProto) -> tuple[list[dict], list[dict]]
     return inputs, outputs
 
 
-def convert(kind: str, source: Path, output: Path) -> None:
+def hubert_projection(checkpoint: Path, tensors: list) -> list:
+    """Recover the trained RVC v1 head omitted by v2 ONNX feature exports.
+
+    Accept HF (including RVC's custom HF model) or fairseq checkpoints. Check
+    a shared learned parameter against the export to prevent mixing embedders.
+    """
+    import torch
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    state = state.get("model", state)
+    hf = "feature_projection.projection.weight" in state
+    projection_key = "feature_projection.projection.weight" if hf else "post_extract_proj.weight"
+    if projection_key not in state or "final_proj.weight" not in state or "final_proj.bias" not in state:
+        raise ValueError("HuBERT checkpoint must contain the learned final_proj weight and bias")
+    exported = next((t for t in tensors if t[0] == "hubert.model.feature_projection.projection.weight"), None)
+    expected = state[projection_key].float().numpy().T
+    if exported is None or exported[2] != list(expected.shape) or not np.array_equal(
+        np.frombuffer(exported[3], dtype="<f4").reshape(expected.shape), expected
+    ):
+        raise ValueError("HuBERT checkpoint feature projection does not match ONNX export; use the same checkpoint")
+    weight = state["final_proj.weight"].float().numpy()
+    bias = state["final_proj.bias"].float().numpy()
+    if weight.shape != (256, 768) or bias.shape != (256,) or not np.isfinite(weight).all() or not np.isfinite(bias).all():
+        raise ValueError("unsupported or non-finite HuBERT v1 final_proj layout")
+    return [("hubert.model.final_proj.weight", 5, [768, 256], np.ascontiguousarray(weight.T, dtype="<f4").tobytes()),
+            ("hubert.model.final_proj.bias", 5, [256], np.ascontiguousarray(bias, dtype="<f4").tobytes())]
+
+
+def convert(kind: str, source: Path, output: Path, hubert_checkpoint: Path | None = None) -> None:
     model = onnx.load(str(source), load_external_data=True)
     if model.opset_import and any(op.domain and op.domain != "ai.onnx" for op in model.opset_import):
         raise ValueError("custom ONNX domains are not accepted by acoustic VFRM")
@@ -184,6 +216,28 @@ def convert(kind: str, source: Path, output: Path) -> None:
         tensors.append((name, dtype_code(value), list(value.shape), value.tobytes(order="C")))
         tensor_map.append({"canonical": name, "source": initializer.name, "sha256": hashlib.sha256(value.tobytes()).hexdigest()})
 
+    if kind == "hubert":
+        layers = {int(t[0].split(".encoder.layers.")[1].split(".")[0])
+                  for t in tensors if ".encoder.layers." in t[0]}
+        if layers != set(range(12)):
+            raise ValueError("HuBERT template requires exactly twelve canonical encoder blocks")
+        # The v2 export contains all 12 encoder layers, but never executes or
+        # stores the v1 head. Attach its canonical parameters for handwritten
+        # builders; retain the original exported operator IR as provenance.
+        checkpoint = hubert_checkpoint or source.parent / "pytorch_model.bin"
+        if checkpoint.is_file():
+            for name, code, dims, data in hubert_projection(checkpoint, tensors):
+                existing = next((t for t in tensors if t[0] == name), None)
+                if existing is not None:
+                    if existing != (name, code, dims, data):
+                        raise ValueError(f"export and checkpoint disagree on {name}")
+                    continue
+                tensors.append((name, code, dims, data))
+                tensor_map.append({"canonical": name, "source": f"{checkpoint.name}#final_proj.{name.rsplit('.', 1)[-1]}",
+                                   "sha256": hashlib.sha256(data).hexdigest()})
+        elif hubert_checkpoint is not None:
+            raise FileNotFoundError(hubert_checkpoint)
+
     nodes = []
     for index, node in enumerate(graph.node):
         nodes.append({
@@ -221,6 +275,13 @@ def convert(kind: str, source: Path, output: Path) -> None:
         "tensor_map": tensor_map,
         "conversion": {"source": str(source), "external_data_loaded": True},
     }
+    if kind == "hubert":
+        metadata["rvc_feature_modes"] = [
+            {"version": version, "output_layer": layer, "feature_width": width,
+             "projection": "hubert.model.final_proj" if version == "v1" else None}
+            for version, layer, width in ([("v1", 9, 256), ("v2", 12, 768)]
+                if any(t[0] == "hubert.model.final_proj.weight" for t in tensors) else [("v2", 12, 768)])
+        ]
     config = json.dumps({"manifest": manifest, "metadata": metadata}, separators=(",", ":"), ensure_ascii=False).encode()
     directory_len = sum(8 + len(name.encode()) + 8 * len(shape_) + 16 for name, _, shape_, _ in tensors)
     data_offset = align(HEADER + len(config) + directory_len)
@@ -242,7 +303,18 @@ def convert(kind: str, source: Path, output: Path) -> None:
     raw += b"\0" * (data_offset - len(raw))
     for (_, _, _, data), offset in zip(tensors, offsets):
         raw += b"\0" * (offset - len(raw)) + data
-    output.write_bytes(raw)
+    # A failed conversion or an in-use file must not truncate a runtime asset.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=output.parent, suffix=".vfrm.tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     print(f"converted {kind}: {len(nodes)} nodes, {len(tensors)} tensors, {len(raw)} bytes -> {output}")
 
 
@@ -251,8 +323,12 @@ def main() -> int:
     parser.add_argument("--kind", choices=["hubert", "rmvpe"], required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--hubert-checkpoint", type=Path,
+                        help="HF/fairseq checkpoint with trained v1 final_proj; defaults to adjacent pytorch_model.bin")
     args = parser.parse_args()
-    convert(args.kind, args.input, args.output)
+    if args.hubert_checkpoint is not None and args.kind != "hubert":
+        parser.error("--hubert-checkpoint is only valid for HuBERT")
+    convert(args.kind, args.input, args.output, args.hubert_checkpoint)
     return 0
 
 

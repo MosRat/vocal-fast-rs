@@ -1,6 +1,29 @@
 export type Lifecycle = 'created' | 'loading' | 'ready' | 'running' | 'stopping' | 'stopped' | 'failed';
-export type BootPhase = 'starting' | 'restoringConfig' | 'restoringModel' | 'ready' | 'failed' | 'shuttingDown';
-export type Backend = 'passthrough' | 'rvcCpu' | 'tensorRtRtx';
+export type BootPhase = 'starting' | 'restoringConfig' | 'initializingIo' | 'detectingDevices' | 'ready' | 'failed' | 'shuttingDown';
+export type Backend = 'passthrough' | 'rvcCpu' | 'tensorRtRtx' | 'directMl';
+export interface ProcessingDevice {
+  id: string;
+  name: string;
+  vendorId: number;
+  dedicatedMemoryBytes: number;
+  sharedMemoryBytes: number;
+  available: boolean;
+  reason: string | null;
+  kind: 'gpu' | 'virtual' | 'remote' | 'software';
+}
+export interface ProcessingBackendCatalog {
+  recommended: Backend;
+  cpu?: { logicalProcessors: number; recommendedThreads: number; operatorVersion: string | null };
+  backends: Array<{
+    backend: Backend;
+    available: boolean;
+    reason: string | null;
+    device: string | null;
+    description: string;
+    devices: ProcessingDevice[];
+    recommendedDeviceId: string | null;
+  }>;
+}
 export type ConfigUpdateKind =
   | 'unchanged'
   | 'hotReload'
@@ -9,9 +32,9 @@ export type ConfigUpdateKind =
   | 'planBuildRequired'
   | 'loadModelRequired';
 export type ThemePreference = 'system' | 'light' | 'dark';
-export type WorkspaceRoute = 'studio' | 'audio' | 'tuning' | 'diagnostics';
+export type WorkspaceRoute = 'studio' | 'audio' | 'tuning' | 'diagnostics' | 'models';
 
-export const WORKSPACE_ROUTES: readonly WorkspaceRoute[] = ['studio', 'audio', 'tuning', 'diagnostics'];
+export const WORKSPACE_ROUTES: readonly WorkspaceRoute[] = ['studio', 'audio', 'tuning', 'diagnostics', 'models'];
 
 export function isWorkspaceRoute(value: string): value is WorkspaceRoute {
   return WORKSPACE_ROUTES.includes(value as WorkspaceRoute);
@@ -19,6 +42,7 @@ export function isWorkspaceRoute(value: string): value is WorkspaceRoute {
 
 export interface ConversionConfig {
   pitchSemitones: number;
+  autoPitch: { enabled: boolean; targetHz: number };
   indexRatio: number;
   protect: number;
   rmsMixRate: number;
@@ -51,6 +75,8 @@ export interface GuiConfig {
   outputFormat: { sampleRate: number; channels: number };
   conversion: ConversionConfig;
   backend: Backend;
+  backendAuto: boolean;
+  speakerId: number;
   modelPath: string | null;
   modelDirectory: string | null;
   inputDevice: string | null;
@@ -60,6 +86,16 @@ export interface GuiConfig {
   tensorrtArtifactsPath: string | null;
   tensorrtWindowSamples: number | null;
   tensorrt: TensorRtPipelineConfig;
+  cpu: CpuExecutionConfig;
+  directmlSourcesPath: string | null;
+  directmlDeviceId: string | null;
+}
+
+export interface CpuExecutionConfig {
+  threads: number;
+  spinWaitUs: number;
+  pinToPerformanceCores: boolean;
+  profile: boolean;
 }
 
 export interface AudioDeviceInfo {
@@ -80,11 +116,32 @@ export interface AudioDeviceCatalog {
 
 export type ModelArtifactKind = 'vfrm' | 'manifest';
 
+export interface ModelComponent {
+  present: boolean;
+  embedded: boolean;
+  tensorCount: number;
+  sizeBytes: number;
+  source: string | null;
+}
+export interface ModelComponents {
+  synth: ModelComponent;
+  speakerCount?: number | null;
+  hubert: ModelComponent;
+  rmvpe: ModelComponent;
+  retrieval: ModelComponent;
+  automaticTensorRt: boolean;
+}
+export interface ModelArtifactInspection {
+  path: string;
+  components: ModelComponents;
+}
+
 export interface ModelCatalogEntry {
   path: string;
   kind: ModelArtifactKind;
   sizeBytes: number;
   modifiedAtMs: number;
+  components: ModelComponents;
   id: string;
   displayName: string;
   architecture: string;
@@ -110,23 +167,74 @@ export interface AudioTelemetry {
   state: Lifecycle;
   inputDevice: string | null;
   outputDevice: string | null;
-  inputFrames: number;
-  outputFrames: number;
-  processingMicros: number;
-  failures: number;
-  underflowSamples: number;
-  queueOverflows: number;
-  latencyP95Micros: number | null;
+  sessionId: string | null;
+  sample: AudioSample | null;
   streamState: string;
+  route: AudioRouteInfo | null;
+}
+
+export interface DirectionTelemetry {
+  queueDropsPerSecond: number;
+  staleDropsPerSecond: number;
+  queuePeakBlocks: number;
+  callbackPeriodMs: number | null;
+  callbackJitterP95Ms: number | null;
+  endpointPaddingP95Ms: number | null;
+  streamLatencyMs: number | null;
+  clockDriftPpm: number | null;
+}
+
+export interface AudioSample {
+  sequence: number;
+  elapsedMs: number;
+  windowMs: number;
+  inputFramesPerSecond: number;
+  outputFramesPerSecond: number;
+  processingMs: number | null;
+  blockBudgetMs: number | null;
+  processingLoadPercent: number | null;
+  workerFailuresPerSecond: number;
+  underflowMsPerSecond: number;
+  audioAgeMs: number | null;
+  audioAgeP50Ms: number | null;
+  audioAgeP95Ms: number | null;
+  audioAgeP99Ms: number | null;
+  capture: DirectionTelemetry;
+  render: DirectionTelemetry;
+}
+
+export interface AudioRouteInfo {
+  backend: 'nativeWasapi' | 'cpal';
+  processingBatchFrames: number;
+  playbackPrefillMicros: number;
+  fallbackReason: string | null;
+  captureFormat: GuiConfig['inputFormat'];
+  renderFormat: GuiConfig['outputFormat'];
+  processingFormat: GuiConfig['inputFormat'];
+  conversionDelayMicros: number;
 }
 
 export interface ErrorReport {
   code: string;
   message: string;
   recoverable: boolean;
+  details?: AudioStartDetails;
+}
+
+export interface AudioStartDetails {
+  kind: 'deviceBusy' | 'deviceUnavailable' | 'permissionDenied' | 'serviceUnavailable' | 'unsupportedFormat' | 'initialization';
+  message: string;
+  backend: string;
+  direction: string | null;
+  deviceId: string | null;
+  deviceName: string | null;
+  hresult: string | null;
+  technicalDetails: string[];
+  suggestions: string[];
 }
 
 export interface BootStatus {
+  revision: number;
   phase: BootPhase;
   message: string | null;
   elapsedMs: number;
@@ -154,20 +262,23 @@ export interface Snapshot {
     featureDims: number;
     usesF0: boolean;
   } | null;
-  metrics: {
-    inputFrames: number;
-    processingMicros: number;
-    outputFrames: number;
-  };
   engine: {
     state: Lifecycle;
-    processedChunks: number;
-    failures: number;
     lastError: string | null;
   } | null;
   audio: AudioTelemetry;
   tensorrtPipeline: TensorRtPipelineStatus;
+  preparation: PreparationStatus;
   lastError: ErrorReport | null;
+  modelRestorePending: boolean;
+}
+
+/** Metadata only; savedModel is a selection, never a loaded engine. */
+export interface StartupResources {
+  audioDevices: AudioDeviceCatalog | null;
+  processingBackends: ProcessingBackendCatalog;
+  savedModel: { path: string; summary: NonNullable<Snapshot['model']>; components: ModelComponents } | null;
+  notices: string[];
 }
 
 export type TensorRtPipelinePhase = 'idle' | 'checkingCache' | 'building' | 'ready' | 'failed';
@@ -180,9 +291,22 @@ export interface TensorRtPipelineStatus {
 }
 
 export interface BackendEvent {
-  type: 'snapshot' | 'metrics' | 'error';
+  type: 'boot' | 'snapshot' | 'error' | 'preparation' | 'modelImport';
   sequence: number;
-  payload: Snapshot | Snapshot['metrics'] | ErrorReport;
+  payload: BootStatus | Snapshot | ErrorReport | PreparationStatus | import('./model-library-types').ModelImportStatus;
+}
+
+export type PreparationPhase = 'idle' | 'inspecting' | 'extracting' | 'loadingWeights' | 'checkingCache' | 'building' | 'publishing' | 'loadingEngine' | 'ready' | 'failed';
+export interface PreparationStatus {
+  operationId: number;
+  revision: number;
+  kind: 'loadModel' | 'prepareTensorRt' | 'updateConfig' | null;
+  phase: PreparationPhase;
+  message: string;
+  elapsedMs: number;
+  completedSteps: number;
+  totalSteps: number | null;
+  cacheHit: boolean;
 }
 
 export function defaultConfig(): GuiConfig {
@@ -192,11 +316,14 @@ export function defaultConfig(): GuiConfig {
     outputFormat: { sampleRate: 48000, channels: 1 },
     conversion: {
       pitchSemitones: 0,
+      autoPitch: { enabled: true, targetHz: 255 },
       indexRatio: 0,
       protect: 0.33,
       rmsMixRate: 1,
     },
     backend: 'passthrough',
+    backendAuto: true,
+    speakerId: 0,
     modelPath: null,
     modelDirectory: null,
     inputDevice: null,
@@ -205,6 +332,9 @@ export function defaultConfig(): GuiConfig {
     queueBlocks: 3,
     tensorrtArtifactsPath: null,
     tensorrtWindowSamples: null,
+    directmlSourcesPath: null,
+    directmlDeviceId: null,
+    cpu: { threads: 0, spinWaitUs: 0, pinToPerformanceCores: false, profile: false },
     tensorrt: {
       artifactsPath: null,
       hubertSource: null,

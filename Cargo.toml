@@ -7,14 +7,18 @@ members = [
     "crates/vocal-engine",
     "crates/vocal-runtime",
     "crates/vocal-tensorrt",
+    "crates/vocal-directml",
+    "crates/vocal-graph",
+    "crates/vocal-cpu",
     "crates/vocal-cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
-repository = "https://example.invalid/vocal-fast-rs"
+readme = "README.md"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -42,6 +46,15 @@ codegen-units = 256
 opt-level = 1
 debug = false
 
+# Model decoding and graph construction traverse hundreds of MiB of numeric
+# data. Keep those paths optimized even in an otherwise debuggable GUI/CLI.
+[profile.dev.package.vocal-model]
+opt-level = 2
+[profile.dev.package.vocal-directml]
+opt-level = 2
+[profile.dev.package.vocal-tensorrt]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -49,3 +62,8 @@ codegen-units = 16
 panic = "abort"
 strip = "symbols"
 debug = false
+
+[profile.dev.package.vocal-graph]
+opt-level = 2
+[profile.dev.package.vocal-cpu]
+opt-level = 2

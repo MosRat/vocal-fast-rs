@@ -18,8 +18,12 @@ models/shared/
 The files are downloaded from the `lj1995/VoiceConversionWebUI` Hugging Face
 repository. The exact URLs, revisions, byte sizes and SHA-256 values are kept
 in [`manifest.json`](manifest.json). The binary files are intentionally
-ignored by git; run `scripts/download-shared-models.ps1` to fetch or verify
-them.
+ignored by git; run the standard-library downloader to fetch or verify them:
+
+```powershell
+python scripts/download-shared-models.py
+python scripts/download-shared-models.py --verify-only
+```
 
 The current Rust baseline does not deserialize these PyTorch/ONNX files yet.
 They are prepared as real inputs for the HuBERT/RMVPE adapters and subsequent

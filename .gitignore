@@ -1,7 +1,27 @@
 /target
+/.vite/
+/.cache/
+*.tmp
+*.tmp-*.vfr
+*.plan
+*.engine
+*.trt
+*.pdb
+*.ilk
+*.dSYM/
+**/.DS_Store
 **/*.vfr
+**/*.vfrm
 models/*/*.pth
 models/*/*.index
+models/**/*.pth
+models/**/*.index
+models/**/*.vfr
+models/**/*.vfrm
+models/**/*.onnx
+models/**/*.onnx.data
+models/**/*.pt
+models/**/*.bin
 # Downloaded checkpoints and converter manifests used only for local parity runs.
 models/downloads/
 !models/fixture-rvc-v2/model.pth
@@ -27,3 +47,7 @@ apps/tauri/src-tauri/gen/
 
 # External reference checkouts used only for local parity tests.
 ref_repos/
+
+# Local parity reports and downloaded media.
+target/compare/
+target/test-assets/

@@ -43,13 +43,13 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
@@ -85,7 +85,7 @@ jobs:
           - DirectMl
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
@@ -94,14 +94,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: apps/tauri/package-lock.json
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
@@ -143,7 +143,7 @@ jobs:
           Copy-Item (Join-Path $target "windows-build/Release-$env:BACKEND/artifacts.json") (Join-Path $destination "vocal-fast-$env:TAG-$env:BACKEND-artifacts.json")
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-${{ matrix.backend }}-${{ needs.metadata.outputs.tag }}
           path: release-assets/*
@@ -163,7 +163,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --yes ca-certificates curl file git tar unzip zstd
 
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
 
@@ -176,7 +176,7 @@ jobs:
           bash scripts/download-tensorrt-rtx.sh
 
       - name: Upload TensorRT-RTX SDK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: tensorrt-rtx-sdk-${{ needs.metadata.outputs.tag }}
           path: tensorrt-sdk
@@ -190,7 +190,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
@@ -199,14 +199,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: apps/tauri/package-lock.json
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
@@ -215,7 +215,7 @@ jobs:
         run: pwsh -NoProfile -File scripts/setup-cuda-ci.ps1
 
       - name: Download TensorRT-RTX SDK artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.2
         with:
           name: tensorrt-rtx-sdk-${{ needs.metadata.outputs.tag }}
           path: ${{ runner.temp }}/tensorrt-rtx-sdk
@@ -267,7 +267,7 @@ jobs:
           Copy-Item (Join-Path $target "windows-build/Release-TensorRt/artifacts.json") (Join-Path $destination "vocal-fast-$env:TAG-TensorRt-artifacts.json")
 
       - name: Upload TensorRT package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-TensorRt-${{ needs.metadata.outputs.tag }}
           path: release-assets/*
@@ -281,7 +281,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: windows-*
           path: release-assets
@@ -292,7 +292,7 @@ jobs:
         run: sha256sum -- * > SHA256SUMS.txt
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}
           generate_release_notes: true

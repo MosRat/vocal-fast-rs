@@ -115,3 +115,37 @@ JavaScript actions use verified Node 24 releases: `checkout@v7.0.1`,
 `setup-node@v7.1.0`, `setup-python@v7.0.0`, `upload-artifact@v7.0.2`,
 `download-artifact@v8.0.2`, and `action-gh-release@v3.0.3`. The Rust toolchain
 action uses its upstream `stable` channel.
+
+## Verified hosted release
+
+Release [v0.1.6](https://github.com/MosRat/vocal-fast-rs/releases/tag/v0.1.6)
+was built entirely on GitHub-hosted runners. All packaging and publishing
+jobs in [run 38065657590](https://github.com/MosRat/vocal-fast-rs/actions/runs/38065657590)
+completed successfully. The Ubuntu container downloaded and verified the
+TensorRT-RTX 1.6.1.120 Windows SDK; the Windows runner installed signed CUDA
+13.4 compiler/development components and built the native graphs.
+
+| Installer | Enabled backends | Bytes |
+| --- | --- | ---: |
+| Cpu | CPU graph | 8,169,787 |
+| DirectMl | DirectML, CPU graph | 17,106,060 |
+| TensorRt | TensorRT-RTX, DirectML, CPU graph | 204,138,940 |
+
+All six downloaded installer/manifest assets matched `SHA256SUMS.txt`.
+Each installer was extracted and its runtime DLLs and license files checked
+against the build manifest. PE imports and delay imports had no unresolved
+dependencies beyond Windows system libraries. The TensorRT installer also
+passed a local silent installation, installed-file verification and uninstall
+in an isolated test directory. GPU inference was not executed on the hosted
+runners, which have no NVIDIA GPU.
+
+The `artifacts.json` executable hash describes the loose build output. Tauri
+temporarily changes `__TAURI_BUNDLE_TYPE_VAR_UNK` to
+`__TAURI_BUNDLE_TYPE_VAR_NSS` when embedding the executable in an NSIS
+installer, then restores the loose executable. Consequently their raw hashes
+differ. Restoring only this marker in an extracted copy made all three
+executable hashes match the manifests. Installer hashes need no normalization.
+
+Local validation also passed `cargo check --workspace --all-features`,
+`cargo test --workspace` (249 passed, 19 ignored), the TensorRT package tests
+(38 passed, 4 ignored), PowerShell script validation and actionlint.

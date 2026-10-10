@@ -185,42 +185,15 @@ fn target_os_is_windows() -> bool {
 }
 
 fn find_msvc_cl() -> Option<PathBuf> {
-    if let Some(value) = env::var_os("CXX") {
-        let candidate = PathBuf::from(value);
-        if candidate
+    // Reuse cc-rs discovery, including CXX overrides and VS installations
+    // nested under Community/Enterprise on hosted runners. nvcc must use the
+    // same host compiler as the C++ bridge, rather than a guessed VS version.
+    let compiler = cc::Build::new().cpp(true).get_compiler();
+    let path = compiler.path();
+    (compiler.is_like_msvc()
+        && path
             .file_stem()
             .is_some_and(|name| name.eq_ignore_ascii_case("cl"))
-            && candidate.exists()
-        {
-            return Some(candidate);
-        }
-    }
-    let roots = [
-        PathBuf::from(r"C:\Program Files\Microsoft Visual Studio"),
-        PathBuf::from(r"E:\VisualStudio"),
-    ];
-    for root in roots {
-        if let Ok(versions) = std::fs::read_dir(root) {
-            for version in versions.flatten() {
-                let candidate = version
-                    .path()
-                    .join(r"VC\Tools\MSVC")
-                    .join("14.51.36231")
-                    .join(r"bin\Hostx64\x64\cl.exe");
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-                if let Ok(tool_versions) = std::fs::read_dir(version.path().join(r"VC\Tools\MSVC"))
-                {
-                    for tool_version in tool_versions.flatten() {
-                        let candidate = tool_version.path().join(r"bin\Hostx64\x64\cl.exe");
-                        if candidate.exists() {
-                            return Some(candidate);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+        && path.is_file())
+    .then(|| path.to_path_buf())
 }

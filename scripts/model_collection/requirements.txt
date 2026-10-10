@@ -1,0 +1,6 @@
+huggingface-hub>=0.34,<2
+modelscope-hub==0.4.6
+# Acoustic conversion additionally uses the project's torch/numpy environment.
+onnx>=1.18,<2
+onnxscript>=0.5,<1
+transformers>=4.50,<5

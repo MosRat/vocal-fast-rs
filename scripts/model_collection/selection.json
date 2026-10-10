@@ -1,0 +1,50 @@
+{
+  "repository": "MosRat/vfrm-models",
+  "sources": [
+    {
+      "id": "hf-maobailing",
+      "provider": "hf",
+      "repo": "maotianchen/maobailing_rvc",
+      "files": ["maobailing_rvc.pth", "maobailing_rvc.index", "README.md", "LICENSE"],
+      "voices": [{"id": "maobailing", "name": "猫百灵 · 中文女声", "language": "zh", "checkpoint": "maobailing_rvc.pth", "index": "maobailing_rvc.index"}]
+    },
+    {
+      "id": "hf-malaysian",
+      "provider": "hf",
+      "repo": "fahmifauzi/rvc-malaysian-voices",
+      "files": ["suara_lelaki_1.pth", "suara_wanita_1.pth", "README.md"],
+      "voices": [
+        {"id": "malay-male-1", "name": "Suara Lelaki 1 · Malay male", "language": "ms", "checkpoint": "suara_lelaki_1.pth"},
+        {"id": "malay-female-1", "name": "Suara Wanita 1 · Malay female", "language": "ms", "checkpoint": "suara_wanita_1.pth"}
+      ]
+    },
+    {
+      "id": "hf-default-v2",
+      "provider": "hf",
+      "repo": "PhoenixStormJr/RVC-V2-default-voice",
+      "files": ["default.pth", "added_IVF511_Flat_nprobe_1_default_v2.index", "README.md"],
+      "voices": [{"id": "default-v2", "name": "RVC default voice v2", "language": "en", "checkpoint": "default.pth", "index": "added_IVF511_Flat_nprobe_1_default_v2.index"}]
+    },
+    {
+      "id": "ms-starrail-bailu",
+      "provider": "ms",
+      "repo": "NaClNeZn/RVC-Model",
+      "files": ["star-rail2.7/Bailu/bailu.pth", "README.md"],
+      "voices": [{"id": "starrail-bailu", "name": "白露 · Star Rail", "language": "zh", "checkpoint": "star-rail2.7/Bailu/bailu.pth"}]
+    },
+    {
+      "id": "hf-hubert",
+      "provider": "hf",
+      "repo": "lj1995/VoiceConversionWebUI",
+      "files": ["hubert_base/pytorch_model.bin", "hubert_base/config.json", "hubert_base/preprocessor_config.json", "README.md"],
+      "components": [{"kind": "hubert", "recipe": "hubert-hf-export", "inputs": ["hubert_base/pytorch_model.bin", "hubert_base/config.json", "hubert_base/preprocessor_config.json"], "seed_vfrm_sha256": "a84fed477f49a040d53b44b7c27184d711fb246d5f9119c7c046941aaee65c59"}]
+    },
+    {
+      "id": "hf-rmvpe-waveform",
+      "provider": "hf",
+      "repo": "wok000/weights_gpl",
+      "files": ["rmvpe/rmvpe_20231006.onnx", "README.md"],
+      "components": [{"kind": "rmvpe", "recipe": "waveform-onnx", "input": "rmvpe/rmvpe_20231006.onnx", "seed_vfrm_sha256": "462ee5494525ed1029abfad368abb56ca20285478e24aa846575ed400bff4734"}]
+    }
+  ]
+}

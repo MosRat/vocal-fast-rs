@@ -1,0 +1,210 @@
+{
+  "schema": "vocal-vfrm-sources-v1",
+  "repository": "MosRat/vfrm-models",
+  "sources": [
+    {
+      "id": "hf-maobailing",
+      "provider": "hf",
+      "repo": "maotianchen/maobailing_rvc",
+      "files": [
+        {
+          "path": "maobailing_rvc.pth",
+          "size": 55225035,
+          "sha256": "c386a153eace55a15cc50b02d102732fa08c1c6a144184be3424c2188a46867c"
+        },
+        {
+          "path": "maobailing_rvc.index",
+          "size": 92566459,
+          "sha256": "a9a17b93dc6d7d078d413dacf4c855e02685fa3000d5b64bf2bb1faa82ba43fa"
+        },
+        {
+          "path": "README.md",
+          "size": 2959,
+          "sha256": "6ba89f12c949377a5448054c76052ed563594c312a592056fc79845df99e9bf9"
+        },
+        {
+          "path": "LICENSE",
+          "size": 11305,
+          "sha256": "07c0d2e76f4b8dae48b3f69d7637913d071849639bdd8609257844dbfeb24b23"
+        }
+      ],
+      "voices": [
+        {
+          "id": "maobailing",
+          "name": "猫百灵 · 中文女声",
+          "language": "zh",
+          "checkpoint": "maobailing_rvc.pth",
+          "index": "maobailing_rvc.index"
+        }
+      ],
+      "revision": "e56357e07e6788617318733dce1e10eb92889633",
+      "license": "apache-2.0"
+    },
+    {
+      "id": "hf-malaysian",
+      "provider": "hf",
+      "repo": "fahmifauzi/rvc-malaysian-voices",
+      "files": [
+        {
+          "path": "suara_lelaki_1.pth",
+          "size": 55226939,
+          "sha256": "0df2030f9b18239727774b88ddbab2d69171af0473be4f8d103e7729e808226e"
+        },
+        {
+          "path": "suara_wanita_1.pth",
+          "size": 55226939,
+          "sha256": "d33ee456332849c4760245a7190c33b7fd104a8d24b19283945ecb996e2075e2"
+        },
+        {
+          "path": "README.md",
+          "size": 3333,
+          "sha256": "9e6543e02faf5d80d7edb32076fe1959933adc25ed90fcd1814a09698e38b5c6"
+        }
+      ],
+      "voices": [
+        {
+          "id": "malay-male-1",
+          "name": "Suara Lelaki 1 · Malay male",
+          "language": "ms",
+          "checkpoint": "suara_lelaki_1.pth"
+        },
+        {
+          "id": "malay-female-1",
+          "name": "Suara Wanita 1 · Malay female",
+          "language": "ms",
+          "checkpoint": "suara_wanita_1.pth"
+        }
+      ],
+      "revision": "5ceac1c1dea37142f46cf7949a389e18a7ef4a96",
+      "license": "mit"
+    },
+    {
+      "id": "hf-default-v2",
+      "provider": "hf",
+      "repo": "PhoenixStormJr/RVC-V2-default-voice",
+      "files": [
+        {
+          "path": "default.pth",
+          "size": 55223136,
+          "sha256": "c9d6b0ac7aa8df91917757894561cd690e5c4b66e97a9f92630c0a7257fbfccc"
+        },
+        {
+          "path": "added_IVF511_Flat_nprobe_1_default_v2.index",
+          "size": 63016939,
+          "sha256": "93e0fbf723992b5ff6a1af3cae4e15f3bbb1dd860880fbd76565be23549aa1b7"
+        },
+        {
+          "path": "README.md",
+          "size": 826,
+          "sha256": "f1ef241ada64f0daa1003e8615f5e9917c31def5cee528ba55e379eb5c99c93b"
+        }
+      ],
+      "voices": [
+        {
+          "id": "default-v2",
+          "name": "RVC default voice v2",
+          "language": "en",
+          "checkpoint": "default.pth",
+          "index": "added_IVF511_Flat_nprobe_1_default_v2.index"
+        }
+      ],
+      "revision": "22e4cd2b759f5da8cbfc2c0b05efc200fbfc4256",
+      "license": "mit"
+    },
+    {
+      "id": "ms-starrail-bailu",
+      "provider": "ms",
+      "repo": "NaClNeZn/RVC-Model",
+      "files": [
+        {
+          "path": "star-rail2.7/Bailu/bailu.pth",
+          "size": 57552902,
+          "sha256": "8a662f8c2155148bec3a73549c3cb4f6bd2781edd569b7497738d16f50697845"
+        },
+        {
+          "path": "README.md",
+          "size": 2604,
+          "sha256": "b25eb12526b83586c7971812354f136e40c8d3a2c9cbf2794df25ea1cbf1d6f6"
+        }
+      ],
+      "voices": [
+        {
+          "id": "starrail-bailu",
+          "name": "白露 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Bailu/bailu.pth"
+        }
+      ],
+      "revision": "master",
+      "license": "Apache License 2.0"
+    },
+    {
+      "id": "hf-hubert",
+      "provider": "hf",
+      "repo": "lj1995/VoiceConversionWebUI",
+      "files": [
+        {
+          "path": "hubert_base/pytorch_model.bin",
+          "size": 189206711,
+          "sha256": "cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5"
+        },
+        {
+          "path": "hubert_base/config.json",
+          "size": 1492,
+          "sha256": "0346950779dfb7f9316fa74ed846e2b8a22a08eedfdc5387b73f327cb1a4a7cf"
+        },
+        {
+          "path": "hubert_base/preprocessor_config.json",
+          "size": 225,
+          "sha256": "7c1976a680fb7acc757cd36fb08eef878fa36c70b4c9d2d595df9c608bbbbf0e"
+        },
+        {
+          "path": "README.md",
+          "size": 21,
+          "sha256": "3e0e15fa0c5cc81675bd69af8eb469d128a725c1a7bfc71f03b7877b7b650567"
+        }
+      ],
+      "components": [
+        {
+          "kind": "hubert",
+          "recipe": "hubert-hf-export",
+          "inputs": [
+            "hubert_base/pytorch_model.bin",
+            "hubert_base/config.json",
+            "hubert_base/preprocessor_config.json"
+          ],
+          "seed_vfrm_sha256": "a84fed477f49a040d53b44b7c27184d711fb246d5f9119c7c046941aaee65c59"
+        }
+      ],
+      "revision": "e6d0c1a17da07c33557852f9dfa2bd44cc75737d",
+      "license": "mit"
+    },
+    {
+      "id": "hf-rmvpe-waveform",
+      "provider": "hf",
+      "repo": "wok000/weights_gpl",
+      "files": [
+        {
+          "path": "rmvpe/rmvpe_20231006.onnx",
+          "size": 362003174,
+          "sha256": "84f0586308e36157f75b77c8591bf636d6719c0c4ba95f8faf3df479e7566219"
+        },
+        {
+          "path": "README.md",
+          "size": 183,
+          "sha256": "3343e16e05d5d2264ebb714cbc879586026109a416dff29d9f6e3820f67e3790"
+        }
+      ],
+      "components": [
+        {
+          "kind": "rmvpe",
+          "recipe": "waveform-onnx",
+          "input": "rmvpe/rmvpe_20231006.onnx",
+          "seed_vfrm_sha256": "462ee5494525ed1029abfad368abb56ca20285478e24aa846575ed400bff4734"
+        }
+      ],
+      "revision": "d1b578cfcdf944dd3910786f7604754c79234b36",
+      "license": "gpl-3.0"
+    }
+  ]
+}

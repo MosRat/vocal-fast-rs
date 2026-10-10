@@ -25,7 +25,7 @@ vocal-audio ── bounded callback queue ── vocal-engine
 
 ```powershell
 rtk cargo fmt --all -- --check
-rtk cargo test --workspace
+rtk cargo test --workspace --exclude vocal-cpu --exclude vocal-tensorrt
 rtk cargo run -p vocal-fast -- doctor
 rtk cargo run -p vocal-fast -- demo 8
 ```

@@ -12,6 +12,7 @@
 [CmdletBinding()]
 param(
     [switch]$Tauri,
+    [switch]$Cpu,
     [switch]$AllFeatures
 )
 
@@ -35,6 +36,9 @@ try {
 
     $workspaceArgs = @("--workspace")
     if (-not $AllFeatures) {
+        if (-not $Cpu) {
+            $workspaceArgs += @("--exclude", "vocal-cpu")
+        }
         $workspaceArgs += @("--exclude", "vocal-tensorrt")
     }
     Invoke-Checked cargo (@("check") + $workspaceArgs + @("--locked"))

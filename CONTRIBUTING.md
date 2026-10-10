@@ -8,10 +8,13 @@ core workspace.
 
 ```powershell
 cargo fmt --all -- --check
-cargo check --workspace --exclude vocal-tensorrt
-cargo test --workspace --exclude vocal-tensorrt
+cargo check --workspace --exclude vocal-cpu --exclude vocal-tensorrt
+cargo test --workspace --exclude vocal-cpu --exclude vocal-tensorrt
 git diff --check
 ```
+
+With the standalone oneDNN SDK installed, include the CPU backend with
+`scripts/verify.ps1 -Cpu`. TensorRT-RTX remains an explicit host-only check.
 
 If you have the TensorRT-RTX SDK and CUDA installed, also run the relevant
 TensorRT checks and record the SDK version and GPU in the pull request. DirectML

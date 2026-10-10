@@ -25,9 +25,9 @@ jobs:
       - name: Check repository whitespace
         run: git diff --check
       - name: Check core workspace
-        run: cargo check --workspace --exclude vocal-tensorrt --locked
+        run: cargo check --workspace --exclude vocal-cpu --exclude vocal-tensorrt --locked
       - name: Test core workspace
-        run: cargo test --workspace --exclude vocal-tensorrt --locked
+        run: cargo test --workspace --exclude vocal-cpu --exclude vocal-tensorrt --locked
 
   python-tools:
     name: Python tooling

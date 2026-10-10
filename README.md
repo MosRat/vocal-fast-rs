@@ -38,8 +38,8 @@ The core workspace can be checked without a GPU SDK:
 
 ```powershell
 cargo fmt --all -- --check
-cargo check --workspace --exclude vocal-tensorrt
-cargo test --workspace --exclude vocal-tensorrt
+cargo check --workspace --exclude vocal-cpu --exclude vocal-tensorrt
+cargo test --workspace --exclude vocal-cpu --exclude vocal-tensorrt
 cargo run -p vocal-fast -- doctor
 cargo run -p vocal-fast -- demo 8
 ```
@@ -51,8 +51,9 @@ pwsh -NoProfile -File scripts/verify.ps1
 pwsh -NoProfile -File scripts/verify.ps1 -Tauri
 ```
 
-Use `-AllFeatures` only on a host that has the optional TensorRT-RTX SDK. The
-normal check intentionally excludes that proprietary SDK so a clean checkout
+Use `-Cpu` when the standalone oneDNN SDK is installed. Use `-AllFeatures`
+only on a host that also has the optional TensorRT-RTX SDK. The normal check
+intentionally excludes both native GPU and oneDNN builds so a clean checkout
 can be verified on Linux, macOS, or Windows without vendor installations.
 
 To use the Python conversion and parity helpers, install the analysis

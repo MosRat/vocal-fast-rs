@@ -9,7 +9,7 @@ The repository publishes Windows installers from two workflows:
 2. `release.yml` listens for `v*.*.*` tags. It builds `Cpu` and `DirectMl`
    installers on `windows-latest`, uploads the installer and build manifest,
    creates `SHA256SUMS.txt`, and publishes the GitHub Release. TensorRT-RTX is
-   an optional package built on a self-hosted Windows runner.
+   an optional package built on GitHub-hosted runners.
 
 `release.yml` also accepts `workflow_dispatch` with `publish=false`, which runs
 both Windows packaging jobs without publishing a release. This is the smoke
@@ -19,12 +19,24 @@ The dispatch workflow explicitly starts `release.yml` after creating the tag.
 This is required because GitHub does not start a new workflow from events
 created with the default `GITHUB_TOKEN`.
 
-TensorRT-RTX is intentionally excluded from hosted runners. Its SDK and CUDA
-redistributables are not distributed by this repository. The optional package
-requires a self-hosted runner labeled `self-hosted`, `windows`, `x64`, and
-`trt-rtx`, with `TENSORRT_RTX_ROOT` (or one of its documented aliases) and
-`CUDA_PATH` configured. The build copies the SDK's `doc/Acknowledgements.txt`,
-`doc/README.txt`, `EULA.txt`, `LICENSE`, and `README` into the installer under
+TensorRT-RTX is downloaded in an Ubuntu container job and passed to a
+GitHub-hosted Windows runner as a one-day artifact. The Windows job installs
+CUDA 13.4 with `Jimver/cuda-toolkit@v0.2.36`, builds the application, and then
+discards the SDK artifact. Configure these repository variables:
+
+- `TENSORRT_RTX_DOWNLOAD_URL`: an authorized NVIDIA TensorRT-RTX archive URL.
+- `TENSORRT_RTX_DOWNLOAD_SHA256`: the exact SHA-256 of that archive.
+
+An optional `NVIDIA_API_KEY` repository secret is sent as a bearer token when
+the download endpoint requires it. The manual workflows accept
+`tensorrt_url` and `tensorrt_sha256` inputs, which override the repository
+variables. The URL must point to a `.zip`, `.tar.gz`, `.tgz`, or `.tar.zst`
+archive containing the Windows SDK layout (`bin/`, `include/`, `lib/`, and
+`doc/`). The downloader verifies the hash before extraction and checks the
+TensorRT runtime DLL, headers, import library, and notice files.
+
+The build copies the SDK's `doc/Acknowledgements.txt`, `doc/README.txt`,
+`EULA.txt`, `LICENSE`, and `README` into the installer under
 `licenses/tensorrt-rtx/` and `licenses/cuda/`. Enable this only when the
 applicable NVIDIA SDK and CUDA licenses permit that redistribution.
 
@@ -48,7 +60,8 @@ gh run watch
 ```
 
 To include the optional TensorRT-RTX package, use the dispatch workflow with
-the self-hosted runner enabled:
+the hosted download/build enabled. The repository variables described above
+must be configured first:
 
 ```powershell
 gh workflow run release-dispatch.yml --ref main `
@@ -64,7 +77,9 @@ set both boolean inputs explicitly:
 ```powershell
 gh workflow run release.yml --ref main `
   --field publish=false `
-  --field include_tensorrt=true
+  --field include_tensorrt=true `
+  --field tensorrt_url="$env:TENSORRT_RTX_DOWNLOAD_URL" `
+  --field tensorrt_sha256="$env:TENSORRT_RTX_DOWNLOAD_SHA256"
 gh run watch
 ```
 

@@ -61,8 +61,10 @@ SDK when necessary; `-DirectMlRoot` or `DIRECTML_ROOT` selects a supplied SDK.
 Debug deployment does not enable the native DML validation layer automatically;
 that remains controlled by `DirectMlConfig.debug_layer`.
 
-TensorRT-RTX packages are built only on a machine that has an authorized
-TensorRT-RTX and CUDA installation. The helper resolves
+TensorRT-RTX packages are built from an authorized TensorRT-RTX archive and a
+CUDA installation. In GitHub Actions the archive is downloaded and verified in
+an Ubuntu container, then CUDA is installed on the hosted Windows runner. For
+local builds, the helper resolves
 `TENSORRT_RTX_ROOT`/`TRT_RTX_ROOT`/`TENSORRT_ROOT`/`TRT_ROOT` and `CUDA_PATH`
 before copying the runtime DLLs. It also requires and stages the vendor notice
 files so the installer carries the applicable terms:

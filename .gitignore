@@ -51,3 +51,7 @@ ref_repos/
 # Local parity reports and downloaded media.
 target/compare/
 target/test-assets/
+
+# Temporary SDK staging used by the GitHub TensorRT-RTX download job.
+.tensorrt-download/
+tensorrt-sdk/

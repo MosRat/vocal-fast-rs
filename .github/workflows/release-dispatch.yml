@@ -22,10 +22,20 @@ on:
         default: false
         type: boolean
       include_tensorrt:
-        description: "Build the TensorRT-RTX package on the configured self-hosted runner"
+        description: "Download and build the TensorRT-RTX package on GitHub-hosted runners"
         required: true
         default: false
         type: boolean
+      tensorrt_url:
+        description: "Authorized TensorRT-RTX archive URL; blank uses repository variable"
+        required: false
+        default: ""
+        type: string
+      tensorrt_sha256:
+        description: "SHA-256 for the TensorRT-RTX archive; blank uses repository variable"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -132,4 +142,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           INCLUDE_TENSORRT: ${{ inputs.include_tensorrt }}
-        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" --field publish=true --field include_tensorrt="$INCLUDE_TENSORRT"
+          TENSORRT_URL: ${{ inputs.tensorrt_url || vars.TENSORRT_RTX_DOWNLOAD_URL }}
+          TENSORRT_SHA256: ${{ inputs.tensorrt_sha256 || vars.TENSORRT_RTX_DOWNLOAD_SHA256 }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" --field publish=true --field include_tensorrt="$INCLUDE_TENSORRT" --field tensorrt_url="$TENSORRT_URL" --field tensorrt_sha256="$TENSORRT_SHA256"

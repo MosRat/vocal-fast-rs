@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $cudaRoot = Join-Path $env:ProgramFiles 'NVIDIA GPU Computing Toolkit/CUDA/v13.4'
 $required = @(
-    'bin/nvcc.exe', 'include/cuda_runtime.h', 'include/cufft.h',
+    'bin/nvcc.exe', 'include/cuda_runtime.h', 'include/cufft.h', 'include/nvtx3/nvtx3.hpp',
     'lib/x64/cudart.lib', 'lib/x64/cufft.lib',
     'bin/x64/cudart64_13.dll', 'bin/x64/cufft64_12.dll'
 )
@@ -28,9 +28,10 @@ if (-not $ValidateOnly) {
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=NVIDIA Corporation') {
         throw "CUDA installer NVIDIA signature verification failed: $($signature.Status)"
     }
-    # Install compiler dependencies and cuFFT headers/import libraries too.
+    # Install compiler dependencies, cuFFT development files and the NVTX 3
+    # headers used by native Nsight annotations. NVTX adds no runtime DLL.
     # No display driver or unrelated inference libraries are installed.
-    $arguments = @('-s', 'nvcc_13.4', 'crt_13.4', 'nvvm_13.4', 'cudart_13.4', 'cufft_13.4', 'cufft_dev_13.4')
+    $arguments = @('-s', 'nvcc_13.4', 'crt_13.4', 'nvvm_13.4', 'cudart_13.4', 'cufft_13.4', 'cufft_dev_13.4', 'nvtx_13.4')
     $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -notin @(0, 3010)) { throw "CUDA installation failed: exit $($process.ExitCode)" }
 }

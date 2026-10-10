@@ -164,6 +164,8 @@ jobs:
 
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Download and verify TensorRT-RTX archive
         env:
@@ -274,7 +276,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: ${{ always() && (github.event_name == 'push' || inputs.publish == true) && needs.metadata.result == 'success' && needs.package.result == 'success' && (needs['package-tensorrt'].result == 'success' || needs['package-tensorrt'].result == 'skipped') }}
+    if: ${{ always() && (github.event_name == 'push' || inputs.publish == true) && needs.metadata.result == 'success' && needs.package.result == 'success' && (needs['package-tensorrt'].result == 'success' || (needs['package-tensorrt'].result == 'skipped' && !(github.event_name == 'workflow_dispatch' && inputs.include_tensorrt == true))) }}
     needs: [metadata, package, package-tensorrt]
     runs-on: ubuntu-latest
     steps:

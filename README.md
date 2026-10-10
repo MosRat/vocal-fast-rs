@@ -128,6 +128,9 @@ See [`docs/windows-runtime-packaging.md`](docs/windows-runtime-packaging.md)
 for the backend matrix, SDK discovery rules, runtime staging, and installer
 verification.
 
+GitHub release preparation and the tag-driven Windows packaging workflow are
+documented in [`docs/github-releases.md`](docs/github-releases.md).
+
 ## Tauri application
 
 The frontend is in `apps/tauri` and uses the same runtime configuration exposed

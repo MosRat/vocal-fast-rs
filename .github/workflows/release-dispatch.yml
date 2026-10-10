@@ -1,0 +1,118 @@
+name: release-dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact semver, optionally prefixed with v; blank uses the bump rule"
+        required: false
+        type: string
+      bump:
+        description: "Automatic bump when version is blank"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: "Validate and show the planned version without committing or tagging"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-dispatch-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare version and tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          current="$(python scripts/release-version.py read)"
+          if [[ -n "$INPUT_VERSION" ]]; then
+            version="$(python scripts/release-version.py normalize "$INPUT_VERSION")"
+          else
+            version="$(python scripts/release-version.py bump "$current" "$INPUT_BUMP")"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Current version: $current"
+          echo "Release version: $version"
+
+      - name: Apply synchronized version files
+        if: ${{ inputs.dry_run != true }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python scripts/release-version.py set "$VERSION"
+
+      - name: Refresh lockfiles
+        if: ${{ inputs.dry_run != true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo update --workspace --manifest-path Cargo.toml
+          cargo update --workspace --manifest-path apps/tauri/src-tauri/Cargo.toml
+
+      - name: Verify release metadata
+        if: ${{ inputs.dry_run != true }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python scripts/release-version.py verify --expected "$VERSION"
+
+      - name: Commit version files
+        if: ${{ inputs.dry_run != true }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "Release dispatch must run from main; selected $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock apps/tauri/package.json \
+            apps/tauri/package-lock.json \
+            apps/tauri/src-tauri/Cargo.toml apps/tauri/src-tauri/Cargo.lock \
+            apps/tauri/src-tauri/tauri.conf.json
+          git diff --cached --quiet || git commit -m "chore(release): prepare v$VERSION"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+
+      - name: Create release tag
+        if: ${{ inputs.dry_run != true }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git fetch --tags --force
+          if git show-ref --tags --verify --quiet "refs/tags/$TAG"; then
+            echo "tag already exists: $TAG" >&2
+            exit 1
+          fi
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"

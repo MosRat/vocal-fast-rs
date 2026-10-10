@@ -1,0 +1,118 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Windows ${{ matrix.backend }} package
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - Cpu
+          - DirectMl
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/tauri/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up PowerShell 7
+        uses: microsoft/setup-powershell@v2
+
+      - name: Set up frontend dependencies
+        working-directory: apps/tauri
+        run: npm ci
+
+      - name: Verify tag and manifest version
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:TAG.Substring(1)
+          python scripts/release-version.py verify --expected $version
+
+      - name: Build Windows release
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "vocal-fast-${{ matrix.backend }}"
+          pwsh -NoProfile -File scripts/build-windows.ps1 `
+            -Profile Release `
+            -Backend "${{ matrix.backend }}" `
+            -TargetDirectory $target
+
+      - name: Collect installer and build manifest
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "vocal-fast-$env:BACKEND"
+          $destination = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          $installer = Get-ChildItem (Join-Path $target "release/bundle/nsis") -Filter "*-setup.exe" -File | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer was not produced" }
+          Copy-Item $installer.FullName (Join-Path $destination "vocal-fast-$env:TAG-$env:BACKEND-setup.exe")
+          Copy-Item (Join-Path $target "windows-build/Release-$env:BACKEND/artifacts.json") (Join-Path $destination "vocal-fast-$env:TAG-$env:BACKEND-artifacts.json")
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.backend }}-${{ github.ref_name }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: release-assets
+        run: sha256sum -- * > SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: release-assets/*

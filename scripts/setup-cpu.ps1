@@ -9,4 +9,4 @@ if ($LASTEXITCODE -ne 0) { throw 'CPU operator SDK installation failed' }
 $sdk = Join-Path $CacheRoot 'onednn'
 if (-not (Test-Path (Join-Path $sdk 'include/oneapi/dnnl/dnnl.hpp'))) { throw 'CPU SDK headers missing' }
 Write-Output "CPU operator SDK: $sdk"
-Write-Output 'Override: VOCAL_CPU_ONEDNN_ROOT; build: rtk cargo build -p vocal-fast --features cpu-graph'
+Write-Output 'Override: VOCAL_CPU_ONEDNN_ROOT; build: cargo build -p vocal-fast --features cpu-graph'

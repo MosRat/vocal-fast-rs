@@ -61,6 +61,23 @@ SDK when necessary; `-DirectMlRoot` or `DIRECTML_ROOT` selects a supplied SDK.
 Debug deployment does not enable the native DML validation layer automatically;
 that remains controlled by `DirectMlConfig.debug_layer`.
 
+TensorRT-RTX packages are built only on a machine that has an authorized
+TensorRT-RTX and CUDA installation. The helper resolves
+`TENSORRT_RTX_ROOT`/`TRT_RTX_ROOT`/`TENSORRT_ROOT`/`TRT_ROOT` and `CUDA_PATH`
+before copying the runtime DLLs. It also requires and stages the vendor notice
+files so the installer carries the applicable terms:
+
+| SDK | Runtime files | Notice destination |
+| --- | --- | --- |
+| TensorRT-RTX | `tensorrt_rtx_1_6.dll`, `tensorrt_onnxparser_rtx_1_6.dll` | `licenses/tensorrt-rtx/` |
+| CUDA | `cudart64_*.dll`, `cufft64_*.dll` | `licenses/cuda/` |
+
+TensorRT-RTX notices are `doc/Acknowledgements.txt` and `doc/README.txt`;
+CUDA notices are `EULA.txt`, `LICENSE`, and `README`. The release manifest
+records their sizes and SHA-256 hashes. Do not enable TensorRT distribution on
+a runner unless the installed SDK licenses permit redistribution of these
+runtime files and notices.
+
 The Cargo build script places DML DLLs beside executables, tests and examples.
 The Windows helper additionally refreshes the loose executable's runtime files
 after building, even when Cargo reused a cached build script. Files whose hashes

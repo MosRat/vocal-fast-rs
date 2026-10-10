@@ -21,6 +21,11 @@ on:
         required: true
         default: false
         type: boolean
+      include_tensorrt:
+        description: "Build the TensorRT-RTX package on the configured self-hosted runner"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -126,4 +131,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
-        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" --field publish=true
+          INCLUDE_TENSORRT: ${{ inputs.include_tensorrt }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" --field publish=true --field include_tensorrt="$INCLUDE_TENSORRT"

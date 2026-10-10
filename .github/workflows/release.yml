@@ -11,6 +11,11 @@ on:
         required: true
         default: false
         type: boolean
+      include_tensorrt:
+        description: "Build the TensorRT-RTX package on a configured self-hosted runner"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -135,10 +140,89 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  package-tensorrt:
+    name: Windows TensorRt package
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_tensorrt == true }}
+    needs: metadata
+    runs-on: [self-hosted, windows, x64, trt-rtx]
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/tauri/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up frontend dependencies
+        working-directory: apps/tauri
+        run: npm ci
+
+      - name: Verify TensorRT and CUDA SDKs
+        shell: pwsh
+        run: |
+          if (-not $env:TENSORRT_RTX_ROOT -and -not $env:TRT_RTX_ROOT -and -not $env:TENSORRT_ROOT -and -not $env:TRT_ROOT) {
+            throw "Configure TENSORRT_RTX_ROOT (or TRT_RTX_ROOT/TENSORRT_ROOT/TRT_ROOT) on the self-hosted runner."
+          }
+          if (-not $env:CUDA_PATH) { throw "Configure CUDA_PATH on the self-hosted runner." }
+
+      - name: Verify tag and manifest version
+        shell: pwsh
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          $version = $env:TAG.Substring(1)
+          python scripts/release-version.py verify --expected $version
+
+      - name: Build Windows TensorRT-RTX release
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "vocal-fast-TensorRt"
+          pwsh -NoProfile -File scripts/build-windows.ps1 `
+            -Profile Release `
+            -Backend TensorRt `
+            -TargetDirectory $target
+
+      - name: Collect TensorRT installer and build manifest
+        shell: pwsh
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "vocal-fast-TensorRt"
+          $destination = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          $installer = Get-ChildItem (Join-Path $target "release/bundle/nsis") -Filter "*-setup.exe" -File | Select-Object -First 1
+          if (-not $installer) { throw "NSIS TensorRT installer was not produced" }
+          Copy-Item $installer.FullName (Join-Path $destination "vocal-fast-$env:TAG-TensorRt-setup.exe")
+          Copy-Item (Join-Path $target "windows-build/Release-TensorRt/artifacts.json") (Join-Path $destination "vocal-fast-$env:TAG-TensorRt-artifacts.json")
+
+      - name: Upload TensorRT package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-TensorRt-${{ needs.metadata.outputs.tag }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish GitHub Release
-    if: ${{ github.event_name == 'push' || inputs.publish == true }}
-    needs: [metadata, package]
+    if: ${{ always() && (github.event_name == 'push' || inputs.publish == true) && needs.metadata.result == 'success' && needs.package.result == 'success' && (needs['package-tensorrt'].result == 'success' || needs['package-tensorrt'].result == 'skipped') }}
+    needs: [metadata, package, package-tensorrt]
     runs-on: ubuntu-latest
     steps:
       - name: Download package artifacts

@@ -91,6 +91,8 @@ try {
     $runtimeFiles = @()
     $noticeFiles = @()
     $cpuNoticeFiles = @()
+    $trtNoticeFiles = @()
+    $cudaNoticeFiles = @()
     $resources = [ordered]@{}
     if ($features -contains "cpu-graph") {
         $defaultCpuRoot = Join-Path $env:LOCALAPPDATA "vocal-fast/cpu-operators/onednn"
@@ -117,6 +119,18 @@ try {
         $env:TENSORRT_RTX_ROOT = $TensorRtRoot
         $env:CUDA_PATH = $CudaRoot
         $env:VOCAL_TRT_COPY_DLLS = "1"
+        foreach ($relative in @("doc/Acknowledgements.txt", "doc/README.txt")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $TensorRtRoot $relative))) {
+                throw "TensorRT-RTX notice file missing: $relative in $TensorRtRoot"
+            }
+            $trtNoticeFiles += Get-Item -LiteralPath (Join-Path $TensorRtRoot $relative)
+        }
+        foreach ($name in @("EULA.txt", "LICENSE", "README")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $CudaRoot $name))) {
+                throw "CUDA notice file missing: $name in $CudaRoot"
+            }
+            $cudaNoticeFiles += Get-Item -LiteralPath (Join-Path $CudaRoot $name)
+        }
         # Never bundle all DLLs left in a previous target directory. These are
         # the linked runtime dependencies; weights and plans stay user-managed.
         foreach ($name in @("tensorrt_rtx_1_6.dll", "tensorrt_onnxparser_rtx_1_6.dll")) {
@@ -198,6 +212,16 @@ try {
         Copy-RuntimeFile $file.FullName (Join-Path $stageDir $relative)
         $resources["$stageResourcePath/$relative"] = $relative
     }
+    foreach ($file in $trtNoticeFiles) {
+        $relative = "licenses/tensorrt-rtx/$($file.Name)"
+        Copy-RuntimeFile $file.FullName (Join-Path $stageDir $relative)
+        $resources["$stageResourcePath/$relative"] = $relative
+    }
+    foreach ($file in $cudaNoticeFiles) {
+        $relative = "licenses/cuda/$($file.Name)"
+        Copy-RuntimeFile $file.FullName (Join-Path $stageDir $relative)
+        $resources["$stageResourcePath/$relative"] = $relative
+    }
 
     $overridePath = Join-Path $reportDir "tauri.runtime.conf.json"
     @{ bundle = @{ resources = $resources } } |
@@ -227,6 +251,12 @@ try {
     foreach ($file in $cpuNoticeFiles) {
         Copy-RuntimeFile $file.FullName (Join-Path $outputDir "licenses/cpu/$($file.Name)")
     }
+    foreach ($file in $trtNoticeFiles) {
+        Copy-RuntimeFile $file.FullName (Join-Path $outputDir "licenses/tensorrt-rtx/$($file.Name)")
+    }
+    foreach ($file in $cudaNoticeFiles) {
+        Copy-RuntimeFile $file.FullName (Join-Path $outputDir "licenses/cuda/$($file.Name)")
+    }
     $artifacts = @((Get-Item -LiteralPath $binaryPath))
     if (-not $NoBundle) {
         $installers = @(Get-ChildItem -LiteralPath (Join-Path $outputDir "bundle/nsis") -Filter '*-setup.exe' -File)
@@ -243,6 +273,9 @@ try {
             @{ path = $_.FullName; bytes = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
         })
         runtimeFiles = @($runtimeFiles | ForEach-Object {
+            @{ name = $_.Name; bytes = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+        })
+        licenseFiles = @($noticeFiles + $cpuNoticeFiles + $trtNoticeFiles + $cudaNoticeFiles | ForEach-Object {
             @{ name = $_.Name; bytes = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
         })
         resourceDestinations = @($resources.Values)

@@ -8,7 +8,8 @@ The repository publishes Windows installers from two workflows:
    creates the matching annotated `vX.Y.Z` tag.
 2. `release.yml` listens for `v*.*.*` tags. It builds `Cpu` and `DirectMl`
    installers on `windows-latest`, uploads the installer and build manifest,
-   creates `SHA256SUMS.txt`, and publishes the GitHub Release.
+   creates `SHA256SUMS.txt`, and publishes the GitHub Release. TensorRT-RTX is
+   an optional package built on a self-hosted Windows runner.
 
 `release.yml` also accepts `workflow_dispatch` with `publish=false`, which runs
 both Windows packaging jobs without publishing a release. This is the smoke
@@ -19,8 +20,13 @@ This is required because GitHub does not start a new workflow from events
 created with the default `GITHUB_TOKEN`.
 
 TensorRT-RTX is intentionally excluded from hosted runners. Its SDK and CUDA
-redistributables are not distributed by this repository; TensorRT packages are
-built locally with `scripts/build-windows.ps1 -Backend TensorRt`.
+redistributables are not distributed by this repository. The optional package
+requires a self-hosted runner labeled `self-hosted`, `windows`, `x64`, and
+`trt-rtx`, with `TENSORRT_RTX_ROOT` (or one of its documented aliases) and
+`CUDA_PATH` configured. The build copies the SDK's `doc/Acknowledgements.txt`,
+`doc/README.txt`, `EULA.txt`, `LICENSE`, and `README` into the installer under
+`licenses/tensorrt-rtx/` and `licenses/cuda/`. Enable this only when the
+applicable NVIDIA SDK and CUDA licenses permit that redistribution.
 
 ## Validate without publishing
 
@@ -38,6 +44,27 @@ To exercise the Windows packaging matrix without creating a tag or release:
 
 ```powershell
 gh workflow run release.yml --ref main --field publish=false
+gh run watch
+```
+
+To include the optional TensorRT-RTX package, use the dispatch workflow with
+the self-hosted runner enabled:
+
+```powershell
+gh workflow run release-dispatch.yml --ref main `
+  --field bump=patch `
+  --field include_tensorrt=true `
+  --field dry_run=false
+gh run watch
+```
+
+For a packaging smoke test without publishing, run `release.yml` directly and
+set both boolean inputs explicitly:
+
+```powershell
+gh workflow run release.yml --ref main `
+  --field publish=false `
+  --field include_tensorrt=true
 gh run watch
 ```
 

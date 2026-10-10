@@ -209,12 +209,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: "13.4.0"
-          method: local
-          sub-packages: '["nvcc","cudart","cufft","visual_studio_integration"]'
-          use-github-cache: true
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/setup-cuda-ci.ps1
 
       - name: Download TensorRT-RTX SDK artifact
         uses: actions/download-artifact@v4

@@ -10,6 +10,10 @@ The repository publishes Windows installers from two workflows:
    installers on `windows-latest`, uploads the installer and build manifest,
    creates `SHA256SUMS.txt`, and publishes the GitHub Release.
 
+`release.yml` also accepts `workflow_dispatch` with `publish=false`, which runs
+both Windows packaging jobs without publishing a release. This is the smoke
+test path for changes to the packaging workflow.
+
 TensorRT-RTX is intentionally excluded from hosted runners. Its SDK and CUDA
 redistributables are not distributed by this repository; TensorRT packages are
 built locally with `scripts/build-windows.ps1 -Backend TensorRt`.
@@ -23,6 +27,13 @@ next version without changing the branch or creating a tag:
 gh workflow run release-dispatch.yml --ref main `
   --field bump=patch `
   --field dry_run=true
+gh run watch
+```
+
+To exercise the Windows packaging matrix without creating a tag or release:
+
+```powershell
+gh workflow run release.yml --ref main --field publish=false
 gh run watch
 ```
 

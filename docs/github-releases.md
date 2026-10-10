@@ -22,8 +22,9 @@ created with the default `GITHUB_TOKEN`.
 TensorRT-RTX is downloaded in an Ubuntu container job and passed to a
 GitHub-hosted Windows runner as a one-day artifact. The Windows job installs
 CUDA 13.4 with `scripts/setup-cuda-ci.ps1`, verifies the installer's NVIDIA
-Authenticode signature, installs nvcc/compiler dependencies and cudart/cuFFT
-development files, and builds the application. The SDK artifact expires after
+Authenticode signature, installs nvcc/compiler dependencies, cudart/cuFFT
+development files and NVTX 3 headers, and builds the application. NVTX is
+header-only and adds no runtime DLL. The SDK artifact expires after
 one day. Configure these repository variables:
 
 - `TENSORRT_RTX_DOWNLOAD_URL`: an authorized NVIDIA TensorRT-RTX archive URL.
@@ -110,5 +111,7 @@ python scripts/release-version.py bump 0.1.0 patch
 python scripts/release-version.py verify --expected 0.1.0
 ```
 
-All workflow actions use versioned major releases (`checkout@v4`, setup
-actions `@v4`/`@v5`, artifact actions `@v4`, and `action-gh-release@v2`).
+JavaScript actions use verified Node 24 releases: `checkout@v7.0.1`,
+`setup-node@v7.1.0`, `setup-python@v7.0.0`, `upload-artifact@v7.0.2`,
+`download-artifact@v8.0.2`, and `action-gh-release@v3.0.3`. The Rust toolchain
+action uses its upstream `stable` channel.

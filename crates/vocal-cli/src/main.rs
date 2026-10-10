@@ -26,6 +26,7 @@ mod cli_config;
 mod cli_error;
 mod cli_logging;
 mod cli_state;
+mod model_command;
 mod offline_command;
 
 use cli_config::CliConfig;
@@ -35,6 +36,9 @@ use cli_state::CliStatus;
 fn usage() {
     eprintln!(
         "vocal-fast baseline\n\nCommands:\n  doctor\n  model inspect <manifest.json>\n  model inspect-cache <model.vfr>\n  model pack <model-dir> <manifest.json> <output.vfr>\n  model pack-rvc <model-dir> <manifest.json> <output.vfr>\n  model convert-pth <model-dir> <manifest.json> <checkpoint.pth> <output.vfr>\n  model convert-onnx <model-dir> <manifest.json> <model.onnx> <output.vfr>\n  model build-graph <model.vfr> <output.graph.json>\n  model compile-trt <model.vfr> <output.plan> [source.onnx]\n  model compile-trt-pipeline <model.vfr> <hubert.onnx> <rmvpe.onnx> <output-dir>\n  model test-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model run-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> <output.wav>\n  model test-pipeline <passthrough|cpu|tensorrt|directml> <model.vfr> <input.wav|input.f32> [pipeline.json]\n  model run-pipeline <passthrough|cpu|tensorrt|directml> <model.vfr> <input.wav|input.f32> <output.wav> [pipeline.json]\n  model profile-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32>\n  model compare-trt-pipeline <pipeline.json> <model.vfr> <input.wav|input.f32> [iterations]\n  model test-trt <output.plan> [model.vfr]\n  demo [blocks]\n"
+    );
+    eprintln!(
+        "  model convert <input.pth|onnx> <output.vfrm> [--manifest file] [--index file] [--name name] [--id id] [--source url] [--provenance json] [--library-info json]\n  model bundle <synth.vfrm> <hubert.vfrm> <rmvpe.vfrm> <output.vfrm>\n  model describe <model.vfrm>\n  model verify <model.vfrm>"
     );
     eprintln!("  model benchmark-trt <output.plan> <input.vin> <output.bin> [iterations]");
     eprintln!(
@@ -78,6 +82,15 @@ fn main() -> ExitCode {
 fn run(args: Vec<String>) -> CliResult<()> {
     let cli_config = CliConfig::default();
     match args.as_slice() {
+        [command, subcommand, arguments @ ..]
+            if command == "model"
+                && matches!(
+                    subcommand.as_str(),
+                    "convert" | "bundle" | "describe" | "verify"
+                ) =>
+        {
+            model_command::run(subcommand, arguments)
+        }
         [command] if command == "doctor" => doctor(),
         [command, subcommand, synth, hubert, rmvpe, output]
             if command == "model" && subcommand == "prepare-dml" =>

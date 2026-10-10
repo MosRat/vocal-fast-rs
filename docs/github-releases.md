@@ -37,10 +37,13 @@ archive containing the Windows SDK layout (`bin/`, `include/`, `lib/`, and
 `doc/`). The downloader verifies the hash before extraction and checks the
 TensorRT runtime DLL, headers, import library, and notice files.
 
-The build copies the SDK's `doc/Acknowledgements.txt`, `doc/README.txt`,
-`EULA.txt`, `LICENSE`, and `README` into the installer under
-`licenses/tensorrt-rtx/` and `licenses/cuda/`. Enable this only when the
-applicable NVIDIA SDK and CUDA licenses permit that redistribution.
+The build copies the TensorRT SDK's `doc/Acknowledgements.txt` and
+`doc/README.txt` into `licenses/tensorrt-rtx/`. Hosted CUDA installations
+bundle NVIDIA's official CUDA EULA page as `licenses/cuda/EULA.html`, with a
+`README` recording the toolkit version and license source. Local builds with
+the full CUDA toolkit copy its `EULA.txt`, `LICENSE`, and `README` instead.
+The installer also includes oneDNN and DirectML notices for the enabled
+backends. Enable redistribution only when the applicable SDK licenses permit it.
 
 ## Validate without publishing
 

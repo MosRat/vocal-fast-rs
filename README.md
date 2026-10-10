@@ -71,6 +71,18 @@ packages, and generated WAV files stay outside Git. See
 
 ## RVC model contract
 
+Convert a real RVC checkpoint with the SDK-independent CLI:
+
+```powershell
+cargo run -p vocal-fast -- model convert voice.pth voice.vfrm --index voice.index
+cargo run -p vocal-fast -- model bundle voice.vfrm hubert.vfrm rmvpe.vfrm complete.vfrm
+```
+
+Preconverted voices and shared acoustic weights are available at
+[MosRat/vfrm-models](https://modelscope.cn/models/MosRat/vfrm-models). See
+[`docs/model-collection.md`](docs/model-collection.md) for HF/ModelScope search,
+pinned acquisition, conversion, validation, licensing and publishing commands.
+
 VFRM is the source-independent intermediate format. Conversion from PTH or ONNX
 normalizes tensor names, layouts, dtypes, and metadata before any backend sees
 the model.

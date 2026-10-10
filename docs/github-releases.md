@@ -21,8 +21,10 @@ created with the default `GITHUB_TOKEN`.
 
 TensorRT-RTX is downloaded in an Ubuntu container job and passed to a
 GitHub-hosted Windows runner as a one-day artifact. The Windows job installs
-CUDA 13.4 with `Jimver/cuda-toolkit@v0.2.36`, builds the application, and then
-discards the SDK artifact. Configure these repository variables:
+CUDA 13.4 with `scripts/setup-cuda-ci.ps1`, verifies the installer's NVIDIA
+Authenticode signature, installs nvcc/compiler dependencies and cudart/cuFFT
+development files, and builds the application. The SDK artifact expires after
+one day. Configure these repository variables:
 
 - `TENSORRT_RTX_DOWNLOAD_URL`: an authorized NVIDIA TensorRT-RTX archive URL.
 - `TENSORRT_RTX_DOWNLOAD_SHA256`: the exact SHA-256 of that archive.

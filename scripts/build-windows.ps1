@@ -125,11 +125,14 @@ try {
             }
             $trtNoticeFiles += Get-Item -LiteralPath (Join-Path $TensorRtRoot $relative)
         }
-        foreach ($name in @("EULA.txt", "LICENSE", "README")) {
-            if (-not (Test-Path -LiteralPath (Join-Path $CudaRoot $name))) {
-                throw "CUDA notice file missing: $name in $CudaRoot"
+        if ($env:CUDA_NOTICE_ROOT) {
+            foreach ($name in @('EULA.html', 'README')) {
+                $cudaNoticeFiles += Get-Item -LiteralPath (Join-Path $env:CUDA_NOTICE_ROOT $name)
             }
-            $cudaNoticeFiles += Get-Item -LiteralPath (Join-Path $CudaRoot $name)
+        } else {
+            foreach ($name in @('EULA.txt', 'LICENSE', 'README')) {
+                $cudaNoticeFiles += Get-Item -LiteralPath (Join-Path $CudaRoot $name)
+            }
         }
         # Never bundle all DLLs left in a previous target directory. These are
         # the linked runtime dependencies; weights and plans stay user-managed.

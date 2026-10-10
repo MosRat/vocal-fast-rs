@@ -11,8 +11,7 @@ $cudaRoot = Join-Path $env:ProgramFiles 'NVIDIA GPU Computing Toolkit/CUDA/v13.4
 $required = @(
     'bin/nvcc.exe', 'include/cuda_runtime.h', 'include/cufft.h',
     'lib/x64/cudart.lib', 'lib/x64/cufft.lib',
-    'bin/x64/cudart64_13.dll', 'bin/x64/cufft64_12.dll',
-    'EULA.txt', 'LICENSE', 'README'
+    'bin/x64/cudart64_13.dll', 'bin/x64/cufft64_12.dll'
 )
 
 if (-not $ValidateOnly) {
@@ -41,6 +40,20 @@ foreach ($relative in $required) {
         throw "CUDA SDK is missing $relative in $cudaRoot"
     }
 }
+# The hosted CUDA installer does not consistently copy the top-level notices
+# that exist in the full local toolkit. Keep the distributed notice set
+# explicit and traceable to NVIDIA's current CUDA EULA page.
+$noticeRoot = Join-Path $env:RUNNER_TEMP 'cuda-notices'
+$null = New-Item -ItemType Directory -Path $noticeRoot -Force
+$eula = Join-Path $noticeRoot 'EULA.html'
+& curl.exe --fail --location --retry 5 --retry-all-errors --output $eula 'https://docs.nvidia.com/cuda/eula/index.html'
+if ($LASTEXITCODE -ne 0) { throw 'CUDA EULA download failed' }
+@(
+    'CUDA Toolkit 13.4 hosted-build notice',
+    'Runtime files are installed from the NVIDIA CUDA Toolkit 13.4 Windows installer.',
+    'License text: https://docs.nvidia.com/cuda/eula/index.html'
+) | Set-Content -LiteralPath (Join-Path $noticeRoot 'README') -Encoding utf8
+if ($env:GITHUB_ENV) { "CUDA_NOTICE_ROOT=$noticeRoot" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8 }
 $env:CUDA_PATH = $cudaRoot
 if ($env:GITHUB_ENV) { "CUDA_PATH=$cudaRoot" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8 }
 if ($env:GITHUB_PATH) {

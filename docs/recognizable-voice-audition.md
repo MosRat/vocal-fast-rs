@@ -85,13 +85,13 @@ Applio offline Pipeline / HuBERT / RMVPE / Synth，FP32 CUDA；禁用 TF32。
 
 ```powershell
 rtk cargo build -p vocal-fast --features directml,tensorrt-rtx
-rtk .venv/Scripts/python.exe -X utf8 scripts/audition-voice-models.py --library C:/Users/taizun/AppData/Local/vocal-fast/model-library/recognizable-chinese-female/ready --input target/test-assets/mandarin-continuous/male-01-liangzhu-16k.wav --output-dir target/compare/recognizable-voices --resume
+rtk .venv/Scripts/python.exe -X utf8 scripts/audition-voice-models.py --library $env:LOCALAPPDATA/vocal-fast/model-library/recognizable-chinese-female/ready --input target/test-assets/mandarin-continuous/male-01-liangzhu-16k.wav --output-dir target/compare/recognizable-voices --resume
 ```
 
 Applio：
 
 ```powershell
-rtk .venv/Scripts/python.exe -X utf8 scripts/run-applio-offline.py --input target/compare/recognizable-voices/input-male-liangzhu-20s.wav --output target/compare/recognizable-voices/elysia-cn-applio-p12-i0.5.wav --checkpoint C:/Users/taizun/AppData/Local/vocal-fast/model-library/recognizable-chinese-female/source/elysia-cn/elysiav3.pth --index C:/Users/taizun/AppData/Local/vocal-fast/model-library/recognizable-chinese-female/source/elysia-cn/added_IVF345_Flat_nprobe_1_elysiav3_v2.index --index-ratio 0.5 --pitch 12 --protect 0.33 --volume-envelope 1 --report target/compare/recognizable-voices/elysia-cn-applio-p12-i0.5.json --trace-dir target/compare/recognizable-voices/traces/elysia-cn-applio-p12-i0.5 --native-noise target/compare/recognizable-voices/traces/elysia-cn-directml-p12-i0.5/0000
+rtk .venv/Scripts/python.exe -X utf8 scripts/run-applio-offline.py --input target/compare/recognizable-voices/input-male-liangzhu-20s.wav --output target/compare/recognizable-voices/elysia-cn-applio-p12-i0.5.wav --checkpoint $env:LOCALAPPDATA/vocal-fast/model-library/recognizable-chinese-female/source/elysia-cn/elysiav3.pth --index $env:LOCALAPPDATA/vocal-fast/model-library/recognizable-chinese-female/source/elysia-cn/added_IVF345_Flat_nprobe_1_elysiav3_v2.index --index-ratio 0.5 --pitch 12 --protect 0.33 --volume-envelope 1 --report target/compare/recognizable-voices/elysia-cn-applio-p12-i0.5.json --trace-dir target/compare/recognizable-voices/traces/elysia-cn-applio-p12-i0.5 --native-noise target/compare/recognizable-voices/traces/elysia-cn-directml-p12-i0.5/0000
 ```
 
 初次运行保存的输入文件名如上；新版 suite 用 `input-male-20s.wav`，重新运行参考时

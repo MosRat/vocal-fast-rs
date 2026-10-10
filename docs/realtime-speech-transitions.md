@@ -47,7 +47,7 @@ Power-preserving overlap avoids adding the optional reference FFT phase vocoder.
 ## Verification, 2026-10-08
 
 Generated audio/reports live outside Git in
-`C:/Users/taizun/AppData/Local/vocal-fast/transition-verification/`.
+`$env:LOCALAPPDATA/vocal-fast/transition-verification/`.
 
 - 72 identical real DirectML decoder tails, 18 seconds, default complete model:
   before/after RMS 0.066757/0.067193, neither clips. Selected weak transition
@@ -91,12 +91,12 @@ and subjective listening remain separate checks.
 Reproduce the identical-tail DSP comparison (use a target directory with space):
 
 ```powershell
-$env:VOCAL_DSP_TRACE_DIR = 'C:/Users/taizun/AppData/Local/vocal-fast/transition-verification/trace'
+$env:VOCAL_DSP_TRACE_DIR = "$env:LOCALAPPDATA/vocal-fast/transition-verification/trace"
 rtk cargo test -p vocal-engine --all-features --lib replay_real_decoder_tails -- --ignored
 rtk .venv/Scripts/python.exe -X utf8 scripts/analyze-speech-transitions.py `
   $env:VOCAL_DSP_TRACE_DIR `
-  C:/Users/taizun/AppData/Local/vocal-fast/transition-verification/trace-after.wav `
-  C:/Users/taizun/AppData/Local/vocal-fast/transition-verification/dsp-report.json
+  $env:LOCALAPPDATA/vocal-fast/transition-verification/trace-after.wav `
+  $env:LOCALAPPDATA/vocal-fast/transition-verification/dsp-report.json
 ```
 
 Regression tests cover weak onsets, preserved releases, unreliable matches,

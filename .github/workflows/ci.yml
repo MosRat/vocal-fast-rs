@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -18,10 +22,12 @@ jobs:
           components: rustfmt
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Check repository whitespace
+        run: git diff --check
       - name: Check core workspace
-        run: cargo check --workspace --exclude vocal-tensorrt
+        run: cargo check --workspace --exclude vocal-tensorrt --locked
       - name: Test core workspace
-        run: cargo test --workspace --exclude vocal-tensorrt
+        run: cargo test --workspace --exclude vocal-tensorrt --locked
 
   python-tools:
     name: Python tooling

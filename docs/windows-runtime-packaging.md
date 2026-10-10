@@ -20,7 +20,7 @@ rtk proxy pwsh -NoProfile -File scripts/build-windows.ps1 -Backend Cpu
 
 # Place build outputs, runtime staging and logs on a drive with enough space.
 rtk proxy pwsh -NoProfile -File scripts/build-windows.ps1 -Profile Release `
-  -TargetDirectory C:/Users/taizun/AppData/Local/vocal-fast/build-release
+  -TargetDirectory $env:LOCALAPPDATA/vocal-fast/build-release
 ```
 
 | Backend argument | Explicit Cargo features | GPU redistributables |
@@ -89,7 +89,7 @@ TensorRT streaming input resampling fixes. See
 [real-time speech transitions](realtime-speech-transitions.md) for replay
 results and their limits. Automatic pitch matching remains enabled by default.
 
-- Installer: `C:/Users/taizun/AppData/Local/vocal-fast/build-release/release/bundle/nsis/vocal-fast_0.1.0_x64-setup.exe`.
+- Installer: `$env:LOCALAPPDATA/vocal-fast/build-release/release/bundle/nsis/vocal-fast_0.1.0_x64-setup.exe`.
 - Size: 204,044,065 bytes (194.59 MiB).
 - SHA-256: `BD62D3A59481AD9A204747C3B378956E05E37E41AFA491FE18ADA7624514DDB2`.
 - Root workspace: formatting and all-feature checking passed; all-feature
@@ -108,7 +108,7 @@ results and their limits. Automatic pitch matching remains enabled by default.
   include DirectML, TensorRT RTX, ONNX parser, cuFFT and oneDNN. All six
   redistributed DLLs load using restricted package-directory/system search.
 - Build and verification manifests:
-  `C:/Users/taizun/AppData/Local/vocal-fast/build-release/windows-build/Release-TensorRt/artifacts.json`
+  `$env:LOCALAPPDATA/vocal-fast/build-release/windows-build/Release-TensorRt/artifacts.json`
   and `package-verification.json`. Build outputs and extraction use C: because
   the repository drive has insufficient space. No GUI launch, installation or
   hardware loopback was performed for this packaging check.

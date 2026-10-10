@@ -1,0 +1,21 @@
+# Keep source and documentation stable across Windows and Unix checkouts.
+* text=auto eol=lf
+
+*.ps1 text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.rs text
+*.toml text
+*.json text
+*.md text
+*.py text
+*.ts text
+*.tsx text
+*.js text
+*.mjs text
+*.html text
+*.css text
+
+# These are intentionally small binary fixtures used by loader and audio tests.
+*.wav binary
+*.index binary

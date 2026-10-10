@@ -53,8 +53,8 @@ CPU planner 在分配 native buffer 前执行局部模式融合，融合只改�
 
 ```powershell
 rtk cargo fmt --all -- --check
-rtk cargo check --workspace --all-features --target-dir C:/Users/taizun/AppData/Local/vocal-fast/validation/cpu-gui-speaker-cargo
-rtk cargo test --workspace --all-features --target-dir C:/Users/taizun/AppData/Local/vocal-fast/validation/cpu-gui-speaker-cargo
+rtk cargo check --workspace --all-features --target-dir $env:LOCALAPPDATA/vocal-fast/validation/cpu-gui-speaker-cargo
+rtk cargo test --workspace --all-features --target-dir $env:LOCALAPPDATA/vocal-fast/validation/cpu-gui-speaker-cargo
 ```
 
 当前 workspace 回归结果：255 passed，24 ignored。

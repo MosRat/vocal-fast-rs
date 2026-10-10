@@ -120,7 +120,7 @@ Use private config/cache paths; the saved GUI config is never changed:
 ```powershell
 rtk cargo build -p vocal-fast --all-features --example model_memory_probe --example plan_build_probe
 rtk target/debug/examples/model_memory_probe.exe target/compare/idle-reload/trt.json target/test-assets/mandarin-continuous/male-01-liangzhu-16k.wav target/compare/backend-loading/repeat.json
-rtk target/debug/examples/plan_build_probe.exe target/compare/idle-reload/trt.json C:/Users/taizun/AppData/Local/Temp/vocal-fast-loading-check-20261008 target/compare/backend-loading/plan-repeat.json
+rtk target/debug/examples/plan_build_probe.exe target/compare/idle-reload/trt.json $env:LOCALAPPDATA/Temp/vocal-fast-loading-check-20261008 target/compare/backend-loading/plan-repeat.json
 rtk cargo test -p vocal-model -p vocal-tensorrt -p vocal-engine -p vocal-runtime --all-features -- --test-threads=1
 rtk cargo test -p vocal-directml --lib -- --include-ignored --test-threads=1
 rtk cargo check --workspace --all-features

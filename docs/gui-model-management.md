@@ -102,7 +102,7 @@ Private/gated repository authentication is not implemented.
   check, frontend build and runtime Clippy (`--no-deps`) passed.
 - Embedded-frontend Windows debug application built with CPU, DirectML and
   TensorRT at
-  `C:/Users/taizun/AppData/Local/vocal-fast/build-model-library-tauri/debug/vocal-fast-tauri.exe`.
+  `$env:LOCALAPPDATA/vocal-fast/build-model-library-tauri/debug/vocal-fast-tauri.exe`.
   The directory includes the backend runtime DLLs. This is a development build,
   not a new installer; the existing running application was preserved.
 

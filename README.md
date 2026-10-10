@@ -44,6 +44,17 @@ cargo run -p vocal-fast -- doctor
 cargo run -p vocal-fast -- demo 8
 ```
 
+The same SDK-independent checks can be run on Windows with PowerShell 7:
+
+```powershell
+pwsh -NoProfile -File scripts/verify.ps1
+pwsh -NoProfile -File scripts/verify.ps1 -Tauri
+```
+
+Use `-AllFeatures` only on a host that has the optional TensorRT-RTX SDK. The
+normal check intentionally excludes that proprietary SDK so a clean checkout
+can be verified on Linux, macOS, or Windows without vendor installations.
+
 To use the Python conversion and parity helpers, install the analysis
 environment with [uv](https://docs.astral.sh/uv/):
 
@@ -99,6 +110,22 @@ cargo check -p vocal-fast --features tensorrt-rtx
 The native build links only the CUDA runtime, cuFFT, TensorRT-RTX, and the
 TensorRT-RTX ONNX parser libraries. SDK DLLs and generated plans are local
 build artifacts and must not be committed.
+
+For a Windows Debug GUI instance or a packaged release, use the repository
+build helper. It discovers the selected SDKs, stages only the required runtime
+DLLs, writes a hash manifest under `target/windows-build/`, and keeps model
+weights outside the repository:
+
+```powershell
+pwsh -NoProfile -File scripts/build-windows.ps1 -Profile Debug `
+  -Backend TensorRt -NoBundle -Launch
+pwsh -NoProfile -File scripts/build-windows.ps1 -Profile Release `
+  -Backend Cpu
+```
+
+See [`docs/windows-runtime-packaging.md`](docs/windows-runtime-packaging.md)
+for the backend matrix, SDK discovery rules, runtime staging, and installer
+verification.
 
 ## Tauri application
 

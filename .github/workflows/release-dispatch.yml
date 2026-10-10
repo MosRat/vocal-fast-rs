@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release-dispatch-${{ github.ref }}
@@ -119,3 +120,10 @@ jobs:
           fi
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
+
+      - name: Trigger tagged release workflow
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" --field publish=true

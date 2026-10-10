@@ -14,6 +14,10 @@ The repository publishes Windows installers from two workflows:
 both Windows packaging jobs without publishing a release. This is the smoke
 test path for changes to the packaging workflow.
 
+The dispatch workflow explicitly starts `release.yml` after creating the tag.
+This is required because GitHub does not start a new workflow from events
+created with the default `GITHUB_TOKEN`.
+
 TensorRT-RTX is intentionally excluded from hosted runners. Its SDK and CUDA
 redistributables are not distributed by this repository; TensorRT packages are
 built locally with `scripts/build-windows.ps1 -Backend TensorRt`.

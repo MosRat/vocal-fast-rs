@@ -140,6 +140,24 @@ $cli = 'target/release/vocal-fast.exe'
    Updating an existing repository reuses it and does not delete unrelated
    remote files. SDK credentials stay outside source and distribution trees.
 
+## Using the published files in the GUI
+
+The collection's `bundles/` directory is the simplest GUI path. Download a
+complete bundle, place it in the GUI model library, select it in Studio, choose
+Automatic, CPU, DirectML or TensorRT-RTX, and click **Load**. The GUI detects
+the embedded Synth, HuBERT, RMVPE and optional retrieval index. For DirectML
+and TensorRT-RTX it extracts the acoustic VFRMs into its local cache and builds
+or reuses the backend graph. PTH, ONNX and `pipeline.json` are not needed.
+
+The smaller `voices/` files contain Synth and optional retrieval only. To use
+one of them, also download `shared/hubert.vfrm` and `shared/rmvpe.vfrm`, place
+all three in the model workspace, select the voice, and set the two acoustic
+sources in the backend's Advanced source controls before loading. The GUI
+component badges make this distinction visible: a voice-only file reports
+HuBERT/RMVPE as missing, while a complete bundle reports all required
+components as embedded. The optional retrieval index is used automatically
+when it is present in the selected voice.
+
 ## Distribution layout and licensing
 
 ```text

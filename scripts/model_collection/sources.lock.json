@@ -117,9 +117,109 @@
       "repo": "NaClNeZn/RVC-Model",
       "files": [
         {
+          "path": "star-rail2.7/Acheron/acheron.pth",
+          "size": 57582496,
+          "sha256": "3beb55857e6dc1d8c8faed4a85fe2b9c681ffe019e870239e68e90334b6854d2"
+        },
+        {
           "path": "star-rail2.7/Bailu/bailu.pth",
           "size": 57552902,
           "sha256": "8a662f8c2155148bec3a73549c3cb4f6bd2781edd569b7497738d16f50697845"
+        },
+        {
+          "path": "star-rail2.7/Buluoniya/buluoniya.pth",
+          "size": 57583930,
+          "sha256": "efb661652f6d6b4f15a678b05f71ee332d899c8ce57a43d05faa9b5fb9317e58"
+        },
+        {
+          "path": "star-rail2.7/Clara/clara.pth",
+          "size": 57552902,
+          "sha256": "8aa375f7dc8b9720242baaebc9a88316b56ce1a2d9f4981ad282157e25bc2616"
+        },
+        {
+          "path": "star-rail2.7/Firefly/firefly.pth",
+          "size": 57582496,
+          "sha256": "ee9c4d93d4a3151d39b3fce9884ef4ef5d9803c074174003d6abb595c956fd0b"
+        },
+        {
+          "path": "star-rail2.7/Fuxuan/fuxuan.pth",
+          "size": 57576275,
+          "sha256": "b93b6dfca4686b9061377644bf614b1dc4a24715d4321c83a221a963e1c64a23"
+        },
+        {
+          "path": "star-rail2.7/Guinaifen/guinaifen.pth",
+          "size": 57583930,
+          "sha256": "ef9ba012a5751c14c0526545fdcc7ccd5df126eb9a97d2bf9701998cae1a7958"
+        },
+        {
+          "path": "star-rail2.7/Heita/heita.pth",
+          "size": 57552902,
+          "sha256": "7b420e4b9057786bf876272f072793249ca887877a1403535a651b9b073027b5"
+        },
+        {
+          "path": "star-rail2.7/Huahuo/huahuo.pth",
+          "size": 57576275,
+          "sha256": "66435507d5e658f870aa18973d234fc2cdeebf39666ded439eb6efed8d6e71ec"
+        },
+        {
+          "path": "star-rail2.7/Huohuo/huohuo.pth",
+          "size": 57576275,
+          "sha256": "becd68b476c8ca3305c14d553370cfbae2c4becd4d156f1fd52403b31b85639b"
+        },
+        {
+          "path": "star-rail2.7/Kafka/kafka.pth",
+          "size": 57552902,
+          "sha256": "6a1bb40fdbd55d8e0214107be03cbdffe04134f7143208b0ae7ffff0ce3d7a1f"
+        },
+        {
+          "path": "star-rail2.7/Lingsha/lingsha.pth",
+          "size": 57582496,
+          "sha256": "4b019d67751a663799435b4d641945bdea443a83fc8652c5bf5c6cc8f78d01d5"
+        },
+        {
+          "path": "star-rail2.7/Lynx/lynx.pth",
+          "size": 57552377,
+          "sha256": "71e61458e893243c35e572f0eeed1ab3d15cd458d437820599815c3213df4a09"
+        },
+        {
+          "path": "star-rail2.7/March7th/March7th.pth",
+          "size": 57583469,
+          "sha256": "b304ffbab93ca083c94141e82400c64debac882ff8b263662cba97e48cd85211"
+        },
+        {
+          "path": "star-rail2.7/Qingque/qingque.pth",
+          "size": 57582496,
+          "sha256": "497f65a45d2b47689368d3a8aaa7d00bd266cce4706edb5f868ea1d5510f2258"
+        },
+        {
+          "path": "star-rail2.7/Robin/robin.pth",
+          "size": 57552902,
+          "sha256": "567732898cd5c85bdf2313ac68c01393ddccb7208ac8e97894e09d80cf3540ee"
+        },
+        {
+          "path": "star-rail2.7/Ruanmei/ruanmei.pth",
+          "size": 57582496,
+          "sha256": "c64aff6bf5d7bc95f36908a4bed0cebb578a93aaf96ad6fdb265abe41b72fcb2"
+        },
+        {
+          "path": "star-rail2.7/Seele/seele.pth",
+          "size": 57552902,
+          "sha256": "1b388f450f735fc3cdb75909bb67127d6ce8ec9aded7cb059e1f123ff9aa4d5a"
+        },
+        {
+          "path": "star-rail2.7/Silverwolf/silverwolf.pth",
+          "size": 57584391,
+          "sha256": "f3f67adaebd7e2c1c3d6d8616ce401dc7fbb05c9d09f45cf0b9655c3b403533f"
+        },
+        {
+          "path": "star-rail2.7/Tingyun/tingyun.pth",
+          "size": 57582496,
+          "sha256": "66ace8371b271f6af93229e94e5f65081b20b63091335cedd881c706f7748bb5"
+        },
+        {
+          "path": "star-rail2.7/Topaz/topaz.pth",
+          "size": 57552902,
+          "sha256": "fd5ef1911c4db09f588da114f721c1253213a18094f2b3ee3802eb6d2ef10fec"
         },
         {
           "path": "README.md",
@@ -129,10 +229,130 @@
       ],
       "voices": [
         {
+          "id": "starrail-acheron",
+          "name": "黄泉 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Acheron/acheron.pth"
+        },
+        {
           "id": "starrail-bailu",
           "name": "白露 · Star Rail",
           "language": "zh",
           "checkpoint": "star-rail2.7/Bailu/bailu.pth"
+        },
+        {
+          "id": "starrail-buluoniya",
+          "name": "布洛妮娅 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Buluoniya/buluoniya.pth"
+        },
+        {
+          "id": "starrail-clara",
+          "name": "克拉拉 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Clara/clara.pth"
+        },
+        {
+          "id": "starrail-firefly",
+          "name": "流萤 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Firefly/firefly.pth"
+        },
+        {
+          "id": "starrail-fuxuan",
+          "name": "符玄 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Fuxuan/fuxuan.pth"
+        },
+        {
+          "id": "starrail-guinaifen",
+          "name": "桂乃芬 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Guinaifen/guinaifen.pth"
+        },
+        {
+          "id": "starrail-heita",
+          "name": "黑塔 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Heita/heita.pth"
+        },
+        {
+          "id": "starrail-huahuo",
+          "name": "花火 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Huahuo/huahuo.pth"
+        },
+        {
+          "id": "starrail-huohuo",
+          "name": "藿藿 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Huohuo/huohuo.pth"
+        },
+        {
+          "id": "starrail-kafka",
+          "name": "卡芙卡 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Kafka/kafka.pth"
+        },
+        {
+          "id": "starrail-lingsha",
+          "name": "灵砂 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Lingsha/lingsha.pth"
+        },
+        {
+          "id": "starrail-lynx",
+          "name": "玲可 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Lynx/lynx.pth"
+        },
+        {
+          "id": "starrail-march7th",
+          "name": "三月七 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/March7th/March7th.pth"
+        },
+        {
+          "id": "starrail-qingque",
+          "name": "青雀 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Qingque/qingque.pth"
+        },
+        {
+          "id": "starrail-robin",
+          "name": "知更鸟 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Robin/robin.pth"
+        },
+        {
+          "id": "starrail-ruanmei",
+          "name": "阮梅 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Ruanmei/ruanmei.pth"
+        },
+        {
+          "id": "starrail-seele",
+          "name": "希儿 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Seele/seele.pth"
+        },
+        {
+          "id": "starrail-silverwolf",
+          "name": "银狼 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Silverwolf/silverwolf.pth"
+        },
+        {
+          "id": "starrail-tingyun",
+          "name": "停云 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Tingyun/tingyun.pth"
+        },
+        {
+          "id": "starrail-topaz",
+          "name": "托帕 · Star Rail",
+          "language": "zh",
+          "checkpoint": "star-rail2.7/Topaz/topaz.pth"
         }
       ],
       "revision": "master",

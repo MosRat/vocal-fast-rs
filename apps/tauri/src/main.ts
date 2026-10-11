@@ -330,7 +330,7 @@ function dependencyRequest(path: string, allowDownload = false): Record<string, 
     request: {
       modelPath: path,
       libraryDirectory: config.modelDirectory,
-      cacheDirectory: config.tensorrt.cacheDirectory,
+      cacheDirectory: null,
       allowDownload,
       hubertSource: dependencyHubertSource,
       rmvpeSource: dependencyRmvpeSource,

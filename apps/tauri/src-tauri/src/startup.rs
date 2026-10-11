@@ -210,7 +210,7 @@ pub fn initialize(
                 let request = vocal_runtime::model_library::ModelDependencyRequest {
                     model_path: PathBuf::from(path),
                     library_directory: config.model_directory.clone().map(PathBuf::from),
-                    cache_directory: config.tensorrt.cache_directory.clone().map(PathBuf::from),
+                    cache_directory: None,
                     allow_download: false,
                     hubert_source: None,
                     rmvpe_source: None,

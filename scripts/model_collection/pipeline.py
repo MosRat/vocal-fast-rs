@@ -102,7 +102,10 @@ def prepare(lock: dict, output: Path, cache: Path, cli: Path, seed_root: Path | 
             if not matches(staged, record):
                 shutil.copyfile(verified, staged)
             local[record["path"]] = staged
-            if Path(record["path"]).suffix.lower() in (".md", ".txt") or "license" in Path(record["path"]).name.lower():
+            record_name = Path(record["path"]).name.lower()
+            if (Path(record["path"]).suffix.lower() in (".md", ".txt")
+                    or record_name in {"license", "copying", "notice"}
+                    or "license" in record_name):
                 notice = output / "provenance" / source_id / safe_path(record["path"])
                 notice.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(local[record["path"]], notice)
@@ -251,7 +254,9 @@ def prepare(lock: dict, output: Path, cache: Path, cli: Path, seed_root: Path | 
               "See the project's `docs/model-collection.md` for commands and dependencies.", ""]
     (output / "README.md").write_text("\n".join(lines), encoding="utf-8")
     files = [p for p in output.rglob("*") if p.is_file()
-             and p.relative_to(output).as_posix() != LOCAL_UPLOAD_CACHE]
+             and p.relative_to(output).as_posix() not in {
+                 LOCAL_UPLOAD_CACHE, "inventory.json", "SHA256SUMS"
+             }]
     for path in files:
         relative = path.relative_to(output).as_posix()
         for entry in catalog["voices"] + catalog["shared"] + catalog["bundles"]:

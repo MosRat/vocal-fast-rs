@@ -359,6 +359,71 @@
       "license": "Apache License 2.0"
     },
     {
+      "id": "ms-xique",
+      "provider": "ms",
+      "repo": "chuangxuan2012/xique-rvc-voices",
+      "revision": "master",
+      "files": [
+        {
+          "path": "voices/derived_chunzhen.pth",
+          "size": 55071107,
+          "sha256": "168f1b9207b88c4e1961f19e8cb33d23e856d3edde1ca571c33e21e0d110e041"
+        },
+        {
+          "path": "voices/derived_huoli.pth",
+          "size": 55071107,
+          "sha256": "16825ab706d3bef9adf496b0b73b2d5a4cc9e8139bf6649de4ba177062edbc7f"
+        },
+        {
+          "path": "voices/derived_lingdong.pth",
+          "size": 55217389,
+          "sha256": "9d08929c5fadcbf21040d6f22a91fd8c7bb35f786828fdac79add6a376cf42c1"
+        },
+        {
+          "path": "voices/derived_qingleng.pth",
+          "size": 55071107,
+          "sha256": "755c57cf4fb45ef22cf31f409b3fabd9229f2b9d76987858b0170ddaf30ff56d"
+        },
+        {
+          "path": "NOTICE",
+          "size": 4109,
+          "sha256": "31e9117ee1c5206f08aa6471dccc2c201c98b5da38d9af7944272e6afa5ccc84"
+        },
+        {
+          "path": "README.md",
+          "size": 1372,
+          "sha256": "71b51d188b1f7f45717608d70da0fb1695f99c4366fdae43c7409f4d67bd07e1"
+        }
+      ],
+      "voices": [
+        {
+          "id": "xique-chunzhen",
+          "name": "纯真 · Xique",
+          "language": "zh",
+          "checkpoint": "voices/derived_chunzhen.pth"
+        },
+        {
+          "id": "xique-huoli",
+          "name": "活力 · Xique",
+          "language": "zh",
+          "checkpoint": "voices/derived_huoli.pth"
+        },
+        {
+          "id": "xique-lingdong",
+          "name": "灵动 · Xique",
+          "language": "zh",
+          "checkpoint": "voices/derived_lingdong.pth"
+        },
+        {
+          "id": "xique-qingleng",
+          "name": "清冷 · Xique",
+          "language": "zh",
+          "checkpoint": "voices/derived_qingleng.pth"
+        }
+      ],
+      "license": "MIT"
+    },
+    {
       "id": "hf-hubert",
       "provider": "hf",
       "repo": "lj1995/VoiceConversionWebUI",

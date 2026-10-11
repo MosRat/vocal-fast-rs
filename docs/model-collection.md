@@ -1,7 +1,7 @@
 # RVC conversion and ModelScope collection
 
 The public collection is [MosRat/vfrm-models](https://modelscope.cn/models/MosRat/vfrm-models).
-It contains 25 real RVC v2 voices from Hugging Face and ModelScope, shared
+It contains 29 real RVC v2 voices from Hugging Face and ModelScope, shared
 HuBERT/RMVPE VFRMs, and a complete Mandarin voice bundle. All three execution
 backends consume the same canonical tensor names and layouts.
 
@@ -245,8 +245,10 @@ declaration, not a new grant by this project.
 | malay-female-1 | HF | v2 | 40000 | no |
 | default-v2 | HF | v2 | 40000 | yes |
 | Star Rail 21 voices | ModelScope | v2 | 48000 | no |
+| Xique 4 voices | ModelScope | v2 | 40000 | no |
 
-All 25 conversions passed canonical Synth and index validation. The two
+All 29 conversions passed canonical Synth and index validation. The four Xique
+voices are MIT-licensed ModelScope checkpoints without retrieval indexes. The two
 shared acoustic files and complete bundle passed Rust loading. A separate
 rebuild from original acoustic sources produced identical names, shapes,
 dtypes and payload hashes for all 229 HuBERT and 310 RMVPE tensors. The large

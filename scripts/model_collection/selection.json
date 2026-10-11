@@ -67,6 +67,26 @@
       ]
     },
     {
+      "id": "ms-xique",
+      "provider": "ms",
+      "repo": "chuangxuan2012/xique-rvc-voices",
+      "revision": "master",
+      "files": [
+        "voices/derived_chunzhen.pth",
+        "voices/derived_huoli.pth",
+        "voices/derived_lingdong.pth",
+        "voices/derived_qingleng.pth",
+        "NOTICE",
+        "README.md"
+      ],
+      "voices": [
+        {"id": "xique-chunzhen", "name": "纯真 · Xique", "language": "zh", "checkpoint": "voices/derived_chunzhen.pth"},
+        {"id": "xique-huoli", "name": "活力 · Xique", "language": "zh", "checkpoint": "voices/derived_huoli.pth"},
+        {"id": "xique-lingdong", "name": "灵动 · Xique", "language": "zh", "checkpoint": "voices/derived_lingdong.pth"},
+        {"id": "xique-qingleng", "name": "清冷 · Xique", "language": "zh", "checkpoint": "voices/derived_qingleng.pth"}
+      ]
+    },
+    {
       "id": "hf-hubert",
       "provider": "hf",
       "repo": "lj1995/VoiceConversionWebUI",

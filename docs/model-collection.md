@@ -1,7 +1,7 @@
 # RVC conversion and ModelScope collection
 
 The public collection is [MosRat/vfrm-models](https://modelscope.cn/models/MosRat/vfrm-models).
-It contains five real RVC v2 voices from Hugging Face and ModelScope, shared
+It contains 25 real RVC v2 voices from Hugging Face and ModelScope, shared
 HuBERT/RMVPE VFRMs, and a complete Mandarin voice bundle. All three execution
 backends consume the same canonical tensor names and layouts.
 
@@ -162,7 +162,7 @@ metadata therefore uses `other`, preserves upstream declarations/cards and does
 not label all weights MIT. A hub license label is recorded as an upstream
 declaration, not a new grant by this project.
 
-## Initial validation (2026-10-11)
+## Current validation (2026-10-11)
 
 | Voice | Provider | Version | Sample rate | Embedded retrieval |
 |---|---|---|---:|---|
@@ -170,13 +170,13 @@ declaration, not a new grant by this project.
 | malay-male-1 | HF | v2 | 40000 | no |
 | malay-female-1 | HF | v2 | 40000 | no |
 | default-v2 | HF | v2 | 40000 | yes |
-| starrail-bailu | ModelScope | v2 | 48000 | no |
+| Star Rail 21 voices | ModelScope | v2 | 48000 | no |
 
-All five conversions passed canonical Synth and index validation. The two
+All 25 conversions passed canonical Synth and index validation. The two
 shared acoustic files and complete bundle passed Rust loading. A separate
 rebuild from original acoustic sources produced identical names, shapes,
-dtypes and payload hashes for all 229 HuBERT and 310 RMVPE tensors. The first
-upload committed 28 distribution files (eight VFRMs), checked every remote
+dtypes and payload hashes for all 229 HuBERT and 310 RMVPE tensors. The large
+upload committed 48 distribution files (28 LFS VFRMs), checked every remote
 size/hash, and round-tripped maobailing through the download API and Rust
 parser. Reports remain untracked under `target/model-collection/`.
 

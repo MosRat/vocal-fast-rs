@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from .pipeline import verify, write_json
-from .sources import matches, safe_path, sha256
+from .sources import candidate_warnings, eligible_files, matches, safe_path, search, sha256
 
 
 class IntegrityTests(unittest.TestCase):
@@ -21,6 +21,20 @@ class IntegrityTests(unittest.TestCase):
             self.assertTrue(matches(path, record))
             path.write_bytes(b"abce")
             self.assertFalse(matches(path, record))
+
+    def test_eligible_files_and_warnings(self):
+        files = eligible_files([
+            {"path": "voice.pth", "size": 4, "sha256": "a" * 64},
+            {"path": "voice.index", "size": 4, "sha256": "b" * 64},
+            {"path": "notes.bin", "size": 4, "sha256": "c" * 64},
+        ])
+        self.assertEqual([item["kind"] for item in files], ["checkpoint", "index"])
+        self.assertEqual(candidate_warnings("unknown", files), ["license is not declared in hub metadata"])
+        self.assertIn("no exported .pth Synth checkpoint found", candidate_warnings("MIT", []))
+
+    def test_search_rejects_unknown_provider_before_network_access(self):
+        with self.assertRaises(ValueError):
+            search("unknown", "rvc", 1)
 
     def test_verify_rejects_extra_files_and_credentials(self):
         with tempfile.TemporaryDirectory() as root:

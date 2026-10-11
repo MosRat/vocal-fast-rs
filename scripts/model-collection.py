@@ -16,7 +16,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     find = sub.add_parser("search", help="search public model repository names")
-    find.add_argument("provider", choices=["hf", "ms"])
+    find.add_argument("provider", choices=["hf", "ms", "all"])
     find.add_argument("query")
     find.add_argument("--limit", type=int, choices=range(1, 101), default=20)
     find.add_argument("--output", type=Path, required=True)
@@ -25,6 +25,9 @@ def main() -> int:
     discover.add_argument("repo")
     discover.add_argument("--revision")
     discover.add_argument("--output", type=Path, required=True)
+    merge = sub.add_parser("merge-search", help="merge normalized search result files")
+    merge.add_argument("inputs", nargs="+", type=Path)
+    merge.add_argument("--output", type=Path, required=True)
     lock = sub.add_parser("lock", help="pin source revisions and hashes from a reviewed selection")
     lock.add_argument("--selection", type=Path, required=True)
     lock.add_argument("--output", type=Path, required=True)
@@ -48,6 +51,19 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "search":
         write_json(args.output, search(args.provider, args.query, args.limit))
+    elif args.command == "merge-search":
+        merged = {}
+        for path in args.inputs:
+            records = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(records, list):
+                raise ValueError(f"search result must be a JSON array: {path}")
+            for record in records:
+                key = (record.get("provider"), str(record.get("repo", "")).lower())
+                if key[0] not in {"hf", "ms"} or not key[1]:
+                    raise ValueError(f"invalid search candidate in {path}")
+                merged[key] = record
+        write_json(args.output, sorted(merged.values(), key=lambda item: (
+            -int(item.get("checkpointCount", 0)), item["provider"], item["repo"])))
     elif args.command == "discover":
         result = repository(args.provider, args.repo, args.revision)
         result["files"] = [f for f in result["files"] if f["path"].lower().endswith((".pth", ".onnx", ".index"))

@@ -62,16 +62,29 @@ $py = '.venv/Scripts/python.exe'
 $cli = 'target/release/vocal-fast.exe'
 ```
 
-1. Search repository names on both hubs, then inspect selected repositories:
+1. Search and integrate repository candidates from both hubs. The unified
+   search inspects each result and marks exported checkpoints, FAISS indexes,
+   ONNX files, missing licenses and shape-validation warnings. It does not
+   download model weights:
 
    ```powershell
    & $py scripts/model-collection.py search hf RVC --output target/hf-rvc.json
    & $py scripts/model-collection.py search ms RVC --output target/ms-rvc.json
+   & $py scripts/model-collection.py search all RVC --limit 20 `
+     --output target/rvc-candidates.json
+   & $py scripts/model-collection.py merge-search target/hf-rvc.json target/ms-rvc.json `
+     --output target/rvc-candidates-merged.json
    & $py scripts/model-collection.py discover hf maotianchen/maobailing_rvc `
      --output target/maobailing-candidates.json
    & $py scripts/model-collection.py discover ms NaClNeZn/RVC-Model `
      --output target/ms-rvc-candidates.json
    ```
+
+   The `all` form is the preferred cross-hub scan. `merge-search` is useful
+   when separate scans were run with different queries. Candidates are keyed
+   by `(provider, repository)`; same names on HF and ModelScope remain separate
+   sources because their bytes and licenses are independent. Review the
+   `warnings` field and select exact files in `selection.json` before locking.
 
 2. Review model cards/license restrictions and select exact checkpoint/index
    paths in `scripts/model_collection/selection.json`. Pin the selection:

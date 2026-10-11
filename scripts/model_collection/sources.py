@@ -52,11 +52,75 @@ def repository(provider: str, repo: str, revision: str | None = None) -> dict:
 
 
 def search(provider: str, query: str, limit: int) -> list[dict]:
-    if provider == "hf":
-        from huggingface_hub import HfApi
-        return [{"repo": item.id, "provider": provider} for item in HfApi().list_models(search=query, limit=limit)]
-    page = ms_api().list_repos("model", search=query, page_size=limit, page_number=1)
-    return [{"repo": item.repo_id, "provider": provider} for item in page.items]
+    """Return normalized, inspectable candidates from one or both hubs.
+
+    Search endpoints only return repository summaries. We inspect each small
+    result set so callers can distinguish a repository containing exported
+    Synth checkpoints from one containing only training assets or documentation.
+    A failed repository inspection is retained as a warning instead of making
+    a broad search fail.
+    """
+    if provider not in {"hf", "ms", "all"}:
+        raise ValueError("provider must be hf, ms or all")
+    providers = ["hf", "ms"] if provider == "all" else [provider]
+    names: list[dict] = []
+    for current in providers:
+        if current == "hf":
+            from huggingface_hub import HfApi
+            names.extend({"repo": item.id, "provider": current}
+                         for item in HfApi().list_models(search=query, limit=limit))
+        else:
+            page = ms_api().list_repos("model", search=query, page_size=limit, page_number=1)
+            names.extend({"repo": item.repo_id, "provider": current} for item in page.items)
+    result = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in names:
+        key = (candidate["provider"], candidate["repo"].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            info = repository(candidate["provider"], candidate["repo"])
+            files = eligible_files(info["files"])
+            result.append({**candidate, "revision": info["revision"], "license": info["license"],
+                           "files": files, "checkpointCount": sum(f["kind"] == "checkpoint" for f in files),
+                           "indexCount": sum(f["kind"] == "index" for f in files),
+                           "warnings": candidate_warnings(info["license"], files)})
+        except Exception as error:
+            result.append({**candidate, "files": [], "warnings": [f"inspection failed: {type(error).__name__}"]})
+    return sorted(result, key=lambda item: (-item.get("checkpointCount", 0), item["provider"], item["repo"]))
+
+
+def eligible_files(files: list[dict]) -> list[dict]:
+    """Reduce hub listings to runtime-relevant RVC artifacts."""
+    result = []
+    for file in files:
+        path = file["path"]
+        suffix = Path(path).suffix.lower()
+        name = Path(path).name.lower()
+        if suffix == ".pth":
+            kind = "checkpoint"
+        elif suffix == ".index":
+            kind = "index"
+        elif suffix == ".onnx":
+            kind = "onnx"
+        elif name in {"readme.md", "license", "license.txt", "copying", "notice"}:
+            kind = "notice"
+        else:
+            continue
+        result.append({**file, "kind": kind})
+    return result
+
+
+def candidate_warnings(license_name: str, files: list[dict]) -> list[str]:
+    warnings = []
+    if not license_name or str(license_name).lower() in {"unknown", "none"}:
+        warnings.append("license is not declared in hub metadata")
+    if not any(file["kind"] == "checkpoint" for file in files):
+        warnings.append("no exported .pth Synth checkpoint found")
+    if any(file["kind"] == "onnx" for file in files):
+        warnings.append("ONNX requires an explicit RVC manifest and shape validation")
+    return warnings
 
 
 def download(source: dict, record: dict, cache: Path) -> Path:

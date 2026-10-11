@@ -291,9 +291,34 @@ export interface TensorRtPipelineStatus {
 }
 
 export interface BackendEvent {
-  type: 'boot' | 'snapshot' | 'error' | 'preparation' | 'modelImport';
+  type: 'boot' | 'snapshot' | 'error' | 'preparation' | 'modelImport' | 'modelDependency';
   sequence: number;
-  payload: BootStatus | Snapshot | ErrorReport | PreparationStatus | import('./model-library-types').ModelImportStatus;
+  payload: BootStatus | Snapshot | ErrorReport | PreparationStatus | import('./model-library-types').ModelImportStatus | ModelDependencyStatus;
+}
+
+export type DependencyPhase = 'idle' | 'inspecting' | 'needsConsent' | 'queued' | 'listing' | 'downloading' | 'binding' | 'ready' | 'cancelling' | 'cancelled' | 'failed';
+export interface AcousticDependencyStatus {
+  kind: 'hubert' | 'rmvpe' | string;
+  present: boolean;
+  path: string | null;
+  sizeBytes: number;
+  expectedSizeBytes: number | null;
+  source: string | null;
+}
+export interface ModelDependencyStatus {
+  jobId: number;
+  revision: number;
+  phase: DependencyPhase;
+  message: string;
+  modelPath: string | null;
+  resolvedModelPath: string | null;
+  hubert: AcousticDependencyStatus;
+  rmvpe: AcousticDependencyStatus;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  elapsedMs: number;
+  complete: boolean;
+  error: { code: string; message: string; retryable: boolean } | null;
 }
 
 export type PreparationPhase = 'idle' | 'inspecting' | 'extracting' | 'loadingWeights' | 'checkingCache' | 'building' | 'publishing' | 'loadingEngine' | 'ready' | 'failed';

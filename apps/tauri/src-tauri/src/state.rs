@@ -47,6 +47,7 @@ pub struct AppState {
     preparation: Arc<PreparationTracker>,
     startup: Arc<StartupTracker>,
     pub model_library: vocal_runtime::model_library::ModelLibrary,
+    pub model_dependencies: vocal_runtime::model_library::DependencyManager,
 }
 
 impl AppState {
@@ -59,6 +60,10 @@ impl AppState {
         let library_events = events.clone();
         let model_library = vocal_runtime::model_library::ModelLibrary::new(move |status| {
             library_events.publish(BackendEvent::model_import(status))
+        });
+        let dependency_events = events.clone();
+        let model_dependencies = vocal_runtime::model_library::DependencyManager::new(move |status| {
+            dependency_events.publish(BackendEvent::model_dependency(status))
         });
         Self {
             inner: Arc::new(Mutex::new(RuntimeState {
@@ -75,6 +80,7 @@ impl AppState {
             preparation,
             startup,
             model_library,
+            model_dependencies,
         }
     }
 

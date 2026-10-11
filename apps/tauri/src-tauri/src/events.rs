@@ -15,6 +15,10 @@ use tauri::ipc::Channel;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum BackendEvent {
+    ModelDependency {
+        sequence: u64,
+        payload: vocal_runtime::model_library::ModelDependencyStatus,
+    },
     ModelImport {
         sequence: u64,
         payload: vocal_runtime::model_library::ModelImportStatus,
@@ -38,6 +42,15 @@ pub enum BackendEvent {
 }
 
 impl BackendEvent {
+    pub fn model_dependency(
+        payload: vocal_runtime::model_library::ModelDependencyStatus,
+    ) -> Self {
+        Self::ModelDependency {
+            sequence: 0,
+            payload,
+        }
+    }
+
     pub fn model_import(payload: vocal_runtime::model_library::ModelImportStatus) -> Self {
         Self::ModelImport {
             sequence: 0,
@@ -74,6 +87,7 @@ impl BackendEvent {
 
     fn with_sequence(self, sequence: u64) -> Self {
         match self {
+            Self::ModelDependency { payload, .. } => Self::ModelDependency { sequence, payload },
             Self::Boot { payload, .. } => Self::Boot { sequence, payload },
             Self::Snapshot { payload, .. } => Self::Snapshot { sequence, payload },
             Self::Error { payload, .. } => Self::Error { sequence, payload },

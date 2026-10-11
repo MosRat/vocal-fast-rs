@@ -206,11 +206,39 @@ pub fn initialize(
     }
     let saved_model = config.model_path.as_ref().and_then(|path| {
         match vocal_model::inspect_model_artifact(path) {
-            Ok(inspection) => Some(StartupModel {
-                path: path.clone(),
-                summary: ModelSummary::from(&inspection.manifest),
-                components: inspection.components,
-            }),
+            Ok(inspection) => {
+                let request = vocal_runtime::model_library::ModelDependencyRequest {
+                    model_path: PathBuf::from(path),
+                    library_directory: config.model_directory.clone().map(PathBuf::from),
+                    cache_directory: config.tensorrt.cache_directory.clone().map(PathBuf::from),
+                    allow_download: false,
+                    hubert_source: None,
+                    rmvpe_source: None,
+                };
+                match vocal_runtime::model_library::inspect_dependencies(&request) {
+                    Ok(status) if status.phase == vocal_runtime::model_library::DependencyPhase::Ready => {
+                        let resolved = status
+                            .resolved_model_path
+                            .map(|value| value.display().to_string())
+                            .unwrap_or_else(|| path.clone());
+                        let resolved_inspection = vocal_model::inspect_model_artifact(&resolved)
+                            .unwrap_or(inspection);
+                        Some(StartupModel {
+                            path: resolved,
+                            summary: ModelSummary::from(&resolved_inspection.manifest),
+                            components: resolved_inspection.components,
+                        })
+                    }
+                    Ok(_) => {
+                        notices.push("The saved voice needs HuBERT and RMVPE setup before it can be restored.".into());
+                        None
+                    }
+                    Err(error) => {
+                        notices.push(format!("The saved voice dependencies could not be inspected: {error}"));
+                        None
+                    }
+                }
+            }
             Err(error) => {
                 notices.push(format!(
                     "The saved model is unavailable: {error}. Choose a model to continue."

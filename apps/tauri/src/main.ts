@@ -20,6 +20,7 @@ import {
   type ModelCatalog,
   type ModelArtifactInspection,
   type ModelComponents,
+  type ModelDependencyStatus,
   type ProcessingBackendCatalog,
   type Snapshot,
   type StartupResources,
@@ -96,6 +97,10 @@ const AUTO_SAVE_DELAY_MS = 350;
 let selectedModelPath: string | undefined;
 let modelInspection: (ModelArtifactInspection & { selectionPath: string }) | null = null;
 let modelInspectionError: string | null = null;
+let modelDependencyStatus: ModelDependencyStatus | null = null;
+let dependencyHubertSource: string | null = null;
+let dependencyRmvpeSource: string | null = null;
+let dependencyInspectionSequence = 0;
 let inspectionSequence = 0;
 let inspectionTimer: number | undefined;
 let renderTimer: number | undefined;
@@ -319,6 +324,20 @@ function modelSelectionPath(): string {
   return selectedModelPath ?? snapshot?.config.modelPath ?? '';
 }
 
+function dependencyRequest(path: string, allowDownload = false): Record<string, unknown> {
+  const config = draftConfig ?? snapshot?.config ?? defaultConfig();
+  return {
+    request: {
+      modelPath: path,
+      libraryDirectory: config.modelDirectory,
+      cacheDirectory: config.tensorrt.cacheDirectory,
+      allowDownload,
+      hubertSource: dependencyHubertSource,
+      rmvpeSource: dependencyRmvpeSource,
+    },
+  };
+}
+
 function selectedComponents(): ModelComponents | null {
   const path = modelSelectionPath();
   return modelCatalog?.entries.find(entry => samePath(entry.path, path))?.components
@@ -342,17 +361,25 @@ function renderProcessingBackend(config: GuiConfig, catalog: ProcessingBackendCa
 function inspectSelectedModel(): void {
   window.clearTimeout(inspectionTimer);
   const sequence = ++inspectionSequence;
+  const dependencySequence = ++dependencyInspectionSequence;
   modelInspection = null;
   modelInspectionError = null;
+  modelDependencyStatus = null;
+  dependencyHubertSource = null;
+  dependencyRmvpeSource = null;
   const path = modelSelectionPath().trim();
-  if (!path || selectedComponents() || !runningInTauri()) return;
+  if (!path || !runningInTauri()) return;
   inspectionTimer = window.setTimeout(() => {
-    void call<ModelArtifactInspection>('inspect_model_artifact', { path }).then(result => {
-      if (sequence !== inspectionSequence || !samePath(modelSelectionPath(), path)) return;
+    void Promise.all([
+      call<ModelArtifactInspection>('inspect_model_artifact', { path }),
+      call<ModelDependencyStatus>('inspect_model_dependencies', dependencyRequest(path)),
+    ]).then(([result, dependencies]) => {
+      if (sequence !== inspectionSequence || dependencySequence !== dependencyInspectionSequence || !samePath(modelSelectionPath(), path)) return;
       modelInspection = { ...result, selectionPath: path };
+      modelDependencyStatus = dependencies;
       render();
     }).catch(error => {
-      if (sequence !== inspectionSequence || !samePath(modelSelectionPath(), path)) return;
+      if (sequence !== inspectionSequence || dependencySequence !== dependencyInspectionSequence || !samePath(modelSelectionPath(), path)) return;
       modelInspectionError = normalizeError(error).message;
       render();
     });
@@ -363,6 +390,7 @@ function modelSelectionLabel(): string {
   const path = modelSelectionPath().trim();
   if (!path) return 'Choose a model to load';
   if (selectedComponents()?.synth.present === false) return 'Acoustic component · choose a voice model to load';
+  if (modelDependencyStatus && modelDependencyStatus.phase !== 'ready') return 'Set up HuBERT and RMVPE to continue';
   return snapshot?.model && samePath(path, snapshot.config.modelPath)
     ? snapshot.engine ? 'Loaded' : 'Model loaded · prepare plans'
     : 'Selected · click Load';
@@ -667,7 +695,20 @@ function renderSidebar(): string {
 
 function renderModelControls(locked: boolean): string {
   const path = displayPath(modelSelectionPath());
-  return `<div class="model-actions"><div class="model-path-row"><input id="modelPath" aria-label="Model path" title="${escapeHtml(path)}" value="${escapeHtml(path)}" placeholder="Paste a model path…" ${locked ? 'disabled' : ''}/></div><div class="model-action-row"><span id="modelSelectionStatus" class="model-selection-status" role="status">${modelSelectionLabel()}</span><div class="model-buttons">${button('load', 'Load', 'folder', 'primary compact', locked || !path.trim() || !backendAvailable(draftConfig ?? snapshot?.config ?? defaultConfig(), processingBackends), 'Load selected model')}${button('unload', 'Unload', undefined, 'secondary compact', locked || !snapshot?.model, 'Unload the current model')}</div></div></div>`;
+  return `<div class="model-actions"><div class="model-path-row"><input id="modelPath" aria-label="Model path" title="${escapeHtml(path)}" value="${escapeHtml(path)}" placeholder="Paste a model path…" ${locked ? 'disabled' : ''}/></div>${renderDependencySetup(locked)}<div class="model-action-row"><span id="modelSelectionStatus" class="model-selection-status" role="status">${modelSelectionLabel()}</span><div class="model-buttons">${button('load', 'Load', 'folder', 'primary compact', locked || !path.trim() || !backendAvailable(draftConfig ?? snapshot?.config ?? defaultConfig(), processingBackends) || (!!modelDependencyStatus && modelDependencyStatus.phase !== 'ready'), 'Load selected model')}${button('unload', 'Unload', undefined, 'secondary compact', locked || !snapshot?.model, 'Unload the current model')}</div></div></div>`;
+}
+
+function renderDependencySetup(locked: boolean): string {
+  const status = modelDependencyStatus;
+  if (!status || status.phase === 'idle' || status.phase === 'ready') return '';
+  const item = (label: string, value: ModelDependencyStatus['hubert']) => `<span class="dependency-item"><strong>${label}</strong><span>${value.present ? `Ready · ${formatBytes(value.sizeBytes)}` : `Missing${value.expectedSizeBytes ? ` · ${formatBytes(value.expectedSizeBytes)}` : ''}`}</span></span>`;
+  const active = ['queued', 'listing', 'downloading', 'binding', 'cancelling'].includes(status.phase);
+  const progress = status.totalBytes ? ` · ${formatBytes(status.downloadedBytes)} / ${formatBytes(status.totalBytes)}` : '';
+  const actions = status.phase === 'needsConsent' || status.phase === 'binding'
+    ? `<button id="installModelDependencies" class="button primary compact" ${locked ? 'disabled' : ''}>${icon(status.phase === 'binding' ? 'sparkle' : 'download', 14)}${status.phase === 'binding' ? 'Prepare and continue' : 'Download and continue'}</button><button id="pickHubertDependency" class="button ghost compact" ${locked ? 'disabled' : ''}>Choose HuBERT</button><button id="pickRmvpeDependency" class="button ghost compact" ${locked ? 'disabled' : ''}>Choose RMVPE</button>`
+    : active ? `<button id="cancelModelDependencies" class="button ghost compact">Cancel</button>`
+      : status.phase === 'failed' || status.phase === 'cancelled' ? `<button id="installModelDependencies" class="button secondary compact" ${locked ? 'disabled' : ''}>Retry</button>` : '';
+  return `<section class="model-dependency-setup ${status.phase === 'failed' ? 'failed' : ''}" role="status" aria-live="polite"><div class="dependency-heading"><strong>${escapeHtml(status.message)}</strong><span>${active ? `${escapeHtml(status.phase)}${progress}` : 'Setup required'}</span></div><div class="dependency-items">${item('HuBERT', status.hubert)}${item('RMVPE', status.rmvpe)}</div>${status.phase === 'needsConsent' ? '<p>Shared acoustic models are downloaded once and reused by every voice model on this device.</p>' : ''}<div class="dependency-actions">${actions}</div></section>`;
 }
 
 function renderModelCatalog(locked: boolean): string {
@@ -856,6 +897,40 @@ async function runAction(action: () => Promise<unknown>, key = 'command', applyD
 function isSnapshot(value: unknown): value is Snapshot {
   return typeof value === 'object' && value !== null && 'lifecycle' in value && 'configRevision' in value;
 }
+
+function dependencyActive(status: ModelDependencyStatus | null): boolean {
+  return !!status && ['queued', 'listing', 'downloading', 'binding', 'cancelling'].includes(status.phase);
+}
+
+async function waitForDependency(jobId: number): Promise<ModelDependencyStatus> {
+  for (;;) {
+    const status = await call<ModelDependencyStatus>('get_model_dependency_status');
+    if (status.jobId !== jobId) throw new Error('Dependency operation was replaced by another request');
+    modelDependencyStatus = status;
+    render();
+    if (!dependencyActive(status)) return status;
+    await new Promise<void>(resolve => window.setTimeout(resolve, 220));
+  }
+}
+
+async function prepareDependenciesAndLoad(path: string, allowDownload: boolean): Promise<Snapshot> {
+  const started = await call<ModelDependencyStatus>('start_model_dependency_install', dependencyRequest(path, allowDownload));
+  modelDependencyStatus = started;
+  render();
+  const finished = dependencyActive(started) ? await waitForDependency(started.jobId) : started;
+  if (finished.phase !== 'ready' || !finished.resolvedModelPath) {
+    throw new Error(finished.error?.message ?? finished.message);
+  }
+  selectedModelPath = finished.resolvedModelPath;
+  inspectSelectedModel();
+  const config = draftConfig ?? snapshot?.config ?? defaultConfig();
+  const backendChanged = backendSelectionChanged(config, snapshot?.config ?? defaultConfig(), processingBackends);
+  return call<Snapshot>('load_model', {
+    path: finished.resolvedModelPath,
+    selection: backendChanged ? backendLoadSelection(config, processingBackends, draftRevision ?? snapshot?.configRevision ?? 0) : null,
+  });
+}
+
 function wireHandlers(): void {
   modelManagement.wire(busy || pipelineBusy() || !!snapshot?.audio.active || snapshot?.lifecycle==='running' || snapshot?.lifecycle==='loading' || snapshot?.lifecycle==='stopping');
   const byId = <T extends HTMLElement>(id: string) => document.querySelector<T>(`#${id}`);
@@ -869,14 +944,48 @@ function wireHandlers(): void {
       const path = modelSelectionPath().trim();
       if (!path) throw new Error('Model path is required');
       if (!backendAvailable(config, processingBackends)) throw new Error('The selected processing backend is unavailable. Refresh devices or choose another implementation.');
+      const dependencies = await call<ModelDependencyStatus>('inspect_model_dependencies', dependencyRequest(path));
+      modelDependencyStatus = dependencies;
+      if (dependencies.phase !== 'ready') {
+        render();
+        return snapshot;
+      }
+      const resolved = dependencies.resolvedModelPath ?? path;
+      selectedModelPath = resolved;
       const loaded = await call<Snapshot>('load_model', {
-        path,
+        path: resolved,
         selection: backendChanged ? backendLoadSelection(config, processingBackends, draftRevision ?? snapshot?.configRevision ?? 0) : null,
       });
       selectedModelPath = undefined;
       return loaded;
     }, 'load-model', false, backendChanged || resolvedBackend(config, processingBackends) === 'tensorRtRtx');
   });
+  on(byId<HTMLButtonElement>('installModelDependencies'), 'click', () => {
+    runAction(async () => {
+      const path = modelSelectionPath().trim();
+      if (!path) throw new Error('Model path is required');
+      return prepareDependenciesAndLoad(path, true);
+    }, 'install-model-dependencies', false, true);
+  });
+  on(byId<HTMLButtonElement>('pickHubertDependency'), 'click', () => {
+    runAction(async () => {
+      const path = await call<string | null>('pick_model_file', { kind: 'acoustic' });
+      if (path) { dependencyHubertSource = path; modelDependencyStatus = { ...(modelDependencyStatus as ModelDependencyStatus), message: 'HuBERT selected; choose RMVPE or download the remaining dependency' }; render(); }
+      return snapshot;
+    }, 'pick-hubert-dependency');
+  });
+  on(byId<HTMLButtonElement>('pickRmvpeDependency'), 'click', () => {
+    runAction(async () => {
+      const path = await call<string | null>('pick_model_file', { kind: 'acoustic' });
+      if (path) { dependencyRmvpeSource = path; modelDependencyStatus = { ...(modelDependencyStatus as ModelDependencyStatus), message: 'RMVPE selected; choose HuBERT or continue' }; render(); }
+      return snapshot;
+    }, 'pick-rmvpe-dependency');
+  });
+  on(byId<HTMLButtonElement>('cancelModelDependencies'), 'click', () => runAction(async () => {
+    if (!modelDependencyStatus?.jobId) return snapshot;
+    modelDependencyStatus = await call<ModelDependencyStatus>('cancel_model_dependency_install', { jobId: modelDependencyStatus.jobId });
+    return snapshot;
+  }, 'cancel-model-dependencies'));
   on(byId<HTMLInputElement>('modelPath'), 'keydown', (event) => {
     if (event.key === 'Enter') byId<HTMLButtonElement>('load')?.click();
   });
@@ -1261,6 +1370,10 @@ async function connect(): Promise<void> {
       // Import has its own job/revision ordering. A later snapshot delivered by
       // another publisher must not hide a terminal import event arriving late.
       if (event.type === 'modelImport') modelManagement.observe(event.payload as ModelImportStatus);
+      if (event.type === 'modelDependency') {
+        modelDependencyStatus = event.payload as ModelDependencyStatus;
+        scheduleRender();
+      }
       if (event.sequence <= lastEventSequence) return;
       if (lastEventSequence !== 0 && event.sequence > lastEventSequence + 1) void resyncSnapshot();
       lastEventSequence = event.sequence;

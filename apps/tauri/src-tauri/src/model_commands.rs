@@ -62,6 +62,48 @@ pub fn cancel_model_import(
 pub fn default_model_library() -> String {
     default_library_directory().display().to_string()
 }
+
+#[tauri::command]
+pub fn get_model_dependency_status(
+    state: State<'_, AppState>,
+) -> ModelDependencyStatus {
+    state.model_dependencies.status()
+}
+
+#[tauri::command]
+pub async fn inspect_model_dependencies(
+    state: State<'_, AppState>,
+    request: ModelDependencyRequest,
+) -> GuiResult<ModelDependencyStatus> {
+    let manager = state.model_dependencies.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.inspect(&request).map_err(GuiError::ModelLibrary)
+    })
+    .await
+    .map_err(|error| GuiError::Internal(error.to_string()))?
+}
+
+#[tauri::command]
+pub fn start_model_dependency_install(
+    state: State<'_, AppState>,
+    request: ModelDependencyRequest,
+) -> GuiResult<ModelDependencyStatus> {
+    state
+        .model_dependencies
+        .start(request)
+        .map_err(GuiError::ModelLibrary)
+}
+
+#[tauri::command]
+pub fn cancel_model_dependency_install(
+    state: State<'_, AppState>,
+    job_id: u64,
+) -> GuiResult<ModelDependencyStatus> {
+    state
+        .model_dependencies
+        .cancel(job_id)
+        .map_err(GuiError::ModelLibrary)
+}
 #[tauri::command]
 pub async fn pick_model_file(kind: String) -> GuiResult<Option<String>> {
     tauri::async_runtime::spawn_blocking(move || {

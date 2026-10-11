@@ -149,13 +149,18 @@ the embedded Synth, HuBERT, RMVPE and optional retrieval index. For DirectML
 and TensorRT-RTX it extracts the acoustic VFRMs into its local cache and builds
 or reuses the backend graph. PTH, ONNX and `pipeline.json` are not needed.
 
-The smaller `voices/` files contain Synth and optional retrieval only. To use
-one of them, also download `shared/hubert.vfrm` and `shared/rmvpe.vfrm`, place
-all three in the model workspace, select the voice, and set the two acoustic
-sources in the backend's Advanced source controls before loading. The GUI
-component badges make this distinction visible: a voice-only file reports
-HuBERT/RMVPE as missing, while a complete bundle reports all required
-components as embedded. The optional retrieval index is used automatically
+The smaller `voices/` files contain Synth and optional retrieval only. The GUI
+now resolves the two shared acoustic dependencies while loading: it first
+checks the per-user cache, then asks before downloading `shared/hubert.vfrm`
+and `shared/rmvpe.vfrm` from the public ModelScope registry. The files are
+SHA-256 verified and bound into a derived complete VFRM under
+`%LOCALAPPDATA%/vocal-fast/model-library/bound`; the original voice file is
+never modified. Choosing local acoustic files remains available from the same
+setup card. This means CPU, DirectML and TensorRT load the same resolved model
+without backend-specific source fields. The GUI component badges make the
+distinction visible: a voice-only file reports HuBERT/RMVPE as missing, while
+a complete bundle reports all required components as embedded. The optional
+retrieval index is used automatically
 when it is present in the selected voice.
 
 ## Distribution layout and licensing

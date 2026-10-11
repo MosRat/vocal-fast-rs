@@ -44,9 +44,13 @@ and metadata sizes are bounded.
 Complete VFRM files keep their embedded HuBERT/RMVPE/index. PTH imports can
 reuse acoustics from a complete model already in the library, or use an
 explicit complete bundle / canonical HuBERT and RMVPE VFRM pair. Without
-acoustic sources, the output is clearly marked Synth-only. Raw acoustic PT
-and ONNX exports are not converted by this importer. Some models also lack
-a retrieval index; the UI reports that separately.
+acoustic sources, the output is clearly marked Synth-only. When a Synth-only
+voice is selected in Studio, the load setup card checks the shared acoustic
+cache, asks before downloading the public `MosRat/vfrm-models` files, verifies
+them, and creates a derived complete VFRM in the per-user cache. The original
+voice file is retained and all backends load the same resolved path. Raw
+acoustic PT and ONNX exports are not converted by this importer. Some models
+also lack a retrieval index; the UI reports that separately.
 
 The GUI lists supported *file extensions*, not a guarantee that every PTH in
 an arbitrary repository is an RVC model. Conversion validates the checkpoint.

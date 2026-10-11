@@ -12,11 +12,13 @@ are documented in [RVC v1 support](rvc-v1-support.md).
 
 ## Load workflow
 
-1. Select a complete voice bundle in Studio.
-2. Select Automatic or TensorRT RTX on a supported device.
-3. Click **Load**. The application extracts the embedded acoustic packages to
-   its source cache, builds or reuses the selected voice's plans, and loads the
-   engine. No source paths or pipeline JSON need to be entered.
+1. Select a complete voice bundle or a Synth-only voice in Studio.
+2. Select Automatic or a supported backend.
+3. Click **Load**. Complete bundles extract their embedded acoustic packages.
+   For Synth-only voices, Studio checks the shared cache and offers one
+   consented download from `MosRat/vfrm-models`; the verified files are bound
+   into a derived complete VFRM and then loaded automatically. Local HuBERT and
+   RMVPE files can be selected from the same setup card.
 
 Studio and Settings initially show the embedded component locations. After
 loading, they show the actual cached `hubert.vfrm`, `rmvpe.vfrm`, and generated
@@ -28,7 +30,9 @@ Startup restoration uses the same automatic preparation path. Audio sessions
 lock configuration and loading; preparation also locks the controls across
 windows. A failed build or load preserves the previous model, engine, and
 persisted configuration. The existing error action restores the idle state.
-Synth-only packages retain the explicit shared-source/existing-plan workflow.
+The original Synth-only package is never modified. Its derived complete VFRM
+is stored in the per-user cache, so all three backends consume the same
+resolved model without manually entering backend source paths.
 
 ## Container and memory policy
 

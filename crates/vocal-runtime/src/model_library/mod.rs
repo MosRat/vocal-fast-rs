@@ -1,9 +1,14 @@
 //! Model import is independent of engine ownership and the runtime control actor.
 mod convert;
+mod dependencies;
 mod download;
 mod jobs;
 mod provider;
 
+pub use dependencies::{
+    AcousticDependencyStatus, DependencyManager, DependencyPhase, ModelDependencyRequest,
+    ModelDependencyStatus, SHARED_REPOSITORY, inspect_dependencies,
+};
 pub use jobs::ModelLibrary;
 pub use provider::{
     ModelProvider, RemoteFile, RemoteModelCatalog, RemoteRepository, list_remote_models,
@@ -15,7 +20,7 @@ use std::{
 };
 
 pub type LibraryResult<T> = Result<T, LibraryError>;
-#[derive(Clone, Debug, thiserror::Error, Serialize)]
+#[derive(Clone, Debug, thiserror::Error, Serialize, Deserialize)]
 #[error("{message}")]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryError {

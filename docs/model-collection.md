@@ -110,11 +110,40 @@ $cli = 'target/release/vocal-fast.exe'
      --cli $cli --seed-root models --bundle maobailing
    ```
 
-   The output directory must be new. Raw downloads and exporter intermediates
+   The first output directory must be new. Raw downloads and exporter intermediates
    stay under `target/model-collection/cache/`; source notices, VFRMs and catalog
-   go into the distribution directory. Failed builds leave partial output for
-   inspection; rebuild into a new directory. Only requested files are downloaded,
-   never a multi-gigabyte repository snapshot.
+   go into the distribution directory. Only requested files are downloaded,
+   never a multi-gigabyte repository snapshot. The generated `catalog.json` is
+   schema v2 and records a source-lock digest, source fingerprint, artifact
+   hashes and bundle dependency hashes.
+
+   To maintain an existing directory after changing `sources.lock.json`, use
+   the same command with `--update`:
+
+   ```powershell
+   & $py scripts/model-collection.py build `
+     --lock scripts/model_collection/sources.lock.json `
+     --output target/model-collection/distribution `
+     --cli $cli --seed-root models --bundle maobailing --update
+   ```
+
+   A voice or shared acoustic VFRM is reused when its locked source revision,
+   complete source fingerprint, size and SHA-256 still match. New or changed
+   inputs alone are fetched and converted. Add `--prune` when obsolete generated
+   voice, shared or bundle files should be removed; provenance files are kept
+   for audit history unless removed explicitly.
+
+   An older checked-out distribution can be upgraded without touching its large
+   VFRM files:
+
+   ```powershell
+   & $py scripts/model-collection.py migrate `
+     --lock scripts/model_collection/sources.lock.json `
+     --output target/model-collection/distribution-large
+   ```
+
+   Migration validates the existing inventory, adds source fingerprints and
+   bundle dependency hashes, rewrites the README, and regenerates checksums.
 
    HuBERT is exported from the locked HF checkpoint/config before acoustic
    conversion. RMVPE uses the locked **waveform-input** ONNX; the more common
@@ -135,10 +164,25 @@ $cli = 'target/release/vocal-fast.exe'
    ```
 
    Publish requires the destination to match the lock. It checks an exact file
-   inventory and token patterns in text files, uploads an explicit allow-list,
-   verifies remote sizes/hashes, and downloads one voice for Rust validation.
-   Updating an existing repository reuses it and does not delete unrelated
-   remote files. SDK credentials stay outside source and distribution trees.
+   inventory and token patterns in text files, validates catalog v2 against the
+   inventory, uploads an explicit allow-list, and reports local-only, remote-only
+   and changed files before and after upload. Remote files are never deleted by
+   default. Use `--prune` only for an intentional exact mirror:
+
+   ```powershell
+   & $py scripts/model-collection.py publish `
+     --output target/model-collection/distribution `
+     --repo MosRat/vfrm-models --cli $cli `
+     --report target/model-collection/publish-report.json --roundtrip sample
+   & $py scripts/model-collection.py publish `
+     --output target/model-collection/distribution `
+     --repo MosRat/vfrm-models --cli $cli --prune --roundtrip none
+   ```
+
+   `--roundtrip sample` validates both shared VFRMs, one voice and every
+   complete bundle through the public download API and Rust parser. `all`
+   validates every voice too; `none` only checks remote metadata. SDK credentials
+   stay outside source and distribution trees.
 
 ## Using the published files in the GUI
 
@@ -163,6 +207,13 @@ a complete bundle reports all required components as embedded. The optional
 retrieval index is used automatically
 when it is present in the selected voice.
 
+The runtime keeps the public collection manifest under
+`%LOCALAPPDATA%/vocal-fast/model-library/catalog-cache/` for six hours. Shared
+dependency resolution reads `catalog.json` first and falls back to a repository
+listing when the manifest is unavailable or uses an older schema. Downloaded
+payloads remain content verified and are keyed by immutable repository/file
+identity, so refreshing the manifest never invalidates a valid local file.
+
 ## Distribution layout and licensing
 
 ```text
@@ -170,7 +221,7 @@ voices/                 Synth + optional FAISS; shared acoustics not duplicated
 shared/                 hubert.vfrm, rmvpe.vfrm
 bundles/                complete voice + retrieval + embedded acoustics
 provenance/<source>/     original cards/licenses and source.json
-catalog.json            manifests, component sizes, licenses and artifact hashes
+catalog.json            v2 manifests, source fingerprints and artifact hashes
 sources.lock.json       upstream revisions, file hashes and conversion recipes
 inventory.json          complete distribution file sizes/hashes
 SHA256SUMS              readable checksum list

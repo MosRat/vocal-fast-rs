@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from model_collection.pipeline import prepare, verify, write_json
+from model_collection.pipeline import migrate_catalog, prepare, verify, write_json
 from model_collection.sources import lock_source, repository, safe_path, search
 
 
@@ -41,6 +41,13 @@ def main() -> int:
     build.add_argument("--hubert-seed", type=Path)
     build.add_argument("--rmvpe-seed", type=Path)
     build.add_argument("--bundle", help="voice id to produce a complete GUI-ready bundle")
+    build.add_argument("--update", action="store_true",
+                       help="incrementally maintain an existing distribution directory")
+    build.add_argument("--prune", action="store_true",
+                       help="with --update, remove obsolete generated voice/bundle files")
+    migrate = sub.add_parser("migrate", help="upgrade an existing v1 distribution manifest without rebuilding weights")
+    migrate.add_argument("--lock", type=Path, required=True)
+    migrate.add_argument("--output", type=Path, required=True)
     check = sub.add_parser("verify")
     check.add_argument("--output", type=Path, required=True)
     check.add_argument("--cli", type=Path, required=True)
@@ -48,6 +55,12 @@ def main() -> int:
     publish.add_argument("--output", type=Path, required=True)
     publish.add_argument("--repo", required=True)
     publish.add_argument("--cli", type=Path, required=True)
+    publish.add_argument("--prune", action="store_true",
+                         help="delete remote files absent from the verified local inventory")
+    publish.add_argument("--report", type=Path,
+                         help="write a JSON local/remote diff report")
+    publish.add_argument("--roundtrip", choices=["none", "sample", "all"], default="sample",
+                         help="download and parse no, representative, or all VFRM artifacts")
     args = parser.parse_args()
     if args.command == "search":
         write_json(args.output, search(args.provider, args.query, args.limit))
@@ -80,13 +93,20 @@ def main() -> int:
         lock = json.loads(args.lock.read_text(encoding="utf-8"))
         shared = {k: v.resolve() for k, v in {"hubert": args.hubert_seed, "rmvpe": args.rmvpe_seed}.items() if v}
         prepare(lock, args.output.resolve(), args.cache.resolve(), args.cli.resolve(),
-                args.seed_root.resolve() if args.seed_root else None, shared, args.bundle)
+                args.seed_root.resolve() if args.seed_root else None, shared, args.bundle,
+                update=args.update, prune=args.prune)
     elif args.command == "verify":
         inventory = verify(args.output.resolve(), args.cli.resolve())
         print(f"verified {len(inventory)} distribution files")
+    elif args.command == "migrate":
+        lock = json.loads(args.lock.read_text(encoding="utf-8"))
+        migrate_catalog(lock, args.output.resolve())
+        print(f"migrated {args.output} to catalog schema v2")
     else:
         from model_collection.publish import publish
-        publish(args.output.resolve(), args.repo, args.cli.resolve())
+        publish(args.output.resolve(), args.repo, args.cli.resolve(), prune=args.prune,
+                report_path=args.report.resolve() if args.report else None,
+                roundtrip=args.roundtrip)
     return 0
 
 

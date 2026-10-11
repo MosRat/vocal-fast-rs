@@ -1,7 +1,14 @@
 use super::{LibraryError, LibraryResult, client, validate_relative};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, io::Read};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Read,
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,7 +33,7 @@ pub struct RemoteRepository {
     pub repository: String,
     pub revision: Option<String>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteFile {
     pub path: String,
@@ -35,7 +42,7 @@ pub struct RemoteFile {
     pub kind: String,
     pub revision: Option<String>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteModelCatalog {
     pub repository: RemoteRepository,
@@ -166,6 +173,117 @@ fn file(path: &str, size: Option<u64>, hash: Option<&str>) -> LibraryResult<Opti
 }
 pub fn list_remote_models(repository: RemoteRepository) -> LibraryResult<RemoteModelCatalog> {
     list_with_client(&client()?, repository)
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogCache {
+    fetched_at: u64,
+    catalog: RemoteModelCatalog,
+}
+
+/// Resolve the published collection manifest before walking a large remote tree.
+/// The cache is deliberately short lived because arbitrary repositories can change;
+/// immutable revisions still remain the source of truth for downloaded bytes.
+pub(crate) fn list_cached_with_client(
+    client: &reqwest::blocking::Client,
+    repository: RemoteRepository,
+    cache_root: &Path,
+    ttl: Duration,
+) -> LibraryResult<RemoteModelCatalog> {
+    if !matches!(repository.provider, ModelProvider::ModelScope) {
+        return list_with_client(client, repository);
+    }
+    let identity = serde_json::to_vec(&repository)
+        .map_err(|e| LibraryError::new("repository", e.to_string()))?;
+    let key = format!("{:x}", Sha256::digest(identity));
+    let cache_path = cache_root.join(format!("{key}.json"));
+    if let Ok(bytes) = fs::read(&cache_path) {
+        if let Ok(cached) = serde_json::from_slice::<CatalogCache>(&bytes) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now.saturating_sub(cached.fetched_at) <= ttl.as_secs() {
+                return Ok(cached.catalog);
+            }
+        }
+    }
+    let catalog = public_collection_catalog(client, repository.clone())
+        .or_else(|_| list_with_client(client, repository))?;
+    if fs::create_dir_all(cache_root).is_ok() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(bytes) = serde_json::to_vec(&CatalogCache {
+            fetched_at: now,
+            catalog: catalog.clone(),
+        }) {
+            let temp = cache_path.with_extension(format!("tmp-{}", std::process::id()));
+            if fs::write(&temp, bytes).is_ok() {
+                let _ = fs::rename(temp, cache_path);
+            }
+        }
+    }
+    Ok(catalog)
+}
+
+fn public_collection_catalog(
+    client: &reqwest::blocking::Client,
+    mut repository: RemoteRepository,
+) -> LibraryResult<RemoteModelCatalog> {
+    repository.repository = repo_id(&repository.repository, repository.provider)?;
+    let revision = repository
+        .revision
+        .clone()
+        .unwrap_or_else(|| "master".into());
+    repository.revision = Some(revision.clone());
+    let url = download_url(&repository, "catalog.json")?;
+    let response = client.get(url).send()?;
+    if !response.status().is_success() {
+        return Err(LibraryError::new(
+            "catalog",
+            "Published catalog is unavailable",
+        ));
+    }
+    let value: Value = response
+        .json()
+        .map_err(|e| LibraryError::new("catalog", e.to_string()))?;
+    if value.get("schema").and_then(Value::as_str) != Some("vocal-vfrm-collection-v2") {
+        return Err(LibraryError::new(
+            "catalog",
+            "Published catalog schema is unsupported",
+        ));
+    }
+    let mut files = Vec::new();
+    for entry in value["voices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(value["shared"].as_array().into_iter().flatten())
+        .chain(value["bundles"].as_array().into_iter().flatten())
+    {
+        let path = entry["file"].as_str().unwrap_or_default();
+        let size = entry["size"].as_u64();
+        let hash = entry["sha256"].as_str();
+        if let Some(mut item) = file(path, size, hash)? {
+            item.revision = Some(revision.clone());
+            files.push(item);
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    if files.is_empty() {
+        return Err(LibraryError::new(
+            "catalog",
+            "Published catalog has no VFRM files",
+        ));
+    }
+    Ok(RemoteModelCatalog {
+        repository,
+        total_files: files.len(),
+        files,
+    })
 }
 pub(crate) fn list_with_client(
     client: &reqwest::blocking::Client,

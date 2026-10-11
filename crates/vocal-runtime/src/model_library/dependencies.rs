@@ -384,13 +384,15 @@ fn execute(
             0,
             None,
         )?;
-        let catalog = provider::list_with_client(
+        let catalog = provider::list_cached_with_client(
             &client()?,
             RemoteRepository {
                 provider: ModelProvider::ModelScope,
                 repository: SHARED_REPOSITORY.into(),
                 revision: Some("master".into()),
             },
+            &root.join("catalog-cache"),
+            std::time::Duration::from_secs(6 * 60 * 60),
         )?;
         let find = |path: &str| {
             catalog
